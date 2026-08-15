@@ -745,11 +745,11 @@ container/Dockerfile                     CI 镜像工具链 baseline
 
       <Card>
         <CardHeader>
-          <H3>9.3 macOS host 复测（merge + fixup 之后）</H3>
+          <H3>9.3 第一次拉取后 macOS host 复测（merge + fb2d723fd 兜底）</H3>
         </CardHeader>
         <CardBody>
           <Stack gap={8}>
-            <Text>在合并后 HEAD（含 fb2d723fd fixup）上重跑三系统 aarch64：</Text>
+            <Text>第一次拉取（73 commits，至 <Code>fd63e7525</Code>）之后，单独提交 <Code>fb2d723fd fix(gic): restore QEMU 9.0.2 boot path on top of upstream #1803 routing</Code>，在三系统上的实测：</Text>
             <CodeBlock
               language="text"
               code={`ArceOS helloworld  cold build 3.70s    QEMU 启动 → "Hello, world!"   PASS
@@ -772,7 +772,55 @@ Axvisor            cold build 17.70s   ELF 出炉，axvm 12 warnings        PASS
 
       <Card>
         <CardHeader>
-          <H3>9.4 仍未修的兼容性 bug（建议下次给 upstream 报）</H3>
+          <H3>9.4 第二次拉取后 GIC 兜底被 upstream 取代</H3>
+        </CardHeader>
+        <CardBody>
+          <Stack gap={8}>
+            <Text>
+              上游在 2026-08-14 合入 <Code>989954f54 fix(arm-gic-driver): handle implicit GICv2 uniprocessor targets (#2007)</Code>，
+              <Code>Closes #1840</Code>（独立 issue），supersede #1803 的 buggy 行为。#2007 引入 <Code>CpuInterfaceTarget</Code> 枚举：
+            </Text>
+            <CodeBlock
+              language="rust"
+              code={`pub enum CpuInterfaceTarget {
+    /// A uniprocessor controller makes ITARGETSR read-as-zero/write-ignored.
+    ImplicitUniprocessor,
+    /// The controller reports one implementation-defined target-list bit.
+    Explicit(TargetList),
+}`}
+            />
+            <Text>
+              新逻辑：<Code>discover_target()</Code> 把银行 ITARGETSR[..32] mask 跟 <Code>TYPER.CPUNumber</Code> 配对——
+              mask 为 one-hot → <Code>Explicit(target)</Code>（多核，按 mask 路由 SPI）；mask 为 0 且 <Code>cpu_interface_count() == 1</Code> →
+              <Code>ImplicitUniprocessor</Code>（单核，整段 SPI 路由跳过）。前一种是 QEMU 10 / 真硬件的路径，后一种是 QEMU 9 / 简化模型的路径。
+            </Text>
+            <Text>
+              在 merge origin/dev 后 52 个 commit（含 #2007）的最新 HEAD 上，删掉了本地 <Code>fb2d723fd</Code> 兜底和
+              之前的 <Code>e6b06faf9</Code> revert（两者被 #2007 取代），重新跑三系统 aarch64：
+            </Text>
+            <CodeBlock
+              language="text"
+              code={`ArceOS helloworld  cold build 3.29s    QEMU 启动 → "Hello, world!"   PASS
+ArceOS helloworld  warm build 0.82s    QEMU 启动 → "Hello, world!"   PASS
+StarryOS           cold build 14.07s   ELF + kallsyms + bin                PASS
+Axvisor            cold build 13.91s   ELF 出炉                          PASS`}
+            />
+            <Text>
+              homebrew QEMU 9.0.2 上不再需要任何本地 GIC workaround。upstream <Code>discover_target()</Code> 把这个控制器归类为
+              <Code>ImplicitUniprocessor</Code>，自动跳过 SPI ITARGETSR 写入。
+            </Text>
+            <Text>
+              #2007 还顺带解决了我们之前的两个猜测：(1) 银行 ITARGETSR 读值不应只看 <Code>[0]</Code> 一个 byte，应读 <Code>[..32]</Code> 8 个 32-bit
+              banked 寄存器（line 787）；(2) UP 系统的 mask=0 不应被解释为「无可用 target」而 panic，应判为 implicit UP。
+              这两点都直接落到了 <Code>drivers/intc/arm-gic-driver/src/version/v2/mod.rs</Code>。
+            </Text>
+          </Stack>
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <H3>9.5 仍未修的兼容性 bug（剩余 3 条）</H3>
         </CardHeader>
         <CardBody>
           <Stack gap={8}>
@@ -786,11 +834,11 @@ Axvisor            cold build 17.70s   ELF 出炉，axvm 12 warnings        PASS
               建议在 Apple host 上 fallback 到 <Code>xcrun --show-sdk-path</Code> 或 homebrew gcc 的 <Code>$HOMEBREW_PREFIX/Cellar/aarch64-unknown-linux-musl/*/toolchain/.../sysroot</Code>。
             </Text>
             <Text>
-              (3) <Code>fix(arm-gic-driver)</Code> #1803 还没在 QEMU 9 上验证过——homebrew 上 <Code>ITARGETSR[0]</Code> 在 CPU interface 未 enable 时返回 0/0xFF。
-              本轮用「current_cpu_target() 兜底回 0x01」局部绕开；理想方案是 upstream 加 QEMU 9 兼容路径。
+              (3) axbuild rootfs 拉取没有 mirror / 缓存复用：本机下载 alpine rootfs 22 MB/5 分钟，每次 lock 文件都会重新拉。
             </Text>
-            <Text>
-              (4) axbuild rootfs 拉取没有 mirror / 缓存复用：本机下载 alpine rootfs 22 MB/5 分钟，每次 lock 文件都会重新拉。
+            <Text style={{ color: theme.text.tertiary }}>
+              之前列的 (3)「<Code>fix(arm-gic-driver)</Code> #1803 没在 QEMU 9 上验证过」已被 #2007 解决，移出此列表。
+              本地兜底 commit <Code>fb2d723fd</Code> 与历史 revert <Code>e6b06faf9</Code> 都被 git rebase 摘掉，不再需要保留。
             </Text>
           </Stack>
         </CardBody>
