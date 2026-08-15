@@ -47,13 +47,13 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use ax_errno::AxError;
-use ax_sync::Mutex;
-use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsResult};
-use spin::Once;
+use ax_lazyinit::OnceLock;
+use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsError, VfsResult};
+
+use crate::sync::Mutex;
 
 #[cfg(feature = "sg2002")]
-pub static ION_DEVICE: Once<Arc<ion::IonDevice>> = Once::new();
+pub static ION_DEVICE: OnceLock<Arc<ion::IonDevice>> = OnceLock::new();
 #[cfg(feature = "dev-log")]
 pub use log::bind_dev_log;
 use rand::{Rng, SeedableRng, rngs::ChaCha20Rng};
@@ -63,7 +63,7 @@ use crate::pseudofs::{Device, DeviceOps, DirMaker, DirMapping, SimpleDir, Simple
 const RANDOM_SEED_STEP: u64 = 0x9e37_79b9_7f4a_7c15;
 
 static RANDOM_SEED_COUNTER: AtomicU64 = AtomicU64::new(0xa076_1d64_78bd_642f);
-static INITIAL_PTS_INSTANCE: Once<Arc<tty::PtsInstance>> = Once::new();
+static INITIAL_PTS_INSTANCE: OnceLock<Arc<tty::PtsInstance>> = OnceLock::new();
 
 #[cfg(any(feature = "sg2002", feature = "k230-kpu"))]
 pub(super) struct IrqRegistration {
@@ -158,11 +158,11 @@ struct RootBlk;
 
 impl DeviceOps for RootBlk {
     fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::Io)
+        Err(VfsError::Io)
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::Io)
+        Err(VfsError::Io)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -380,7 +380,7 @@ impl DeviceOps for Full {
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::StorageFull)
+        Err(VfsError::StorageFull)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -396,7 +396,7 @@ struct CpuDmaLatency;
 
 impl DeviceOps for CpuDmaLatency {
     fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::InvalidInput)
+        Err(VfsError::InvalidInput)
     }
 
     fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {

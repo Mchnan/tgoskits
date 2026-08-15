@@ -11,21 +11,20 @@ use core::{
     task::Poll,
 };
 
-use ax_errno::{AxError, AxResult};
 use ax_runtime::hal::cpu::uspace::UserContext;
-use ax_sync::Mutex;
 use ax_task::{current, future::block_on, yield_now};
 use axfs_ng_vfs::Location;
 use kernel_elf_parser::AuxType;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
-use starry_process::Pid;
 use starry_vm::vm_load_until_nul;
 
 use crate::{
+    StarryError, StarryResult,
     config::USER_HEAP_BASE,
     file::{ResolveAtResult, memfd::Memfd, resolve_at},
     mm::{copy_from_kernel, load_user_app, new_user_aspace_empty, vm_load_string},
-    task::{AsThread, rebind_task_tid, zap_thread},
+    sync::Mutex,
+    task::{AsThread, Tid, TidNumber, zap_thread},
 };
 
 pub fn sys_execve(
@@ -33,7 +32,7 @@ pub fn sys_execve(
     path: *const c_char,
     argv: *const *const c_char,
     envp: *const *const c_char,
-) -> AxResult<isize> {
+) -> StarryResult<isize> {
     let path = vm_load_string(path)?;
     let loc = ax_fs_ng::vfs::current_fs_context().lock().resolve(&path)?;
     do_execve(uctx, loc, path, argv, envp)
@@ -49,9 +48,9 @@ pub fn sys_execveat(
     argv: *const *const c_char,
     envp: *const *const c_char,
     flags: u32,
-) -> AxResult<isize> {
+) -> StarryResult<isize> {
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
-        return Err(AxError::InvalidInput);
+        return Err(StarryError::InvalidInput);
     }
 
     let path = vm_load_string(path)?;
@@ -69,7 +68,7 @@ pub fn sys_execveat(
         ResolveAtResult::Other(f) => {
             let memfd = f.downcast_ref::<Memfd>().ok_or_else(|| {
                 warn!("sys_execveat: exec from non-memfd anonymous fd is not supported");
-                AxError::PermissionDenied
+                StarryError::PermissionDenied
             })?;
             let loc = memfd.inner().inner().location().clone();
             let disp = format!("/memfd:{} (deleted)", memfd.name());
@@ -91,7 +90,7 @@ fn do_execve(
     path: String,
     argv: *const *const c_char,
     envp: *const *const c_char,
-) -> AxResult<isize> {
+) -> StarryResult<isize> {
     // ----------------------------------------------------------------
     // Phase 1: all fallible work — nothing is committed yet.
     // If any of these fail we return an error and the process is intact.
@@ -101,7 +100,7 @@ fn do_execve(
     // `execl(path, NULL)` passes NULL to mean "no arguments", and Linux's
     // `count_strings_kernel` short-circuits NULL to an empty list rather
     // than returning EFAULT.
-    let load_vec = |ptr: *const *const c_char| -> AxResult<Vec<String>> {
+    let load_vec = |ptr: *const *const c_char| -> StarryResult<Vec<String>> {
         if ptr.is_null() {
             Ok(Vec::new())
         } else {
@@ -125,8 +124,9 @@ fn do_execve(
     let curr = current();
     let thr = curr.as_thread();
     let proc_data = &thr.proc_data;
-    let my_tid = thr.tid();
-    let tgid = proc_data.proc.pid();
+    let my_tid = thr.tid_number();
+    let former_tid = thr.pid_identity().snapshot();
+    let leader_tid = TidNumber::from(proc_data.proc.pid().pid_number());
 
     // Serialize concurrent execve from sibling threads.
     //
@@ -138,7 +138,7 @@ fn do_execve(
     // the holder has crossed into irreversible teardown — which we observe
     // by `zap_thread` setting our `exit_request`.
     //
-    // We can't use `ax_sync::Mutex::lock` directly: it sleeps on
+    // We can't use `Mutex::lock` directly: it sleeps on
     // `WaitQueue::wait_until`, which is not awakened by zap's
     // `task.interrupt()`, and (worse) on release the loser would acquire
     // the mutex and proceed with execve on top of the holder's already-
@@ -157,7 +157,7 @@ fn do_execve(
             break g;
         }
         if thr.has_exit_request() {
-            return Err(AxError::Interrupted);
+            return Err(StarryError::Interrupted);
         }
         yield_now();
     };
@@ -184,7 +184,7 @@ fn do_execve(
     let (entry_point, user_stack_base, auxv) =
         match load_user_app(&mut new_aspace, loc, &path, &args, &envs) {
             Ok(result) => result,
-            Err(AxError::InvalidExecutable) => {
+            Err(StarryError::InvalidExecutable) => {
                 // ENOEXEC fallback: retry via /bin/sh.
                 // In Linux this retry is done by user-space (execvp / busybox),
                 // not by the kernel. This is a pragmatic workaround until
@@ -220,7 +220,7 @@ fn do_execve(
     // that new thread's tid wasn't visible last time around.
     // ----------------------------------------------------------------
     loop {
-        let siblings: Vec<Pid> = proc_data
+        let siblings: Vec<TidNumber> = proc_data
             .proc
             .threads()
             .into_iter()
@@ -270,20 +270,6 @@ fn do_execve(
             }
         }));
     }
-
-    // Collect CLOEXEC fds to close *after* sibling teardown. Snapshotting
-    // before teardown would miss any fd a sibling promoted to CLOEXEC (via
-    // `open(... O_CLOEXEC)`, `fcntl(F_SETFD)`, or `close_range(..., CLOEXEC)`)
-    // between our snapshot and its own exit, leaking those fds into the new
-    // image. Once all siblings are reaped, the snapshot reflects the final
-    // post-quiescence table. The close pass below runs under the same
-    // `crate::file::current_fd_table().write()` guard so no new fds appear between scan and close.
-    let current_fd_table = crate::file::current_fd_table();
-    let mut fd_table = current_fd_table.write();
-    let cloexec_fds: Vec<_> = fd_table
-        .ids()
-        .filter(|it| fd_table.get(*it).unwrap().cloexec)
-        .collect();
 
     // ----------------------------------------------------------------
     // Phase 2: point of no return — commit all changes.
@@ -342,9 +328,15 @@ fn do_execve(
     thr.set_robust_list_head(0);
     thr.clear_rseq_state();
 
-    // Remove CLOEXEC fds from the table under the write guard we took
-    // for the post-teardown snapshot — no fd can be added or have its
-    // CLOEXEC bit flipped between scan and close — but defer the actual
+    // Collect and remove CLOEXEC fds after sibling teardown. Snapshotting
+    // before teardown would miss any fd a sibling promoted to CLOEXEC (via
+    // `open(... O_CLOEXEC)`, `fcntl(F_SETFD)`, or `close_range(..., CLOEXEC)`)
+    // between our snapshot and its own exit. The scan and removal share one
+    // short write critical section, but that guard must not span the address
+    // space and signal commit above: `FD_TABLE` uses a preempt-disabling lock,
+    // while those operations may acquire sleeping mutexes.
+    //
+    // Defer the actual
     // `release_locks_on_close` (POSIX-lock release, OFD waker wakes,
     // FileDescriptor drop) until after we've dropped the table write
     // lock. The wakers fire on the global advisory-lock waiter queues
@@ -356,13 +348,21 @@ fn do_execve(
     // after the lock is released, which is equivalent: no new fd can
     // appear in the slots we just emptied because nothing else in this
     // process is running yet (siblings reaped, new image not started).
-    let mut closing = Vec::with_capacity(cloexec_fds.len());
-    for fd in cloexec_fds {
-        if let Some(f) = fd_table.remove(fd) {
-            closing.push(f);
+    let closing = {
+        let current_fd_table = crate::file::current_fd_table();
+        let mut fd_table = current_fd_table.write();
+        let cloexec_fds: Vec<_> = fd_table
+            .ids()
+            .filter(|it| fd_table.get(*it).unwrap().cloexec)
+            .collect();
+        let mut closing = Vec::with_capacity(cloexec_fds.len());
+        for fd in cloexec_fds {
+            if let Some(f) = fd_table.remove(fd) {
+                closing.push(f);
+            }
         }
-    }
-    drop(fd_table);
+        closing
+    };
     for f in closing {
         crate::file::release_locks_on_close(f);
     }
@@ -377,21 +377,22 @@ fn do_execve(
     // existing handle on the (still-original) PID continues to refer to
     // this thread for `wait`, `kill`, `tgkill`, `/proc/<pid>` etc.
     //
-    // We mirror that here by:
-    //   - renaming our `Thread::tid` from the old non-leader value to
-    //     the leader's TGID,
-    //   - re-keying the global TASK_TABLE entry,
-    //   - re-keying the process-level signal child list,
-    //   - replacing our entry in `proc.tg.threads`.
+    // We mirror that here by transferring the stable leader identity to the
+    // caller, then updating signal and thread-group indexes that use TIDs.
     //
     // The original leader was zapped above (it's a sibling from `curr`'s
     // viewpoint), did its `do_exit(0, false)`, and is no longer in the
     // task table or thread group, so the destination TID is free.
-    if my_tid != tgid {
-        thr.set_tid(tgid);
-        rebind_task_tid(&curr, my_tid, tgid);
-        proc_data.signal.rename_child(my_tid, tgid);
-        proc_data.proc.rename_thread(my_tid, tgid);
+    if my_tid != leader_tid {
+        let leader_identity = proc_data.identity();
+        let leader_tid_lease = leader_identity
+            .acquire_role::<Tid>()
+            .expect("exited exec leader retained its TID role");
+        thr.transfer_pid_identity(&curr, leader_identity, leader_tid_lease);
+        proc_data
+            .signal
+            .rename_child(my_tid.get(), leader_tid.get());
+        proc_data.proc.rename_thread(my_tid, leader_tid);
     }
 
     // Reset every user-visible register to a fresh-process state, not
@@ -421,7 +422,7 @@ fn do_execve(
     // only controls whether the stop carries PTRACE_EVENT_EXEC data,
     // not whether the stop itself occurs.
     if proc_data.is_ptrace_traceme() || proc_data.is_ptrace_attached() {
-        proc_data.set_ptrace_exec_stop_pending();
+        proc_data.set_ptrace_exec_stop_pending(former_tid);
     }
 
     // Per-task perf: flip any `enable_on_exec` counter attached to this thread

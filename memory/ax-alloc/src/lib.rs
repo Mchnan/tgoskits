@@ -14,7 +14,6 @@ extern crate alloc;
 
 use core::{alloc::Layout, fmt, ptr::NonNull};
 
-use ax_errno::AxError;
 use strum::{IntoStaticStr, VariantArray};
 
 const PAGE_SIZE: usize = 0x1000;
@@ -23,22 +22,22 @@ const PAGE_SIZE: usize = 0x1000;
 /// clean file-backed page cache pages). Returns the number of pages freed.
 pub type PageReclaimFn = fn(num_pages: usize) -> usize;
 
-static PAGE_RECLAIM_FN: ax_kspin::SpinNoIrq<Option<PageReclaimFn>> = ax_kspin::SpinNoIrq::new(None);
+static PAGE_RECLAIM_FN: ax_sync::SpinLock<Option<PageReclaimFn>> = ax_sync::SpinLock::new(None);
 
 /// Register a callback that the allocator will invoke when a page allocation
 /// cannot be satisfied.
 pub fn register_page_reclaim_fn(f: PageReclaimFn) {
-    *PAGE_RECLAIM_FN.lock() = Some(f);
+    *PAGE_RECLAIM_FN.lock_irqsave() = Some(f);
 }
 
 /// Try to reclaim physical pages by invoking the registered callback.
 /// Returns the number of pages actually freed.
 ///
-/// The `SpinNoIrq` guard is released before calling into the reclaim
+/// The `SpinLock` guard is released before calling into the reclaim
 /// function so that the reclaim path (and any evict listeners it
 /// triggers) runs with interrupts enabled.
 pub fn try_page_reclaim(num_pages: usize) -> usize {
-    let reclaim_fn = { *PAGE_RECLAIM_FN.lock() };
+    let reclaim_fn = { *PAGE_RECLAIM_FN.lock_irqsave() };
     reclaim_fn.map_or(0, |f| f(num_pages))
 }
 
@@ -103,38 +102,33 @@ impl fmt::Debug for Usages {
 }
 
 /// The error type used for allocation operations in `ax-alloc`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AllocError {
     /// Invalid size, alignment, or other input parameter.
+    #[error("invalid allocation parameter")]
     InvalidParam,
     /// The allocator has already been initialized.
+    #[error("allocator is already initialized")]
     AlreadyInitialized,
     /// A region overlaps with an existing managed region.
+    #[error("memory region overlaps an existing allocation region")]
     MemoryOverlap,
     /// Not enough memory is available to satisfy the request.
+    #[error("not enough memory")]
     NoMemory,
     /// Attempted to deallocate memory that was not allocated.
+    #[error("memory was not allocated by this allocator")]
     NotAllocated,
     /// The allocator has not been initialized.
+    #[error("allocator is not initialized")]
     NotInitialized,
     /// The requested address or entity was not found.
+    #[error("allocation was not found")]
     NotFound,
 }
 
 /// A [`Result`] alias with [`AllocError`] as the error type.
 pub type AllocResult<T = ()> = Result<T, AllocError>;
-
-impl From<AllocError> for AxError {
-    fn from(value: AllocError) -> Self {
-        match value {
-            AllocError::NoMemory => AxError::NoMemory,
-            AllocError::NotFound => AxError::NotFound,
-            AllocError::NotInitialized | AllocError::AlreadyInitialized => AxError::BadState,
-            AllocError::MemoryOverlap => AxError::AlreadyExists,
-            AllocError::InvalidParam | AllocError::NotAllocated => AxError::InvalidInput,
-        }
-    }
-}
 
 /// Unified allocator operations provided by all `ax-alloc` backends.
 pub trait AllocatorOps {

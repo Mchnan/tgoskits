@@ -206,9 +206,7 @@ impl DmaOp for KlibDma {
         let layout = Layout::from_size_align(size.get(), align)?;
         let dma_addr = dma_addr_from_ptr(addr);
 
-        if dma_range_fits_mask(dma_addr, size.get(), constraints.addr_mask)
-            && dma_addr_is_aligned(dma_addr, align)
-        {
+        if dma_mapping_can_be_direct(dma_addr, size.get(), constraints) {
             return Ok(unsafe { DmaMapHandle::new(addr, dma_addr.into(), layout, None) });
         }
 
@@ -270,13 +268,22 @@ fn dma_addr_is_aligned(dma_addr: u64, align: usize) -> bool {
     dma_addr.is_multiple_of(align.max(1) as u64)
 }
 
+fn dma_mapping_can_be_direct(dma_addr: u64, size: usize, constraints: DmaConstraints) -> bool {
+    let align = constraints.align.max(1);
+    // A direct streaming mapping transfers cache-line ownership to the device.
+    // Keep both ends aligned so unrelated heap objects cannot share that range.
+    dma_range_fits_mask(dma_addr, size, constraints.addr_mask)
+        && dma_addr_is_aligned(dma_addr, align)
+        && size.is_multiple_of(align)
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::{rc::Rc, vec::Vec};
     use core::cell::RefCell;
 
     use super::*;
-    use crate::AxError;
+    use crate::KlibError;
 
     #[test]
     fn coherent_release_restores_mapping_before_free() {
@@ -320,7 +327,7 @@ mod tests {
         let free_events = events.clone();
 
         let result = finish_coherent_mapping(
-            DmaCoherentMappingOutcome::NotStarted(AxError::Unsupported),
+            DmaCoherentMappingOutcome::NotStarted(KlibError::Unsupported),
             move || free_events.borrow_mut().push("free"),
         );
 
@@ -334,11 +341,21 @@ mod tests {
         let free_events = events.clone();
 
         let result = finish_coherent_mapping(
-            DmaCoherentMappingOutcome::StateUncertain(AxError::TimedOut),
+            DmaCoherentMappingOutcome::StateUncertain(KlibError::TimedOut),
             move || free_events.borrow_mut().push("free"),
         );
 
         assert_eq!(result, None);
         assert!(events.borrow().is_empty());
+    }
+
+    #[test]
+    fn direct_streaming_mapping_requires_an_isolated_aligned_range() {
+        let constraints = DmaConstraints::new(u32::MAX as u64).with_align(64);
+
+        assert!(dma_mapping_can_be_direct(0x1000, 64, constraints));
+        assert!(dma_mapping_can_be_direct(0x1000, 128, constraints));
+        assert!(!dma_mapping_can_be_direct(0x1000, 9, constraints));
+        assert!(!dma_mapping_can_be_direct(0x1001, 64, constraints));
     }
 }

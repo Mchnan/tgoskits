@@ -1,7 +1,6 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use ax_kspin::SpinNoIrq;
 use axpoll::{IoEvents, PollSet};
 use ringbuf::{
     Cons, HeapRb, Prod,
@@ -15,6 +14,7 @@ use super::{
         ldisc::{ProcessMode, TtyConfig, TtyRead, TtyWrite},
     },
 };
+use crate::sync::IrqMutex;
 
 const PTY_BUF_SIZE: usize = 4096;
 
@@ -22,7 +22,7 @@ pub type PtyDriver = Tty<PtyReader, PtyWriter>;
 
 type Buffer = Arc<HeapRb<u8>>;
 
-type SharedConsumer = Arc<SpinNoIrq<Cons<Buffer>>>;
+type SharedConsumer = Arc<IrqMutex<Cons<Buffer>>>;
 
 pub struct PtyReader(SharedConsumer, Arc<AtomicBool>);
 
@@ -37,7 +37,7 @@ impl TtyRead for PtyReader {
         self.0.lock().pop_slice(buf)
     }
 
-    fn discard_input(&mut self) -> ax_errno::AxResult<()> {
+    fn discard_input(&mut self) -> crate::StarryResult<()> {
         self.0.lock().clear();
         Ok(())
     }
@@ -49,7 +49,7 @@ impl TtyRead for PtyReader {
 
 #[derive(Clone)]
 pub struct PtyWriter(
-    Arc<SpinNoIrq<Prod<Buffer>>>,
+    Arc<IrqMutex<Prod<Buffer>>>,
     SharedConsumer,
     Arc<PollSet>,
     Arc<AtomicBool>,
@@ -63,7 +63,7 @@ impl PtyWriter {
         writer_closed: Arc<AtomicBool>,
     ) -> Self {
         Self(
-            Arc::new(SpinNoIrq::new(Prod::new(buffer))),
+            Arc::new(IrqMutex::new(Prod::new(buffer))),
             consumer,
             poll_rx,
             writer_closed,
@@ -86,7 +86,7 @@ impl TtyWrite for PtyWriter {
         read
     }
 
-    fn discard_output(&self) -> ax_errno::AxResult<()> {
+    fn discard_output(&self) -> crate::StarryResult<()> {
         let _producer = self.0.lock();
         self.1.lock().clear();
         Ok(())
@@ -112,8 +112,8 @@ pub(crate) fn create_pty_pair() -> (Arc<PtyDriver>, Arc<PtyDriver>) {
     // peer reader can observe hangup (POLLHUP / EOF).
     let master_closed = Arc::new(AtomicBool::new(false));
     let slave_closed = Arc::new(AtomicBool::new(false));
-    let master_to_slave_consumer = Arc::new(SpinNoIrq::new(Cons::new(master_to_slave.clone())));
-    let slave_to_master_consumer = Arc::new(SpinNoIrq::new(Cons::new(slave_to_master.clone())));
+    let master_to_slave_consumer = Arc::new(IrqMutex::new(Cons::new(master_to_slave.clone())));
+    let slave_to_master_consumer = Arc::new(IrqMutex::new(Cons::new(slave_to_master.clone())));
 
     let terminal = Arc::new(Terminal::default());
 

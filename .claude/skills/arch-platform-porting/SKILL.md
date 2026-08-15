@@ -98,6 +98,7 @@ Current Axvisor LoongArch QEMU bring-up uses the dynamic UEFI platform path. The
 - **AArch64 guest timer PPI**: derive CNTV/CNTP PPIs and raw specifiers from the machine `GuestTimerProfile`, and publish only level state into the VM-local VGIC. Claim the host CNTV PPI once for the hypervisor lifetime and configure it level-triggered on every pCPU. On a lower-EL IRQ, assembly must read the GICv2 MMIO IAR or GICv3 `ICC_IAR1_EL1` while CNTV is still asserted; only then may the exit transaction disable CNTV, clear CNTVOFF, restore host timer controls, and call Rust to perform the priority drop. Reversing this order turns a level PPI into a spurious acknowledgement and re-entry loop. VGIC owns pending, active, enable, routing, EOI, DIR, and level re-pend. Under `hv`, every GICv2/GICv3 host CPU interface must use split EOI: `EOIR` only drops priority, while ordinary host `ActiveIrq::drop` performs the matching `DIR` and AxVM defers `DIR` until guest retirement. An acknowledged host CNTV PPI remains active until the corresponding GICv2 EOI/DIR or GICv3 LR/TDIR retirement reaches a typed backend operation after the controller lock is released; lowering CVAL/CTL before DIR must not deactivate it early. Hard IRQ only publishes fixed preallocated state and must not allocate, look up a VM, take `rdrive` locks, or invoke general subscribers. Do not carry IRQ state through an MPSC channel.
 - **AArch64 assigned physical SPI**: deliver an ownership-checked host SPI through a hardware-backed LR that carries the same guest/physical INTID. Normal guest retirement lets the physical GIC deactivate the source and must not repeat host `DIR` after software harvests the LR. A trapped guest DIR or teardown performs explicit host `DIR`; that operation, not a pre-DIR pending read, is the level-resample boundary. If a replacement acknowledgement arrives before a stale LR is harvested, retain it until refill can create the next HW-backed LR. Unassigned GICv3 interrupts, including ITS LPIs, remain host-owned: resolve the GIC parent through the registered MSI leaf route before dispatch and preserve the full 24-bit INTID for host `DIR`. This does not widen passthrough beyond validated SPIs.
 - **AArch64 guest timer wait and migration**: WFI schedules the earliest deliverable CNTV/CNTP deadline. `Aarch64TimerBinding::wait_generation`, not `ArmTimerContext`, owns callback invalidation; timer-wheel callbacks are generation-checked wake hints and must not assert a PPI directly. Cancellation uses a `VmTimerHandle` containing its owner CPU; remote cancellation executes on that owner and rearms its comparator. Before vCPU migration, complete any CPU-local host timer activation on the old pCPU; reset/stop/drop call the binding invalidation transition, clear virtual lines, and advance the wait generation so stale events cannot become valid again.
+  Keep VGIC queries and timer rearming outside the scheduler wait-queue critical section. Capture the VM runtime notification generation before those checks, recheck pending state after arming, and let the wait-queue predicate compare only lifecycle state and that atomic generation so a notification between the checks and blocking cannot be lost.
 - **Temporary host comparator guard**: `ax-task::begin_hardware_timer_irq` clears the recorded comparator deadline only after control enters the matching timer IRQ. This intentionally avoids rewriting an expired comparator before its pending event is consumed while the generic scheduler lacks separate programmed/pending/active comparator state. The guard can retain an expired deadline as the scheduling reference and delay later reprogramming; this performance cost is accepted temporarily. Remove it only after the IRQ acknowledgement path explicitly consumes comparator pending state without depending on comparator rewrite. Keep this exception synchronized with `book/design/axvisor-aarch64-generic-timer.md`.
 - **Dynamic firmware devices**: for `rdrive` ACPI probes, real non-empty ACPI ID lists enumerate namespace `Device` nodes and expose `_CRS` memory, I/O port, and IRQ resources through `AcpiInfo`; empty ID lists or synthetic root IDs are reserved for root-table style callbacks.
 - **FDT child providers**: when a firmware transport owns protocol/provider child nodes, enumerate them through `FdtInfo::available_children()` or validate one with `FdtInfo::prepare_child()`, then publish with `PlatformDevice::register_fdt_child()` or the atomic parent-plus-child form `register_with_fdt_child()`. Do not publish capabilities to a raw phandle. Rdrive owns direct-child validation, disabled-node filtering, stable child `DeviceId`/path/populated state, duplicate and ownership errors, and retry-safe commit semantics. A child without a phandle may still be a valid protocol identity; phandle is only a consumer lookup key. Transport-specific code still interprets bindings such as SCMI protocol `reg`, and each published provider must retain its own backend/agent rather than route through an unrelated global singleton.
@@ -154,7 +155,7 @@ Current Axvisor LoongArch QEMU bring-up uses the dynamic UEFI platform path. The
 1. Discover enabled CPUs from firmware data and keep firmware IDs separate from logical CPU IDs.
 2. Bound-check CPU indices and avoid assuming hart/apic/mpidr/cpuid values are dense.
 3. Prepare one boot argument block per secondary CPU with stack, page table, kernel entry, typed per-CPU area, and logical ID.
-4. Flush boot arguments and page tables before `cpu_on`.
+4. Flush boot arguments and page tables before the architecture CPU-on transport.
 5. In the secondary path, initialize arch address windows, stack, page table state, the
    architecture CPU-local register contract, trap vectors, timer, and interrupt state before
    entering generic secondary code. Install the final `CpuAreaRef` while the CPU is offline, then
@@ -162,6 +163,23 @@ Current Axvisor LoongArch QEMU bring-up uses the dynamic UEFI platform path. The
    fallible state afterward.
 6. Before the OS per-CPU register is initialized on a secondary CPU, use cached controller fast paths for interrupt and timer setup through `somehal::irq::init_secondary_boot_irqs(cpu_id)`; do not take `rdrive`, IRQ-domain, or generic route locks from that window.
 7. Debug secondary failure with physical-address markers first; serial logging may not work until the secondary has its own mapping and trap state.
+8. Keep architecture wake transport separate from generic CPU bring-up synchronization. The
+   architecture hook only delivers PSCI/SBI/mailbox or INIT/SIPI; a shutdown-lifetime per-CPU
+   state owned by someboot publishes `DEAD -> KICKED -> ALIVE -> SHOULD_ONLINE`. The secondary
+   reports `ALIVE` after reaching the common someboot entry, then waits for the control CPU
+   release before entering the OS. Keep this mutable state outside the copyable trampoline
+   metadata and separate from the later scheduler-online publication. Do not replace it with a
+   global last-CPU ID, an architecture-only completion, timeout retry, or scheduler-online flag.
+   Expose this lifecycle through the non-blocking, non-copyable
+   `start_secondary_cpu`/`status`/`release` handle: status observation must not release the CPU,
+   and only a matching alive handle may release it. Claim the single in-flight transport with a
+   non-blocking CAS. A dropped handle, upper-layer timeout, cancellation, or possibly partial
+   transport error must keep the owner claimed because a late x86 AP may still consume the shared
+   trampoline. Do not add cancellation, retry, fallback, or a someboot `Future`; a future upper
+   layer needs a real waker and terminal cancellation semantics. Keep the 10-second synchronous
+   polling policy in `axplat-dyn::PowerIf`, not in the someboot mechanism.
+   On x86, encode SIPI as Linux `APIC_DM_STARTUP` (`0x600`); INIT level bits do not belong to SIPI.
+   Keep this contract synchronized with `book/design/someboot-secondary-cpu-startup.md`.
 
 ## Validation Ladder
 

@@ -264,7 +264,11 @@ impl DirNode {
             let user_data = node.user_data().clone();
             *entry.user_data() = user_data;
             if self.ops.is_cacheable() {
-                self.cache.lock().insert(name.to_owned(), entry.clone());
+                let previous = {
+                    let mut cache = self.cache.lock();
+                    cache.insert(name.to_owned(), entry.clone())
+                };
+                drop(previous);
                 self.bump_cache_generation();
             }
         })
@@ -302,7 +306,11 @@ impl DirNode {
     ) -> VfsResult<DirEntry> {
         let entry = self.ops.create(name, node_type, permission, uid, gid)?;
         if self.ops.is_cacheable() {
-            self.cache.lock().insert(name.to_owned(), entry.clone());
+            let previous = {
+                let mut cache = self.cache.lock();
+                cache.insert(name.to_owned(), entry.clone())
+            };
+            drop(previous);
             self.bump_cache_generation();
         }
         Ok(entry)
@@ -390,15 +398,13 @@ impl DirNode {
                 }
                 return Ok(val);
             }
-            Err(err) if err.canonicalize() == VfsError::NotFound && options.create => {}
+            Err(VfsError::NotFound) if options.create => {}
             Err(err) => return Err(err),
         }
         let (uid, gid) = options.user.unwrap_or((0, 0));
         let entry = match self.create_entry(name, options.node_type, options.permission, uid, gid) {
             Ok(entry) => entry,
-            Err(err) if !options.create_new && err.canonicalize() == VfsError::AlreadyExists => {
-                self.lookup(name)?
-            }
+            Err(VfsError::AlreadyExists) if !options.create_new => self.lookup(name)?,
             Err(err) => return Err(err),
         };
         Ok(entry)

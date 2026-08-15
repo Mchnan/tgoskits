@@ -55,12 +55,14 @@ mod kernel_mapping;
 mod klib;
 
 mod devices;
+mod error;
 mod fs;
 #[cfg(feature = "irq")]
 pub mod irq;
 mod registers;
 #[cfg(feature = "serial")]
 pub mod serial;
+pub mod sync;
 
 #[cfg(all(feature = "net", feature = "fs"))]
 mod unix_ns;
@@ -69,6 +71,7 @@ mod unix_ns;
 mod wifi_glue;
 
 pub use ax_hal as hal;
+pub use error::{RuntimeError, RuntimeResult};
 
 pub(crate) mod build_info {
     include!(concat!(env!("OUT_DIR"), "/build_info.rs"));

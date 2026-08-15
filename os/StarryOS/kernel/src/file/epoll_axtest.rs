@@ -6,14 +6,13 @@ use core::{
     task::{Context, Waker},
 };
 
-use ax_errno::AxError;
-use ax_kspin::SpinNoIrq;
 use axpoll::{IoEvents, PollSet, Pollable};
 
 use super::{
     FileLike,
     epoll::{Epoll, EpollFlags},
 };
+use crate::{StarryError, sync::IrqMutex};
 
 static EPOLL_ADD_TEST_BARRIER_ENABLED: AtomicBool = AtomicBool::new(false);
 static EPOLL_ADD_TEST_BARRIER_ARRIVALS: AtomicUsize = AtomicUsize::new(0);
@@ -32,7 +31,7 @@ pub(super) fn epoll_add_test_barrier() {
 pub(crate) fn concurrent_reverse_add_is_serialized_for_test() -> bool {
     let left = Arc::new(Epoll::new());
     let right = Arc::new(Epoll::new());
-    let results = Arc::new(SpinNoIrq::new([None, None]));
+    let results = Arc::new(IrqMutex::new([None, None]));
 
     EPOLL_ADD_TEST_BARRIER_ARRIVALS.store(0, Ordering::Release);
     EPOLL_ADD_TEST_BARRIER_ENABLED.store(true, Ordering::Release);
@@ -61,7 +60,7 @@ pub(crate) fn concurrent_reverse_add_is_serialized_for_test() -> bool {
     let results = results.lock();
     matches!(
         results.as_slice(),
-        [None, Some(AxError::FilesystemLoop)] | [Some(AxError::FilesystemLoop), None]
+        [None, Some(StarryError::FilesystemLoop)] | [Some(StarryError::FilesystemLoop), None]
     )
 }
 
@@ -164,7 +163,7 @@ impl Pollable for CallbackBoundaryFile {
 struct EpollWaiter {
     epoll: Arc<Epoll>,
     result_index: usize,
-    results: Arc<SpinNoIrq<[Option<u64>; 2]>>,
+    results: Arc<IrqMutex<[Option<u64>; 2]>>,
 }
 
 impl EpollWaiter {
@@ -194,7 +193,7 @@ pub(crate) fn level_aliases_rotate_in_linux_callback_order_for_test() -> bool {
     let epoll = Arc::new(Epoll::new());
     let target = ReadyFile::new();
     let target_file: Arc<dyn FileLike> = target.clone();
-    let results = Arc::new(SpinNoIrq::new([None, None]));
+    let results = Arc::new(IrqMutex::new([None, None]));
 
     epoll
         .add_file_for_test(1, target_file.clone(), 0x11, EpollFlags::empty())
@@ -233,9 +232,9 @@ pub(crate) fn edge_readiness_requires_a_new_notification_for_test() -> bool {
     target.make_ready();
     let after_new_notification = collect_one_event(&epoll);
 
-    first == Ok((1, Some(0x33)))
-        && without_new_notification == Err(AxError::WouldBlock)
-        && after_new_notification == Ok((1, Some(0x33)))
+    matches!(first, Ok((1, Some(0x33))))
+        && matches!(without_new_notification, Err(StarryError::WouldBlock))
+        && matches!(after_new_notification, Ok((1, Some(0x33))))
 }
 
 pub(crate) fn edge_callback_does_not_reenter_target_for_test() -> bool {
@@ -252,7 +251,7 @@ pub(crate) fn edge_callback_does_not_reenter_target_for_test() -> bool {
     !target.callback_reentered_file()
 }
 
-fn collect_one_event(epoll: &Epoll) -> Result<(usize, Option<u64>), AxError> {
+fn collect_one_event(epoll: &Epoll) -> Result<(usize, Option<u64>), StarryError> {
     let mut user_data = None;
     let count = epoll.poll_events_with(1, |_index, event| {
         user_data = Some(event.data);

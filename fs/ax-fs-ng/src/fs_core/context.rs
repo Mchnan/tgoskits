@@ -13,13 +13,13 @@ use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 
 use ax_io::{Read, Write};
+use ax_lazyinit::OnceLock;
 #[cfg(feature = "vfs")]
 use axfs_ng_vfs::Mountpoint;
 use axfs_ng_vfs::{
     Location, Metadata, NodePermission, NodeType, VfsError, VfsResult,
     path::{Component, Components, Path, PathBuf},
 };
-use spin::Once;
 
 use crate::{
     file::File,
@@ -30,7 +30,7 @@ use crate::{
 pub const SYMLINKS_MAX: usize = 40;
 
 /// Global root filesystem context, initialized once during [`init_filesystems`](crate::init_filesystems).
-pub static ROOT_FS_CONTEXT: Once<FsContext> = Once::new();
+pub static ROOT_FS_CONTEXT: OnceLock<FsContext> = OnceLock::new();
 
 /// Registry of all live `FsContext` instances (weak references).
 ///
@@ -435,7 +435,9 @@ impl FsContext {
     pub fn read(&self, path: impl AsRef<Path>) -> VfsResult<Vec<u8>> {
         let mut buf = Vec::new();
         let file = File::open(self, path.as_ref())?;
-        (&file).read_to_end(&mut buf)?;
+        (&file)
+            .read_to_end(&mut buf)
+            .map_err(crate::io_error_to_vfs_error)?;
         Ok(buf)
     }
 
@@ -450,7 +452,9 @@ impl FsContext {
     /// replace its contents if it does.
     pub fn write(&self, path: impl AsRef<Path>, buf: impl AsRef<[u8]>) -> VfsResult<()> {
         let file = File::create(self, path.as_ref())?;
-        (&file).write_all(buf.as_ref())?;
+        (&file)
+            .write_all(buf.as_ref())
+            .map_err(crate::io_error_to_vfs_error)?;
         Ok(())
     }
 

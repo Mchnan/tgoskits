@@ -28,9 +28,9 @@ use acpi::{
     },
     sdt::spcr::{Spcr, SpcrInterfaceType},
 };
-use ax_kspin::SpinNoPreempt as Mutex;
+use ax_lazyinit::OnceLock;
+use ax_sync::SpinLock as Mutex;
 pub use rdif_base::irq::{AcpiGsiController, AcpiGsiRoute, AcpiIrqPolarity, AcpiIrqTrigger};
-use spin::Once;
 
 use crate::{
     DeviceId, PlatformDevice,
@@ -46,7 +46,7 @@ pub const PCI_INTX_VECTOR_BASE: usize = 0x30;
 const LOONGARCH_PCH_PIC_GSI_COUNT: u16 = 256;
 const PCI_ROOT_FALLBACK_PATHS: &[&str] = &["\\_SB.PCI0", "\\_SB.PCI1", "\\_SB.PC00", "\\_SB.PC01"];
 
-static SYSTEM: Once<System> = Once::new();
+static SYSTEM: OnceLock<System> = OnceLock::new();
 static NULL_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy)]
@@ -295,6 +295,10 @@ mod tests {
     };
     use crate::register::{DriverRegister, ProbeKind, ProbeLevel, ProbePriority};
 
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "acpi::Interpreter requires Arc even for this single-threaded test handler"
+    )]
     fn test_fixed_registers(handler: &AcpiHandler) -> Arc<FixedRegisters<AcpiHandler>> {
         let event_gas = GenericAddress {
             address_space: AddressSpace::SystemIo,
