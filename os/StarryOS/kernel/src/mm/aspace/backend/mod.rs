@@ -21,10 +21,6 @@ mod file;
 mod linear;
 mod shared;
 
-#[cfg(axtest)]
-pub(crate) use self::cow::{
-    cow_file_max_read_len_boundary_rules_hold_for_test, private_mmap_eof_check_for_test,
-};
 pub use self::shared::SharedPages;
 pub use super::accounting::RssKind;
 use super::{

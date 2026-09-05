@@ -27,7 +27,7 @@ use sdhci_host::{HostClock, HostResetHook, HostTimer, Sdhci, rdif as sdhci_rdif}
 use sdmmc_protocol::{
     Error,
     error::{ErrorContext, Phase},
-    sdio::card::SdioSdmmc,
+    sdio::{SdMmcIrqHost, native::SdMmcCard},
 };
 
 use super::{
@@ -40,6 +40,8 @@ use crate::{block::ProbeFdtBlock, mmio::iomap};
 const DWCMSHC_P_VENDOR_AREA1: usize = 0xe8;
 const DWCMSHC_AREA1_MASK: u16 = 0x0fff;
 const DWCMSHC_HOST_CTRL3: usize = 0x08;
+const DWCMSHC_HOST_CTRL3_CMD_CONFLICT: u32 = 1 << 0;
+const DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE: u32 = 1 << 4;
 const DWCMSHC_EMMC_CONTROL: usize = 0x2c;
 const DWCMSHC_CARD_IS_EMMC: u16 = 1 << 0;
 const DWCMSHC_EMMC_DLL_CTRL: usize = 0x800;
@@ -195,7 +197,11 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     }
     host.set_reset_hook(RockchipSdhciResetHook { resets });
     host.set_timer(&HOST_TIMER);
-    let dma = axklib::dma::device_with_mask(u32::MAX as u64);
+    let dma = axklib::dma::device(dma_api::DmaDeviceInfo::new(
+        dma_api::DmaDomainId::Direct,
+        crate::binding_resolver::dma_coherency_from_fdt(info),
+        dma_api::DmaConstraints::new(u32::MAX as u64),
+    ));
     let config = rockchip_sdhci_rdif_config(0, &dma);
     host.configure_dma(dma).map_err(|err| {
         OnProbeError::other(alloc::format!(
@@ -211,9 +217,10 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         media_name(preference),
         preference
     );
-    let mut card = SdioSdmmc::new(host);
+    let parts = host.into_parts();
+    let mut card = SdMmcCard::new(parts.bus);
     card.set_diagnostic_identity(identity);
-    let dev = sdhci_rdif::initializing_device(card, config, preference);
+    let dev = sdhci_rdif::BlockDevice::new_initializing(card, parts.irq, config, preference);
     let irq = probe.register_block(dev)?;
     info!("rockchip-sdhci block device registered irq={:?}", irq);
     Ok(())
@@ -251,7 +258,6 @@ fn init_rk3588_dwcmshc_after_reset(host: &mut Sdhci) -> Result<(), Error> {
         DWCMSHC_EMMC_MISC_CON,
         read_u32(base, DWCMSHC_EMMC_MISC_CON) | MISC_INTCLK_EN,
     );
-    write_u32(base, area1 + DWCMSHC_HOST_CTRL3, 0);
     write_u16(
         base,
         area1 + DWCMSHC_EMMC_CONTROL,
@@ -272,8 +278,15 @@ fn configure_rk3588_dwcmshc_clock(host: &mut Sdhci, target_hz: u32) -> Result<()
 
 fn configure_rk3588_dwcmshc_clock_regs(base: NonNull<u8>, area1: usize, target_hz: u32) {
     // Linux's rk35xx set_clock path disables command-conflict checks and
-    // programs the low-speed DLL bypass while SDHCI clock output is gated.
-    write_u32(base, area1 + DWCMSHC_HOST_CTRL3, 0);
+    // keeps the internal clock ungated while SDHCI clock output is gated.
+    // Preserve unrelated vendor bits because this register also carries
+    // controller-specific state outside the two Rockchip workarounds.
+    let host_ctrl3 = read_u32(base, area1 + DWCMSHC_HOST_CTRL3);
+    write_u32(
+        base,
+        area1 + DWCMSHC_HOST_CTRL3,
+        (host_ctrl3 & !DWCMSHC_HOST_CTRL3_CMD_CONFLICT) | DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE,
+    );
     if target_hz <= 52_000_000 {
         write_u32(base, DWCMSHC_EMMC_DLL_CTRL, 0);
         write_u32(
@@ -391,9 +404,12 @@ mod tests {
         let limits = sdmmc_protocol::rdif::config::queue_limits(&config);
 
         assert_eq!(limits.max_blocks_per_request, sdhci_host::ADMA2_MAX_BLOCKS);
-        assert_eq!(limits.max_segment_size, sdhci_host::ADMA2_MAX_TRANSFER_SIZE);
         assert_eq!(
-            limits.segment_boundary,
+            limits.dma.constraints().max_segment_size,
+            Some(sdhci_host::ADMA2_MAX_TRANSFER_SIZE)
+        );
+        assert_eq!(
+            limits.dma.constraints().boundary,
             Some(sdhci_host::DWC_MSHC_ADMA_BOUNDARY)
         );
         assert_eq!(limits.max_segments, 1);
@@ -424,7 +440,18 @@ mod tests {
         let mut host = unsafe { Sdhci::new(base) };
         init_rk3588_dwcmshc_after_reset(&mut host).unwrap();
 
-        assert_eq!(read_u32(base, 0x0500 + DWCMSHC_HOST_CTRL3), 0);
+        let host_ctrl3 = read_u32(base, 0x0500 + DWCMSHC_HOST_CTRL3);
+        assert_eq!(host_ctrl3 & DWCMSHC_HOST_CTRL3_CMD_CONFLICT, 0);
+        assert_eq!(
+            host_ctrl3 & DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE,
+            DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE,
+            "RK3588 DWCMSHC must keep its internal clock ungated during identification"
+        );
+        assert_eq!(
+            host_ctrl3 & !(DWCMSHC_HOST_CTRL3_CMD_CONFLICT | DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE),
+            u32::MAX & !(DWCMSHC_HOST_CTRL3_CMD_CONFLICT | DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE),
+            "clock setup must preserve unrelated vendor bits"
+        );
         assert_eq!(
             read_u16(base, 0x0500 + DWCMSHC_EMMC_CONTROL) & DWCMSHC_CARD_IS_EMMC,
             DWCMSHC_CARD_IS_EMMC
@@ -488,7 +515,18 @@ mod tests {
         let mut host = unsafe { Sdhci::new(base) };
         configure_rk3588_dwcmshc_clock(&mut host, 400_000).unwrap();
 
-        assert_eq!(read_u32(base, 0x0500 + DWCMSHC_HOST_CTRL3), 0);
+        let host_ctrl3 = read_u32(base, 0x0500 + DWCMSHC_HOST_CTRL3);
+        assert_eq!(host_ctrl3 & DWCMSHC_HOST_CTRL3_CMD_CONFLICT, 0);
+        assert_eq!(
+            host_ctrl3 & DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE,
+            DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE,
+            "clock programming must disable the DWCMSHC internal clock gate"
+        );
+        assert_eq!(
+            host_ctrl3 & !(DWCMSHC_HOST_CTRL3_CMD_CONFLICT | DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE),
+            u32::MAX & !(DWCMSHC_HOST_CTRL3_CMD_CONFLICT | DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE),
+            "clock programming must preserve unrelated vendor bits"
+        );
         assert_eq!(
             read_u32(base, DWCMSHC_EMMC_DLL_CTRL),
             DWCMSHC_EMMC_DLL_BYPASS | DWCMSHC_EMMC_DLL_START
@@ -505,7 +543,14 @@ mod tests {
     }
 
     fn test_dma() -> dma_api::DeviceDma {
-        dma_api::DeviceDma::new_legacy(u32::MAX as u64, &TEST_DMA)
+        dma_api::DeviceDma::new(
+            dma_api::DmaDeviceInfo::new(
+                dma_api::DmaDomainId::Direct,
+                dma_api::DmaCoherency::NonCoherent,
+                dma_api::DmaConstraints::new(u32::MAX as u64),
+            ),
+            &TEST_DMA,
+        )
     }
 
     struct TestDma;

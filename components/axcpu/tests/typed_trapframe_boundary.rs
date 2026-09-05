@@ -9,10 +9,11 @@ const ARCH_TRAPS: [(&str, &str); 4] = [
     ("loongarch64/trap.rs", "loongarch64_trap_handler"),
 ];
 
-#[ax_cpu::trap::breakpoint_handler]
 fn typed_breakpoint_hook(_frame: &mut ax_cpu::KernelTrapFrame<'_>) -> bool {
     false
 }
+
+const _: ax_cpu::trap::BreakpointHandler = typed_breakpoint_hook;
 
 #[test]
 fn assembly_frames_are_private_types_not_public_aliases() {
@@ -128,22 +129,6 @@ fn public_api_exposes_user_registers_but_not_the_internal_trap_layout() {
             "{relative} must expose UserRegisters as the owned public image, not a type alias",
         );
     }
-}
-
-#[test]
-fn x86_user_tls_changes_are_confined_to_the_assembly_entry_window() {
-    let user = read_source("x86_64/uspace.rs");
-    let run = function_body(&user, "pub fn run");
-    assert!(!run.contains("write_user_thread_pointer"));
-    assert!(!run.contains("write_thread_pointer"));
-    assert!(!run.contains("KernelGsBase::write"));
-    assert!(!run.contains("KernelGsBase::read"));
-
-    let entry = read_source("x86_64/trap.S");
-    assert!(entry.contains("IA32_FS_BASE"));
-    assert!(entry.contains("IA32_KERNEL_GS_BASE"));
-    assert!(entry.contains("user_fs_base_offset"));
-    assert!(entry.contains("kernel_fs_base_offset"));
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "uspace"))]

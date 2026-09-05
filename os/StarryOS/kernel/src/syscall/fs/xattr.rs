@@ -1,61 +1,33 @@
-//! Extended attribute syscalls backed by per-node `user_data`.
+//! Extended attribute syscalls backed by filesystem inode capabilities.
 //!
-//! Only the `user.*` namespace is supported here. Attributes are stored in a
-//! VFS node side map rather than in the underlying on-disk filesystem. Overlay
-//! paths need special handling: overlay entries are non-cacheable, so xattrs
-//! must be read from the current real target and written to the copy-up target
-//! instead of the temporary overlay entry.
+//! Only the `user.*` namespace is currently exposed by Starry. Persistent
+//! storage and create/replace atomicity belong to the selected filesystem;
+//! this layer owns userspace validation, overlay copy-up, and Linux ABI sizes.
 
 use alloc::{
-    collections::{BTreeMap, btree_map::Entry},
     string::String,
-    sync::Arc,
     vec::Vec,
 };
-use core::ffi::c_char;
+use core::{
+    ffi::c_char,
+    mem::{MaybeUninit, size_of},
+    slice,
+};
 
-use axfs_ng_vfs::Location;
+use ax_memory_addr::PAGE_SIZE_4K;
+use axfs_ng_vfs::{Location, VfsError, XattrSetMode};
 use linux_raw_sys::general::{
     AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, XATTR_CREATE, XATTR_LIST_MAX, XATTR_NAME_MAX,
-    XATTR_REPLACE, XATTR_SIZE_MAX,
+    XATTR_REPLACE, XATTR_SIZE_MAX, xattr_args,
 };
 use starry_vm::{vm_read_slice, vm_write_slice};
 
 use crate::{
-    Errno, StarryError, StarryResult,
+    StarryError, StarryResult,
     file::{fd_is_path, resolve_at},
     mm::{vm_load_path_string, vm_load_string},
     pseudofs::overlay,
-    sync::Mutex,
 };
-
-type XattrMap = BTreeMap<String, Vec<u8>>;
-
-#[derive(Default)]
-struct XattrStore {
-    attrs: Mutex<XattrMap>,
-}
-
-fn linux_errno(errno: Errno) -> StarryError {
-    StarryError::from(errno)
-}
-
-fn existing_store(loc: &Location) -> Option<Arc<XattrStore>> {
-    loc.user_data().get::<XattrStore>()
-}
-
-/// Return the existing xattr store or attach a new one to this real node.
-fn store_for_update(loc: &Location) -> Arc<XattrStore> {
-    loc.user_data().get_or_insert_with(XattrStore::default)
-}
-
-/// Snapshot existing attrs before copy-up.
-///
-/// Copy-up creates a different upper `Location`, so metadata kept in
-/// `user_data` must be transferred explicitly when the upper store is empty.
-fn existing_attrs(loc: &Location) -> Option<XattrMap> {
-    existing_store(loc).map(|store| store.attrs.lock().clone())
-}
 
 /// Read and validate an xattr name from userspace.
 fn read_name(name: *const c_char) -> StarryResult<String> {
@@ -95,6 +67,18 @@ fn resolve_path(path: *const c_char, nofollow: bool) -> StarryResult<Location> {
         .ok_or(StarryError::BadFileDescriptor)
 }
 
+fn resolve_xattrat(dirfd: i32, path: *const c_char, at_flags: u32) -> StarryResult<Location> {
+    const VALID_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+
+    if at_flags & !VALID_FLAGS != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    let path = vm_load_path_string(path)?;
+    resolve_at(dirfd, Some(&path), at_flags)?
+        .into_file()
+        .ok_or(StarryError::BadFileDescriptor)
+}
+
 /// Resolve an fd argument used by fd-based xattr syscalls.
 fn resolve_fd(fd: i32) -> StarryResult<Location> {
     if fd_is_path(fd) {
@@ -103,6 +87,35 @@ fn resolve_fd(fd: i32) -> StarryResult<Location> {
     resolve_at(fd, None, AT_EMPTY_PATH)?
         .into_file()
         .ok_or(StarryError::BadFileDescriptor)
+}
+
+fn read_xattr_args(args: *const xattr_args, args_size: usize) -> StarryResult<xattr_args> {
+    let known_size = size_of::<xattr_args>();
+    if args_size < known_size {
+        return Err(StarryError::InvalidInput);
+    }
+    if args_size > PAGE_SIZE_4K {
+        return Err(StarryError::ArgumentListTooLong);
+    }
+
+    let mut raw_args = MaybeUninit::<xattr_args>::uninit();
+    vm_read_slice(args, slice::from_mut(&mut raw_args))?;
+    if args_size > known_size {
+        let tail_size = args_size - known_size;
+        let mut tail = Vec::<u8>::with_capacity(tail_size);
+        vm_read_slice(
+            args.cast::<u8>().wrapping_add(known_size),
+            &mut tail.spare_capacity_mut()[..tail_size],
+        )?;
+        // SAFETY: vm_read_slice initialized the whole requested tail.
+        unsafe { tail.set_len(tail_size) };
+        if tail.iter().any(|byte| *byte != 0) {
+            return Err(StarryError::ArgumentListTooLong);
+        }
+    }
+
+    // SAFETY: vm_read_slice initialized the complete v0 structure.
+    Ok(unsafe { raw_args.assume_init() })
 }
 
 /// Copy a single xattr value to userspace, or return its required size.
@@ -120,13 +133,11 @@ fn copy_value_to_user(value: &[u8], user_value: *mut u8, size: usize) -> StarryR
 }
 
 /// Serialize xattr names as a nul-separated Linux listxattr buffer.
-fn serialize_names(attrs: Option<&XattrMap>) -> StarryResult<Vec<u8>> {
+fn serialize_names(attrs: &[Vec<u8>]) -> StarryResult<Vec<u8>> {
     let mut names = Vec::new();
-    if let Some(attrs) = attrs {
-        for name in attrs.keys() {
-            names.extend_from_slice(name.as_bytes());
-            names.push(0);
-        }
+    for name in attrs {
+        names.extend_from_slice(name);
+        names.push(0);
     }
     if names.len() > XATTR_LIST_MAX as usize {
         return Err(StarryError::ArgumentListTooLong);
@@ -157,28 +168,31 @@ fn get_xattr(
 ) -> StarryResult<isize> {
     let name = read_name(name)?;
     let loc = overlay::visible_target(&loc)?;
-    let value = {
-        let store = existing_store(&loc).ok_or_else(|| linux_errno(Errno::ENODATA))?;
-        store
-            .attrs
-            .lock()
-            .get(&name)
-            .cloned()
-            .ok_or_else(|| linux_errno(Errno::ENODATA))?
-    };
+    let value = loc.get_xattr(name.as_bytes())?;
     copy_value_to_user(&value, user_value, size)
 }
 
 /// List xattrs from the currently visible real node.
 fn list_xattr(loc: Location, list: *mut u8, size: usize) -> StarryResult<isize> {
     let loc = overlay::visible_target(&loc)?;
-    let names = {
-        let Some(store) = existing_store(&loc) else {
-            return copy_list_to_user(&[], list, size);
-        };
-        serialize_names(Some(&store.attrs.lock()))?
-    };
+    let names = serialize_names(&loc.list_xattrs()?)?;
     copy_list_to_user(&names, list, size)
+}
+
+fn copy_up_xattrs(source: &Location, target: &Location) -> StarryResult<()> {
+    if source.ptr_eq(target) {
+        return Ok(());
+    }
+    let names = match source.list_xattrs() {
+        Ok(names) => names,
+        Err(VfsError::OperationNotSupported | VfsError::Unsupported) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    for name in names {
+        let value = source.get_xattr(&name)?;
+        target.set_xattr(&name, &value, XattrSetMode::Upsert)?;
+    }
+    Ok(())
 }
 
 /// Set an xattr, copying lower-backed overlay files up before writing.
@@ -198,61 +212,36 @@ fn set_xattr(
 
     let name = read_name(name)?;
     let value = read_value(value, size)?;
-    let old_attrs = existing_attrs(&overlay::visible_target(&loc)?);
-
-    if let Some(attrs) = &old_attrs {
-        let exists = attrs.contains_key(&name);
-        if exists && flags & XATTR_CREATE != 0 {
-            return Err(StarryError::AlreadyExists);
-        }
-        if !exists && flags & XATTR_REPLACE != 0 {
-            return Err(linux_errno(Errno::ENODATA));
-        }
+    if loc.is_readonly() {
+        return Err(StarryError::ReadOnlyFilesystem);
+    }
+    let source = overlay::visible_target(&loc)?;
+    let target = overlay::ensure_copy_up_target(&loc)?;
+    copy_up_xattrs(&source, &target)?;
+    let mode = if flags & XATTR_CREATE != 0 {
+        XattrSetMode::Create
     } else if flags & XATTR_REPLACE != 0 {
-        return Err(linux_errno(Errno::ENODATA));
-    }
-
-    let loc = overlay::ensure_copy_up_target(&loc)?;
-    let store = store_for_update(&loc);
-    let mut attrs = store.attrs.lock();
-    if attrs.is_empty()
-        && let Some(old_attrs) = old_attrs
-    {
-        *attrs = old_attrs;
-    }
-    match attrs.entry(name) {
-        Entry::Occupied(mut entry) => {
-            if flags & XATTR_CREATE != 0 {
-                return Err(StarryError::AlreadyExists);
-            }
-            entry.insert(value);
-        }
-        Entry::Vacant(entry) => {
-            if flags & XATTR_REPLACE != 0 {
-                return Err(linux_errno(Errno::ENODATA));
-            }
-            entry.insert(value);
-        }
-    }
+        XattrSetMode::Replace
+    } else {
+        XattrSetMode::Upsert
+    };
+    target.set_xattr(name.as_bytes(), &value, mode)?;
     Ok(0)
 }
 
 /// Remove an xattr, copying lower-backed overlay files up before mutation.
 fn remove_xattr(loc: Location, name: *const c_char) -> StarryResult<isize> {
     let name = read_name(name)?;
-    let old_attrs = existing_attrs(&overlay::visible_target(&loc)?)
-        .ok_or_else(|| linux_errno(Errno::ENODATA))?;
-    if !old_attrs.contains_key(&name) {
-        return Err(linux_errno(Errno::ENODATA));
+    if loc.is_readonly() {
+        return Err(StarryError::ReadOnlyFilesystem);
     }
-
-    let loc = overlay::ensure_copy_up_target(&loc)?;
-    let store = store_for_update(&loc);
-    let mut attrs = store.attrs.lock();
-    if attrs.is_empty() {
-        *attrs = old_attrs;
-    }
-    attrs.remove(&name);
+    let source = overlay::visible_target(&loc)?;
+    // Probe before copy-up so removing a missing lower attribute does not
+    // materialize an upper inode.
+    source.get_xattr(name.as_bytes())?;
+    let target = overlay::ensure_copy_up_target(&loc)?;
+    copy_up_xattrs(&source, &target)?;
+    target.remove_xattr(name.as_bytes())?;
     Ok(0)
 }
 
@@ -295,6 +284,26 @@ pub fn sys_fgetxattr(
     get_xattr(resolve_fd(fd)?, name, value, size)
 }
 
+pub fn sys_getxattrat(
+    dirfd: i32,
+    path: *const c_char,
+    at_flags: u32,
+    name: *const c_char,
+    args: *const xattr_args,
+    args_size: usize,
+) -> StarryResult<isize> {
+    let args = read_xattr_args(args, args_size)?;
+    if args.flags != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    get_xattr(
+        resolve_xattrat(dirfd, path, at_flags)?,
+        name,
+        args.value as *mut u8,
+        args.size as usize,
+    )
+}
+
 pub fn sys_setxattr(
     path: *const c_char,
     name: *const c_char,
@@ -303,6 +312,24 @@ pub fn sys_setxattr(
     flags: i32,
 ) -> StarryResult<isize> {
     set_xattr(resolve_path(path, false)?, name, value, size, flags)
+}
+
+pub fn sys_setxattrat(
+    dirfd: i32,
+    path: *const c_char,
+    at_flags: u32,
+    name: *const c_char,
+    args: *const xattr_args,
+    args_size: usize,
+) -> StarryResult<isize> {
+    let args = read_xattr_args(args, args_size)?;
+    set_xattr(
+        resolve_xattrat(dirfd, path, at_flags)?,
+        name,
+        args.value as *const u8,
+        args.size as usize,
+        args.flags as i32,
+    )
 }
 
 pub fn sys_lsetxattr(
@@ -337,19 +364,25 @@ pub fn sys_fremovexattr(fd: i32, name: *const c_char) -> StarryResult<isize> {
     remove_xattr(resolve_fd(fd)?, name)
 }
 
-#[cfg(axtest)]
-pub(crate) fn xattr_name_and_value_validation_rules_hold_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn xattr_name_and_value_validation_rules_hold_for_test() -> bool {
     use linux_raw_sys::general::{XATTR_NAME_MAX, XATTR_SIZE_MAX};
-    // Test read_name validation logic
-    // Empty name should fail
-    assert!(true); // read_name requires vm_load_string, can't test directly
-    // But we can test the size limits
+
+    // `read_name` itself needs a live user address space; host tests cover the
+    // pure size and namespace-prefix rules used after loading the name.
     assert!(XATTR_NAME_MAX as usize > 0);
     assert!(XATTR_SIZE_MAX as usize > 0);
-    // Test that "user." prefix is required (conceptual test)
     let valid_prefix = "user.test";
     let invalid_prefix = "security.test";
     assert!(valid_prefix.starts_with("user."));
     assert!(!invalid_prefix.starts_with("user."));
     true
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    #[test]
+    fn xattr_name_and_value_validation_rules_hold() {
+        assert!(super::xattr_name_and_value_validation_rules_hold_for_test());
+    }
 }

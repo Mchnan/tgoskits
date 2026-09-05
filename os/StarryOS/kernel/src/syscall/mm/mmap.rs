@@ -243,7 +243,6 @@ pub fn sys_mmap(
                     .as_ref()
                     .expect("file-backed mmap has cached device_mmap")
                 {
-                    #[cfg(feature = "rknpu")]
                     Ok(DeviceMmap::PhysicalCached(..)) => false,
                     Ok(DeviceMmap::Physical(..))
                     | Ok(DeviceMmap::PhysicalResolved(..))
@@ -379,7 +378,6 @@ pub fn sys_mmap(
                             None => Backend::new_linear(start, pa_va_offset, true),
                         }
                     }
-                    #[cfg(feature = "rknpu")]
                     Ok(DeviceMmap::PhysicalCached(mut range, retain)) => {
                         range.start += offset;
                         if range.is_empty() {
@@ -471,7 +469,6 @@ pub fn sys_mmap(
                                             None => Backend::new_linear(start, pa_va_offset, true),
                                         }
                                     }
-                                    #[cfg(feature = "rknpu")]
                                     DeviceMmap::PhysicalCached(range, retain) => {
                                         if range.is_empty() {
                                             return Err(StarryError::InvalidInput);
@@ -679,7 +676,7 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> StarryResult<isize
     Ok(0)
 }
 
-const MREMAP_VALID_FLAGS: u32 = MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP;
+const MREMAP_VALID_FLAGS: usize = (MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) as usize;
 
 fn find_free(
     aspace: &crate::mm::AddrSpace,
@@ -780,7 +777,7 @@ pub fn sys_mremap(
     addr: usize,
     old_size: usize,
     new_size: usize,
-    flags: u32,
+    flags: usize,
     new_addr: usize,
 ) -> StarryResult<isize> {
     debug!(
@@ -796,9 +793,9 @@ pub fn sys_mremap(
     }
 
     let addr = VirtAddr::from(addr);
-    let may_move = flags & MREMAP_MAYMOVE != 0;
-    let fixed = flags & MREMAP_FIXED != 0;
-    let dontunmap = flags & MREMAP_DONTUNMAP != 0;
+    let may_move = flags & MREMAP_MAYMOVE as usize != 0;
+    let fixed = flags & MREMAP_FIXED as usize != 0;
+    let dontunmap = flags & MREMAP_DONTUNMAP as usize != 0;
 
     if (fixed || dontunmap) && !may_move {
         return Err(StarryError::InvalidInput);
@@ -1200,8 +1197,8 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> StarryResult<isize>
     Ok(0)
 }
 
-#[cfg(axtest)]
-pub(crate) fn mmap_capped_device_map_len_rules_hold_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn mmap_capped_device_map_len_rules_hold_for_test() -> bool {
     // capped_device_map_len: returns min of request and aligned available.
     let page_size = PAGE_SIZE_4K;
     assert!(capped_device_map_len(1000, 4096, page_size) == 1000); // request < available
@@ -1209,4 +1206,12 @@ pub(crate) fn mmap_capped_device_map_len_rules_hold_for_test() -> bool {
     assert!(capped_device_map_len(0, 8192, page_size) == 0); // zero request
     assert!(capped_device_map_len(5000, 4096, page_size) == 4096); // request > available (aligned)
     true
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    #[test]
+    fn mmap_capped_device_map_len_rules_hold() {
+        assert!(super::mmap_capped_device_map_len_rules_hold_for_test());
+    }
 }

@@ -41,15 +41,6 @@ pub use self::{
     cred::*, futex::*, ops::*, posix_timer::PosixTimerTable, process::*, resources::*, seccomp::*,
     signal::*, stat::*, timer::*, user::*,
 };
-#[cfg(axtest)]
-pub(crate) use self::{
-    ops::decode_wait_status_rules_hold_for_test,
-    pid::pid_identity_state_machine_rules_hold_for_test,
-    posix_timer::posix_timer_clock_validation_rules_hold_for_test,
-    seccomp::seccomp_action_and_precedence_rules_hold_for_test,
-    seccomp::seccomp_bpf_constants_hold_for_test,
-    timer::itimer_type_signo_and_time_conversion_rules_hold_for_test,
-};
 pub(crate) use self::{pid::*, process_identity::*};
 use crate::{
     StarryResult,
@@ -150,6 +141,14 @@ pub struct Thread {
 
     /// The process data shared by all threads in the process.
     pub proc_data: Arc<ProcessData>,
+
+    /// Keeps the page-table object backing this task's active root alive.
+    ///
+    /// The process slot may clear retired user mappings once no thread can
+    /// access them, but a task finishing kernel exit can still execute with
+    /// that root installed. This lease prevents the page-table root from being
+    /// reclaimed before the scheduler reclaims the task itself.
+    page_table_lease: IrqMutex<Arc<Mutex<AddrSpace>>>,
 
     /// Resources whose sharing is controlled by clone/unshare flags.
     ///
@@ -276,6 +275,7 @@ impl Thread {
         scope: Scope,
     ) -> Box<Self> {
         let cred = parent_cred.unwrap_or_else(|| Arc::new(Cred::root()));
+        let page_table_lease = proc_data.aspace();
         let tid = identity
             .visible_number(&ROOT_PID_NS)
             .expect("every Starry PID identity is visible from the root namespace")
@@ -291,6 +291,7 @@ impl Thread {
                 signal_mask,
             ),
             proc_data,
+            page_table_lease: IrqMutex::new(page_table_lease),
             scope: ContextSwitchRwLock::new(scope),
             clear_child_tid: AtomicUsize::new(0),
             robust_list_head: AtomicUsize::new(0),
@@ -341,6 +342,15 @@ impl Thread {
         unsafe { ActiveScope::set(&scope) };
         core::mem::forget(scope);
         ret
+    }
+
+    /// Replaces the page-table lease associated with the current task.
+    ///
+    /// The retired owner is returned so its destructor runs outside the
+    /// IRQ-disabled lock and only after the caller switches page tables.
+    fn replace_page_table_lease(&self, new_aspace: Arc<Mutex<AddrSpace>>) -> Arc<Mutex<AddrSpace>> {
+        let mut guard = self.page_table_lease.lock();
+        core::mem::replace(&mut *guard, new_aspace)
     }
 
     /// Returns the root-namespace TID for this thread.
@@ -1026,6 +1036,9 @@ pub struct ProcessData {
     /// POSIX per-process interval timers (timer_create/timer_settime/etc.)
     pub posix_timers: Arc<PosixTimerTable>,
 
+    /// Process-wide `ITIMER_REAL` state shared by all threads.
+    real_timer: IrqMutex<ProcessRealTimer>,
+
     /// `true` when this process shares its [`AddrSpace`] with a parent/sibling
     /// (`CLONE_VM`, e.g. vfork / posix_spawn). In that case the last thread must
     /// **not** clear the address space on exit — the co-owner may still be
@@ -1166,6 +1179,7 @@ impl ProcessData {
             personality: AtomicUsize::new(0),
 
             posix_timers: Arc::new(PosixTimerTable::default()),
+            real_timer: IrqMutex::new(ProcessRealTimer::default()),
 
             vm_aspace_shared: AtomicBool::new(vm_aspace_shared),
             aspace_slot_released: AtomicBool::new(false),
@@ -1181,6 +1195,27 @@ impl ProcessData {
         let aspace_arc = this.aspace.lock().clone();
         crate::mm::attach_process_slot(&aspace_arc);
         this
+    }
+
+    /// Replaces this process's `ITIMER_REAL` timer.
+    pub fn set_real_timer(
+        &self,
+        interval_ns: usize,
+        remaining_ns: usize,
+    ) -> (TimeValue, TimeValue) {
+        self.real_timer
+            .lock()
+            .set(&self.identity, interval_ns, remaining_ns)
+    }
+
+    /// Returns this process's `ITIMER_REAL` interval and remaining time.
+    pub fn get_real_timer(&self) -> (TimeValue, TimeValue) {
+        self.real_timer.lock().get()
+    }
+
+    /// Polls this process's `ITIMER_REAL` timer.
+    pub fn poll_real_timer(&self) -> bool {
+        self.real_timer.lock().poll_expired(&self.identity)
     }
 
     /// Returns this process generation's stable PID identity.
@@ -1464,6 +1499,16 @@ impl ProcessData {
 
     /// Record that this tracee is stopped by `signo`.
     pub fn set_ptrace_stop(&self, tid: TidNumber, signo: Signo, uctx: &UserContext) {
+        self.set_ptrace_stop_record(tid, signo, uctx, None);
+    }
+
+    fn set_ptrace_stop_record(
+        &self,
+        tid: TidNumber,
+        signo: Signo,
+        uctx: &UserContext,
+        syscall_no: Option<usize>,
+    ) {
         let pending_event = self.ptrace_pending_event.lock().remove(&tid);
         self.ptrace_stop.lock().insert(
             tid,
@@ -1471,8 +1516,8 @@ impl ProcessData {
                 signo: Some(signo),
                 uctx: *uctx,
                 siginfo: Some(SignalInfo::new_kernel(signo)),
-                is_syscall: false,
-                syscall_no: None,
+                is_syscall: syscall_no.is_some(),
+                syscall_no,
                 reported: false,
                 event: pending_event.as_ref().map_or(0, |event| event.event),
                 event_msg: pending_event
@@ -1491,11 +1536,7 @@ impl ProcessData {
         uctx: &UserContext,
         syscall_no: usize,
     ) {
-        self.set_ptrace_stop(tid, signo, uctx);
-        if let Some(stop) = self.ptrace_stop.lock().get_mut(&tid) {
-            stop.is_syscall = true;
-            stop.syscall_no = Some(syscall_no);
-        }
+        self.set_ptrace_stop_record(tid, signo, uctx, Some(syscall_no));
     }
 
     pub fn ptrace_stop_tid(&self) -> Option<TidNumber> {
@@ -2188,12 +2229,17 @@ impl ProcessData {
     pub fn replace_current_aspace(&self, current: &TaskInner, new_aspace: Arc<Mutex<AddrSpace>>) {
         let new_page_table_root = new_aspace.lock().page_table_root();
         crate::mm::attach_process_slot(&new_aspace);
-        let old = {
+        let old_process_aspace = {
             let mut guard = self.aspace.lock();
-            core::mem::replace(&mut *guard, new_aspace)
+            core::mem::replace(&mut *guard, new_aspace.clone())
         };
+        let old_page_table_lease = current.as_thread().replace_page_table_lease(new_aspace);
         current.switch_page_table(new_page_table_root);
-        crate::mm::release_process_slot(&old);
+        // Every retired sibling has completed its user-memory exit work before
+        // leaving the thread group. This may clear its user VMAs; each task's
+        // lease still keeps the installed page-table root alive until reclaim.
+        crate::mm::release_process_slot(&old_process_aspace);
+        drop(old_page_table_lease);
     }
 
     /// Set the vfork completion (called on the child after a vfork,
@@ -2290,10 +2336,15 @@ impl Drop for ProcessData {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(axtest)]
+    use super::*;
+    #[cfg(not(axtest))]
     use core::sync::atomic::{AtomicBool, Ordering};
 
+    #[cfg(not(axtest))]
     use super::NextSignalCheckBlock;
 
+    #[cfg(not(axtest))]
     #[test]
     fn old_global_signal_check_block_leaks_between_threads() {
         static OLD_BLOCK_NEXT_SIGNAL_CHECK: AtomicBool = AtomicBool::new(false);
@@ -2318,6 +2369,7 @@ mod tests {
         assert!(!unblock_next_signal());
     }
 
+    #[cfg(not(axtest))]
     #[test]
     fn per_thread_signal_check_block_is_isolated() {
         let thread_a = NextSignalCheckBlock::new();
@@ -2331,5 +2383,70 @@ mod tests {
         );
         assert!(thread_a.unblock());
         assert!(!thread_a.unblock());
+    }
+
+    #[cfg(axtest)]
+    #[axtest::axtest]
+    fn thread_page_table_lease_follows_task_lifetime() {
+        crate::cgroup::init();
+        let identity = PidReservation::reserve(&ROOT_PID_NS, PidReservationKind::ProcessLeader)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let tid_lease = identity.acquire_role::<Tid>().unwrap();
+        let tgid_lease = identity.acquire_role::<Tgid>().unwrap();
+        let process = process::new_isolated_process_for_test(identity.clone());
+
+        let mut old_aspace = crate::mm::new_user_aspace_empty().unwrap();
+        crate::mm::copy_from_kernel(&mut old_aspace).unwrap();
+        let old_aspace = Arc::new(Mutex::new(old_aspace));
+        let old_page_table_root = old_aspace.lock().page_table_root();
+        let old_aspace_weak = Arc::downgrade(&old_aspace);
+        let process_data = ProcessData::new(
+            process,
+            identity.clone(),
+            tgid_lease,
+            ProcessDataInit {
+                image: ProcessImage::new(
+                    String::new(),
+                    Arc::new(Vec::new()),
+                    Arc::new(Vec::new()),
+                    Vec::new(),
+                    String::new(),
+                    String::new(),
+                ),
+                aspace: old_aspace.clone(),
+                signal_actions: Arc::default(),
+                exit_signal: None,
+                wait_parent_tid: TidNumber::from(identity.root_number()),
+                vm_aspace_shared: false,
+            },
+        );
+        let thread = Thread::new(
+            identity.clone(),
+            tid_lease,
+            process_data.clone(),
+            None,
+            SignalSet::default(),
+            Scope::new(),
+        );
+
+        let replacement = Arc::new(Mutex::new(crate::mm::new_user_aspace_empty().unwrap()));
+        crate::mm::attach_process_slot(&replacement);
+        let retired = {
+            let mut guard = process_data.aspace.lock();
+            core::mem::replace(&mut *guard, replacement)
+        };
+        crate::mm::release_process_slot(&retired);
+        drop(retired);
+        drop(old_aspace);
+
+        assert!(old_aspace_weak
+            .upgrade()
+            .is_some_and(|aspace| aspace.lock().page_table_root() == old_page_table_root));
+        identity.mark_task_exited();
+        drop(thread);
+        assert!(old_aspace_weak.upgrade().is_none());
+        drop(process_data);
     }
 }

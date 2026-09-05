@@ -102,37 +102,18 @@ impl fmt::Debug for Session {
     }
 }
 
-#[cfg(axtest)]
-pub(crate) fn duplicate_live_session_identity_is_rejected_for_test() -> bool {
-    let namespace = crate::task::new_test_pid_namespace();
-    let (identity, _tgid) = crate::task::new_test_process_identity(&namespace);
-    let _session = Session::new(identity.clone()).unwrap();
-    matches!(
-        Session::new(identity),
-        Err(crate::StarryError::AlreadyExists)
-    )
-}
-
-#[cfg(test)]
+#[cfg(all(test, not(axtest)))]
 mod tests {
-    extern crate std;
-
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-
     use super::*;
-    use crate::StarryError;
 
     #[test]
-    fn duplicate_live_session_identity_is_rejected_without_panicking() {
+    fn duplicate_live_session_identity_is_rejected() {
         let namespace = crate::task::new_test_pid_namespace();
         let (identity, _tgid) = crate::task::new_test_process_identity(&namespace);
         let _session = Session::new(identity.clone()).unwrap();
-
-        let duplicate = catch_unwind(AssertUnwindSafe(|| Session::new(identity)));
-
-        assert!(
-            matches!(duplicate, Ok(Err(StarryError::AlreadyExists))),
-            "a competing setsid must return the role conflict without panicking the kernel"
-        );
+        assert!(matches!(
+            Session::new(identity),
+            Err(crate::StarryError::AlreadyExists)
+        ));
     }
 }

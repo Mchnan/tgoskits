@@ -24,7 +24,7 @@ use bitflags::bitflags;
 use hashbrown::HashMap;
 use linux_raw_sys::general::{EPOLLET, EPOLLEXCLUSIVE, EPOLLONESHOT, epoll_event};
 
-#[cfg(axtest)]
+#[cfg(all(test, axtest))]
 use super::epoll_axtest::epoll_add_test_barrier;
 use super::epoll_topology::{
     EpollTopology, EpollTopologyLink, commit_nested_link, detach_nested_link, lock_epoll_topology,
@@ -125,6 +125,7 @@ struct EntryKey {
     fd: i32,
     file: Weak<dyn FileLike>,
 }
+
 impl EntryKey {
     fn new(fd: i32) -> StarryResult<Self> {
         let file = get_file_like(fd)?;
@@ -139,7 +140,7 @@ impl EntryKey {
         self.file.upgrade()
     }
 
-    #[cfg(axtest)]
+    #[cfg(test)]
     fn for_test(fd: i32, file: &Arc<dyn FileLike>) -> Self {
         Self {
             fd,
@@ -153,6 +154,7 @@ impl Hash for EntryKey {
         (self.fd, self.file.as_ptr()).hash(state);
     }
 }
+
 impl PartialEq for EntryKey {
     fn eq(&self, other: &Self) -> bool {
         self.fd == other.fd && Weak::ptr_eq(&self.file, &other.file)
@@ -509,7 +511,10 @@ impl EpollInner {
         // One file readiness transition can invoke multiple registered
         // callbacks for dup aliases. Publish all matching interests before
         // waking epoll_wait callers so a re-entrant waiter cannot consume and
-        // requeue the first LT item ahead of an alias that is also ready.
+        // requeue the first LT item ahead of an alias from the same callback
+        // batch. Do not call back into the target here: poll wakeups may run
+        // while the target holds an internal lock, and readiness is rechecked
+        // when epoll_wait consumes each queued interest.
         let mut published = 0;
         let mut interests = interests;
         // Linux's non-exclusive poll callbacks are linked at the wait-queue
@@ -526,13 +531,7 @@ impl EpollInner {
             {
                 continue;
             }
-            let Some(file) = interest.key.get_file() else {
-                self.remove_invalid_interest(&interest);
-                continue;
-            };
-            if !match_ready_events(file.poll(), interest.event.events).is_empty()
-                && interest.try_mark_in_queue()
-            {
+            if interest.try_mark_in_queue() {
                 self.enqueue_marked_ready_without_wake(&interest);
                 published += 1;
                 trace!(
@@ -638,6 +637,32 @@ impl Epoll {
         self.inner.register_waker_only(interest);
     }
 
+    fn register_waker_and_recheck(&self, interest: &Arc<EpollInterest>) {
+        if !interest.can_refresh_waker_from_current_process() {
+            return;
+        }
+
+        let Some(file) = interest.key.get_file() else {
+            return;
+        };
+
+        if !interest.is_enabled() {
+            return;
+        }
+
+        let waker = Waker::from(Arc::new(InterestWaker {
+            epoll: Arc::downgrade(&self.inner),
+            interest: Arc::downgrade(interest),
+        }));
+
+        let mut context = Context::from_waker(&waker);
+        file.register(&mut context, register_events(interest.event.events));
+
+        if !match_ready_events(file.poll(), interest.event.events).is_empty() {
+            waker.wake_by_ref();
+        }
+    }
+
     /// Registers enabled interests with the thread currently waiting in epoll.
     pub fn register_waiter_wakers(&self) -> StarryResult {
         let interests = self.inner.snapshot_interests()?;
@@ -701,7 +726,7 @@ impl Epoll {
             .and_then(|file| file.downcast_arc::<Epoll>().ok())
             .map(|epoll| Arc::clone(&epoll.inner));
 
-        #[cfg(axtest)]
+        #[cfg(all(test, axtest))]
         epoll_add_test_barrier();
 
         // Lock order for topology mutation is global topology mutex, then one
@@ -757,7 +782,7 @@ impl Epoll {
         Ok(())
     }
 
-    #[cfg(axtest)]
+    #[cfg(all(test, axtest))]
     pub(super) fn add_nested_for_test(&self, fd: i32, target: Arc<Epoll>) -> StarryResult<()> {
         let target: Arc<dyn FileLike> = target;
         self.add_interest(
@@ -770,7 +795,7 @@ impl Epoll {
         )
     }
 
-    #[cfg(axtest)]
+    #[cfg(all(test, not(axtest)))]
     pub(super) fn add_file_for_test(
         &self,
         fd: i32,
@@ -926,18 +951,12 @@ impl Epoll {
                     }
                 }
                 ConsumeResult::NoEvent => {
-                    // Spurious wakeup: the waker fired but file.poll() did
-                    // not match the interest mask (e.g. a shared PollSet
-                    // wake on a socket that has only EPOLLOUT ready when
-                    // the interest is for EPOLLIN).  Re-arm with a plain
-                    // waker registration — using check_and_register_waker
-                    // here would immediately re-queue the interest via
-                    // waker.wake_by_ref() whenever file.poll() is non-empty,
-                    // which a connected TCP socket (always EPOLLOUT-ready)
-                    // satisfies on every iteration, producing a tight loop
-                    // that fills the ready_queue with phantom events.
+                    // Register before rechecking only this interest's event
+                    // mask. This closes the consume-to-register lost-wakeup
+                    // window without treating an unrelated persistent event
+                    // such as EPOLLOUT as a phantom match.
                     interest.mark_not_in_queue();
-                    self.register_waker_only(&interest);
+                    self.register_waker_and_recheck(&interest);
                 }
             }
         }
@@ -964,8 +983,8 @@ impl Epoll {
     }
 }
 
-#[cfg(axtest)]
-pub(crate) fn epoll_event_matching_rules_hold_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn epoll_event_matching_rules_hold_for_test() -> bool {
     use axpoll::IoEvents as E;
 
     // No overlap between current and interested (and no ALWAYS_POLL bits in
@@ -1012,9 +1031,24 @@ pub(crate) fn epoll_event_matching_rules_hold_for_test() -> bool {
         && !TriggerMode::OneShot { fired: true }.is_enabled()
 }
 
-#[cfg(axtest)]
-pub(crate) fn epoll_hup_does_not_synthesize_readable_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn epoll_hup_does_not_synthesize_readable_for_test() -> bool {
     let matched = match_ready_events(IoEvents::HUP, IoEvents::IN);
 
     matched.bits() == IoEvents::HUP.bits()
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    #[cfg(all(test, not(axtest)))]
+    #[test]
+    fn epoll_event_matching_rules_hold() {
+        assert!(super::epoll_event_matching_rules_hold_for_test());
+    }
+
+    #[cfg(all(test, not(axtest)))]
+    #[test]
+    fn epoll_hup_does_not_synthesize_readable() {
+        assert!(super::epoll_hup_does_not_synthesize_readable_for_test());
+    }
 }

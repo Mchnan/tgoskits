@@ -118,11 +118,15 @@ fn do_select(
                 for ((fd, interested), index) in fds.0.iter().zip(fd_indices.iter().copied()) {
                     let events = fd.poll();
                     let always_report = events & IoEvents::ALWAYS_POLL;
+                    // Linux fs/select.c: POLLIN_SET carries HUP|ERR but
+                    // POLLOUT_SET carries only ERR, so a hangup makes a fd
+                    // readable (read returns EOF) yet never writable.
+                    let write_report = events & IoEvents::ERR;
                     let selected = events & *interested;
                     let selected_read = selected.contains(IoEvents::IN)
                         || (read_set.0.get(index) && !always_report.is_empty());
                     let selected_write = selected.contains(IoEvents::OUT)
-                        || (write_set.0.get(index) && !always_report.is_empty());
+                        || (write_set.0.get(index) && !write_report.is_empty());
                     let selected_except =
                         selected.contains(IoEvents::ERR) && except_set.0.get(index);
 
@@ -209,20 +213,28 @@ pub fn sys_pselect6(
     )
 }
 
-#[cfg(axtest)]
-pub(crate) fn select_fd_set_and_validation_rules_hold_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn select_fd_set_and_validation_rules_hold_for_test() -> bool {
     use linux_raw_sys::general::__FD_SETSIZE;
 
     // Test nfds validation: must be <= __FD_SETSIZE
     let valid_nfds = 1024u32;
-    assert!(valid_nfds <= __FD_SETSIZE as u32);
+    assert!(valid_nfds <= __FD_SETSIZE);
 
-    let max_nfds = __FD_SETSIZE as u32;
-    assert!(max_nfds <= __FD_SETSIZE as u32);
+    let max_nfds = __FD_SETSIZE;
+    assert!(max_nfds <= __FD_SETSIZE);
 
     // Invalid: nfds > __FD_SETSIZE
-    let invalid_nfds = (__FD_SETSIZE + 1) as u32;
-    assert!(invalid_nfds > __FD_SETSIZE as u32);
+    let invalid_nfds = __FD_SETSIZE + 1;
+    assert!(invalid_nfds > __FD_SETSIZE);
 
     true
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    #[test]
+    fn select_fd_set_and_validation_rules_hold() {
+        assert!(super::select_fd_set_and_validation_rules_hold_for_test());
+    }
 }

@@ -1,7 +1,6 @@
 use ax_alloc::AllocError;
 #[cfg(feature = "paging")]
 use ax_hal::cache::TlbShootdownError;
-#[cfg(feature = "irq")]
 use ax_hal::irq::IrqError;
 #[cfg(feature = "paging")]
 use ax_mm::MmError;
@@ -9,7 +8,6 @@ use ax_mm::MmError;
 use axfs_ng_vfs::VfsError;
 #[cfg(feature = "paging")]
 use axklib::KlibError;
-#[cfg(feature = "serial")]
 use rdif_serial::ConfigError;
 
 /// Errors owned by the ArceOS runtime layer.
@@ -24,7 +22,6 @@ pub enum RuntimeError {
     #[error(transparent)]
     TlbShootdown(#[from] TlbShootdownError),
     /// Interrupt discovery or registration failed.
-    #[cfg(feature = "irq")]
     #[error(transparent)]
     Irq(#[from] IrqError),
     /// Runtime-owned storage allocation failed.
@@ -35,9 +32,17 @@ pub enum RuntimeError {
     #[error(transparent)]
     Vfs(#[from] VfsError),
     /// A UART rejected its requested configuration.
-    #[cfg(feature = "serial")]
     #[error(transparent)]
     SerialConfig(#[from] ConfigError),
+    /// A platform console ownership transition was requested out of order.
+    #[error(transparent)]
+    ConsoleHandoff(#[from] ax_hal::console::ConsoleHandoffError),
+    /// Another serial runtime already owns console log routing.
+    #[error("another serial runtime already owns console routing")]
+    SerialConsoleBusy,
+    /// The runtime console handoff failed after early ownership was revoked.
+    #[error("runtime console failed closed")]
+    ConsoleFailedClosed,
     /// A serial operation requires a running port.
     #[error("serial runtime is not started")]
     SerialNotStarted,
@@ -79,7 +84,6 @@ pub(crate) fn runtime_error_to_klib_error(error: RuntimeError) -> KlibError {
             TlbShootdownError::Timeout => KlibError::TimedOut,
             TlbShootdownError::Platform => KlibError::Io,
         },
-        #[cfg(feature = "irq")]
         RuntimeError::Irq(error) => match error {
             IrqError::InvalidIrq | IrqError::InvalidCpu => KlibError::InvalidInput,
             IrqError::CpuOffline | IrqError::Unsupported => KlibError::Unsupported,
@@ -100,7 +104,6 @@ pub(crate) fn runtime_error_to_klib_error(error: RuntimeError) -> KlibError {
             VfsError::Unsupported | VfsError::OperationNotSupported => KlibError::Unsupported,
             _ => KlibError::Io,
         },
-        #[cfg(feature = "serial")]
         RuntimeError::SerialConfig(error) => match error {
             ConfigError::InvalidBaudrate
             | ConfigError::UnsupportedDataBits
@@ -109,6 +112,9 @@ pub(crate) fn runtime_error_to_klib_error(error: RuntimeError) -> KlibError {
             ConfigError::Timeout => KlibError::TimedOut,
             ConfigError::RegisterError => KlibError::Io,
         },
+        RuntimeError::ConsoleHandoff(_) => KlibError::BadState,
+        RuntimeError::SerialConsoleBusy => KlibError::ResourceBusy,
+        RuntimeError::ConsoleFailedClosed => KlibError::BadState,
         RuntimeError::SerialNotStarted => KlibError::BadState,
         RuntimeError::SerialControlBusy => KlibError::ResourceBusy,
         RuntimeError::WouldBlock => KlibError::ResourceBusy,

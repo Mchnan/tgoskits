@@ -319,7 +319,8 @@ impl HyperCall {
                     .map(|task| task.vcpu.id())
                     .and_then(|vcpu_id| {
                         self.vm
-                            .with_runtime(|runtime| Ok(runtime.try_reserve_cpu_off(vcpu_id)))
+                            .runtime_handle()
+                            .map(|runtime| runtime.try_reserve_cpu_off(vcpu_id))
                             .ok()
                     })
                     .unwrap_or(false);
@@ -409,7 +410,7 @@ impl HyperCall {
                     shm_base_gpa,
                     ivc_channel.base_hpa(),
                     actual_size,
-                    MappingFlags::READ | MappingFlags::WRITE,
+                    shared_memory_mapping_flags(),
                 ) {
                     if let Err(release_err) =
                         self.vm.release_ivc_channel(shm_base_gpa, shm_region_size)
@@ -539,12 +540,11 @@ impl HyperCall {
                     }
                 };
 
-                // TODO: separate the mapping flags of metadata and data.
                 if let Err(err) = self.vm.map_region(
                     shm_base_gpa,
                     base_hpa,
                     actual_size,
-                    MappingFlags::READ | MappingFlags::WRITE,
+                    shared_memory_mapping_flags(),
                 ) {
                     match ivc::unsubscribe_from_channel_of_publisher(
                         publisher_vm_id,
@@ -659,12 +659,10 @@ impl HyperCall {
                         detail: "IVC notify target VM does not exist".into(),
                     }
                 })?;
-                target_vm
-                    .with_runtime(|runtime| {
-                        runtime.notify_all();
-                        Ok(())
-                    })
+                let target_runtime = target_vm
+                    .runtime_handle()
                     .map_err(|error| self.operation_error("wake IVC notify target VM", error))?;
+                target_runtime.notify_all();
                 let target_devices = target_vm.get_devices().map_err(|error| {
                     self.operation_error("get IVC notify target devices", error)
                 })?;

@@ -1,6 +1,6 @@
 [package]
 name = "ax-net"
-version = "0.12.7"
+version = "0.12.10"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = ["Mivik <mivikq@gmail.com>"]
@@ -8,11 +8,15 @@ description = "Unified network stack for TGOSKits (ArceOS, StarryOS, Axvisor)"
 license.workspace = true
 
 [features]
-axtest = ["dep:axtest"]
+host-test = [
+    "ax-hal/host-test",
+    "axpoll/host-test",
+    "ax-sync/host-test",
+    "ax-task/host-test",
+]
 vsock = ["dep:rdif-vsock"]
 
 [dependencies]
-axtest = { workspace = true, optional = true }
 async-channel = { version = "2.5", default-features = false }
 async-trait = "0.1"
 ax-hal = { workspace = true }
@@ -20,7 +24,7 @@ ax-io = { workspace = true }
 ax-lazyinit.workspace = true
 axpoll = { workspace = true }
 ax-sync = { workspace = true, features = ["sleep"] }
-ax-task = { workspace = true, features = ["irq", "multitask"] }
+ax-task.workspace = true
 bitflags = "2.9"
 cfg-if = { workspace = true }
 enum_dispatch = "0.3"
@@ -29,6 +33,8 @@ hashbrown = "0.16"
 irq-framework = { workspace = true }
 log = { workspace = true }
 rd-net = { workspace = true }
+rand_chacha.workspace = true
+rand_core.workspace = true
 rdif-vsock = { workspace = true, optional = true }
 ringbuf = { version = "0.4", default-features = false, features = ["alloc"] }
 syscalls.workspace = true
@@ -59,9 +65,11 @@ features = [
 ]
 
 [dev-dependencies]
-ax-hal = { workspace = true, features = ["host-test"] }
-ax-sync = { workspace = true, features = ["host-test"] }
-ax-task = { workspace = true, features = ["host-test"] }
+ax-hal = { path = "../../os/arceos/modules/axhal", features = ["host-test"] }
+ax-sync = { path = "../../os/arceos/modules/axsync", features = ["host-test"] }
+ax-task = { path = "../../os/arceos/modules/axtask", features = ["host-test"] }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)'] }
+[[test]]
+name = "std"
+path = "tests/std.rs"
+required-features = ["host-test"]

@@ -154,12 +154,15 @@ pub fn sys_reboot(magic: u32, magic2: u32, cmd: u32, _arg: usize) -> StarryResul
 
     match cmd {
         LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => Ok(0),
+        // Linux's reboot(2) contract does not synchronize or unmount file
+        // systems; callers such as systemctl perform sync before entering
+        // this syscall. Teardown here can wait forever on userspace services
+        // that still hold descriptors while the requested power transition
+        // is already being committed.
         LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => {
-            let _ = ax_fs_ng::shutdown_filesystems();
             ax_runtime::hal::power::system_reset()
         }
         LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF => {
-            let _ = ax_fs_ng::shutdown_filesystems();
             ax_runtime::hal::power::system_off()
         }
         _ => Err(StarryError::from(Errno::EINVAL)),
@@ -622,8 +625,12 @@ pub fn sys_setfsgid(fsgid: u32) -> StarryResult<isize> {
     Ok(prev_fsgid as isize)
 }
 
-pub fn sys_getgroups(size: usize, list: *mut u32) -> StarryResult<isize> {
+pub fn sys_getgroups(size: i32, list: *mut u32) -> StarryResult<isize> {
     debug!("sys_getgroups <= size: {size}");
+    if size < 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    let size = size as usize;
     let cred = current().as_thread().cred();
     let ngroups = cred.groups.len();
     if size == 0 {
@@ -641,7 +648,7 @@ pub fn sys_getgroups(size: usize, list: *mut u32) -> StarryResult<isize> {
 /// Linux limits supplementary groups to 65536 (`NGROUPS_MAX`).
 const NGROUPS_MAX: usize = 65536;
 
-pub fn sys_setgroups(size: usize, list: *const u32) -> StarryResult<isize> {
+pub fn sys_setgroups(size: i32, list: *const u32) -> StarryResult<isize> {
     debug!("sys_setgroups <= size: {size}");
     let thread = current();
     let thread = thread.as_thread();
@@ -654,9 +661,10 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> StarryResult<isize> {
     if thread.setgroups_deny() {
         return Err(StarryError::OperationNotPermitted);
     }
-    if size > NGROUPS_MAX {
+    if (size as u32) > NGROUPS_MAX as u32 {
         return Err(StarryError::InvalidInput);
     }
+    let size = size as usize;
 
     let groups = if size > 0 {
         let mut buf: Vec<MaybeUninit<u32>> = vec![MaybeUninit::uninit(); size];
@@ -692,14 +700,15 @@ pub fn sys_uname(name: *mut new_utsname) -> StarryResult<isize> {
     Ok(0)
 }
 
-pub fn sys_sethostname(name: *const c_char, len: usize) -> StarryResult<isize> {
-    if len > 64 {
-        return Err(StarryError::InvalidInput);
-    }
+pub fn sys_sethostname(name: *const c_char, len: i32) -> StarryResult<isize> {
     let curr = current();
     if curr.as_thread().cred().euid != 0 {
         return Err(StarryError::OperationNotPermitted);
     }
+    if !(0..=64).contains(&len) {
+        return Err(StarryError::InvalidInput);
+    }
+    let len = len as usize;
     let mut buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); len];
     vm_read_slice(name.cast::<u8>(), &mut buf)?;
     let bytes: Vec<u8> = unsafe { buf.into_iter().map(|v| v.assume_init()).collect() };
@@ -712,14 +721,15 @@ pub fn sys_sethostname(name: *const c_char, len: usize) -> StarryResult<isize> {
     Ok(0)
 }
 
-pub fn sys_setdomainname(name: *const c_char, len: usize) -> StarryResult<isize> {
-    if len > 64 {
-        return Err(StarryError::InvalidInput);
-    }
+pub fn sys_setdomainname(name: *const c_char, len: i32) -> StarryResult<isize> {
     let curr = current();
     if curr.as_thread().cred().euid != 0 {
         return Err(StarryError::OperationNotPermitted);
     }
+    if !(0..=64).contains(&len) {
+        return Err(StarryError::InvalidInput);
+    }
+    let len = len as usize;
     let mut buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); len];
     vm_read_slice(name.cast::<u8>(), &mut buf)?;
     let bytes: Vec<u8> = unsafe { buf.into_iter().map(|v| v.assume_init()).collect() };
@@ -1064,8 +1074,8 @@ pub fn sys_riscv_hwprobe(
     Ok(0)
 }
 
-#[cfg(axtest)]
-pub(crate) fn uid_valid_and_syslog_validation_rules_hold_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn uid_valid_and_syslog_validation_rules_hold_for_test() -> bool {
     // uid_valid: NOCHG (u32::MAX) is invalid, everything else is valid.
     uid_valid(0)
         && uid_valid(1)
@@ -1076,7 +1086,7 @@ pub(crate) fn uid_valid_and_syslog_validation_rules_hold_for_test() -> bool {
     // validate_syslog_read_args: null buf or negative len is invalid.
     && validate_syslog_read_args(core::ptr::null_mut(), 0).is_err()
     && validate_syslog_read_args(core::ptr::null_mut::<c_char>(), 100).is_err()
-    && validate_syslog_read_args(0x1 as *mut c_char, 0).is_ok()  // non-null, len=0 is ok
+    && validate_syslog_read_args(core::ptr::dangling_mut::<c_char>(), 0).is_ok()  // non-null, len=0 is ok
     && {
         let mut dummy: c_char = 0;
         let ptr: *mut c_char = &mut dummy;
@@ -1085,32 +1095,65 @@ pub(crate) fn uid_valid_and_syslog_validation_rules_hold_for_test() -> bool {
     }
 }
 
-#[cfg(axtest)]
-pub(crate) fn sys_constants_and_validation_rules_hold_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn sys_constants_and_validation_rules_hold_for_test() -> bool {
     use linux_raw_sys::general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM};
 
-    // Test NOCHG sentinel value
-    assert!(NOCHG == u32::MAX);
+    const {
+        assert!(NOCHG == u32::MAX);
+        assert!(SECCOMP_SET_MODE_STRICT == 0);
+        assert!(SECCOMP_SET_MODE_FILTER == 1);
+        assert!(SECCOMP_GET_ACTION_AVAIL == 2);
+
+        assert!(SECCOMP_ALLOWED_FLAGS & SECCOMP_FILTER_FLAG_TSYNC != 0);
+        assert!(SECCOMP_ALLOWED_FLAGS & SECCOMP_FILTER_FLAG_LOG != 0);
+        assert!(SECCOMP_ALLOWED_FLAGS & SECCOMP_FILTER_FLAG_SPEC_ALLOW != 0);
+        assert!(SECCOMP_ALLOWED_FLAGS & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0);
+    }
 
     // Test getrandom flags
     let valid_flags = 0u32;
-    assert!(valid_flags & !(GRND_NONBLOCK as u32 | GRND_INSECURE as u32 | GRND_RANDOM as u32) == 0);
+    assert!(valid_flags & !(GRND_NONBLOCK | GRND_INSECURE | GRND_RANDOM) == 0);
 
-    let nonblock_only = GRND_NONBLOCK as u32;
+    let nonblock_only = GRND_NONBLOCK;
     assert!(
-        nonblock_only & !(GRND_NONBLOCK as u32 | GRND_INSECURE as u32 | GRND_RANDOM as u32) == 0
+        nonblock_only & !(GRND_NONBLOCK | GRND_INSECURE | GRND_RANDOM) == 0
     );
 
-    // Test seccomp constants
-    assert!(SECCOMP_SET_MODE_STRICT == 0);
-    assert!(SECCOMP_SET_MODE_FILTER == 1);
-    assert!(SECCOMP_GET_ACTION_AVAIL == 2);
-
-    // Test seccomp filter flags
-    assert!(SECCOMP_ALLOWED_FLAGS & SECCOMP_FILTER_FLAG_TSYNC != 0);
-    assert!(SECCOMP_ALLOWED_FLAGS & SECCOMP_FILTER_FLAG_LOG != 0);
-    assert!(SECCOMP_ALLOWED_FLAGS & SECCOMP_FILTER_FLAG_SPEC_ALLOW != 0);
-    assert!(SECCOMP_ALLOWED_FLAGS & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0);
-
     true
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    #[test]
+    fn uid_valid_and_syslog_validation_rules_hold() {
+        assert!(super::uid_valid_and_syslog_validation_rules_hold_for_test());
+    }
+
+    #[test]
+    fn sys_constants_and_validation_rules_hold() {
+        assert!(super::sys_constants_and_validation_rules_hold_for_test());
+    }
+
+    #[test]
+    fn reboot_syscall_does_not_tear_down_filesystems() {
+        let source = include_str!("sys.rs");
+        let start = source
+            .find("pub fn sys_reboot(")
+            .expect("sys_reboot must exist");
+        let remainder = &source[start..];
+        let end = remainder[1..]
+            .find("\npub fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(remainder.len());
+        let reboot = &remainder[..end];
+        assert!(
+            !reboot.contains("shutdown_filesystems"),
+            "reboot(2) must not sync or unmount filesystems; Linux leaves that to userspace"
+        );
+        assert!(
+            reboot.contains("system_reset") && reboot.contains("system_off"),
+            "reboot(2) restart and power-off must still reach the platform power helpers"
+        );
+    }
 }

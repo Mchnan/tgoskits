@@ -82,12 +82,11 @@ pub(crate) fn publish_zombie(
 
 /// Reaps one exact generation. The TGID lease is released only after topology
 /// retirement, outside its locks, so the number cannot be reused mid-retire.
-pub(crate) fn reap_process(process: &Arc<Process>) -> Option<ProcessCpuTime> {
-    let identity = process_identity(process)?;
+fn reap_process_identity(
+    identity: &Arc<PidIdentity>,
+    process: &Arc<Process>,
+) -> Option<ProcessCpuTime> {
     let zombie = identity.claim_reap(process)?;
-
-    #[cfg(axtest)]
-    axtest::reap_claim_barrier(process.pid());
 
     process.retire();
     identity.finish_reap();
@@ -100,6 +99,11 @@ pub(crate) fn reap_process(process: &Arc<Process>) -> Option<ProcessCpuTime> {
     }
     tgid_lease.release();
     Some(cpu_time)
+}
+
+pub(crate) fn reap_process(process: &Arc<Process>) -> Option<ProcessCpuTime> {
+    let identity = process_identity(process)?;
+    reap_process_identity(&identity, process)
 }
 
 pub(crate) fn is_zombie_process(process: &Arc<Process>) -> bool {
@@ -165,23 +169,15 @@ pub(crate) fn traced_zombies_for(tracer: PidIdentityId) -> Vec<Arc<Process>> {
         .collect()
 }
 
-#[cfg(axtest)]
-#[path = "process_identity_axtest.rs"]
-mod axtest;
-
-#[cfg(axtest)]
-pub(crate) use axtest::reaping_identity_is_not_publicly_resolvable_for_test;
-
-#[cfg(test)]
+#[cfg(all(test, not(axtest)))]
 mod tests {
     use axpoll::PollSet;
 
     use super::*;
     use crate::task::{PidReservation, PidReservationKind, Tid};
-
     #[test]
     fn reaping_releases_process_owned_group_and_session_roles() {
-        let namespace = crate::task::new_test_pid_namespace();
+        let namespace = ROOT_PID_NS.clone();
         let identity = PidReservation::reserve(&namespace, PidReservationKind::ProcessLeader)
             .unwrap()
             .publish()
@@ -189,11 +185,11 @@ mod tests {
         let number = identity.root_number();
         let tid = identity.acquire_role::<Tid>().unwrap();
         let tgid = identity.acquire_role::<Tgid>().unwrap();
-        let process = Process::new_for_axtest(identity.clone());
+        let process = super::super::process::new_isolated_process_for_test(identity.clone());
 
         identity.mark_task_exited();
         tid.release();
-        identity.bind_zombie_for_axtest(
+        identity.bind_zombie_for_test(
             process.clone(),
             Arc::new(PollSet::new()),
             ZombieSnapshot {
@@ -206,7 +202,10 @@ mod tests {
             },
         );
 
-        assert_eq!(reap_process(&process), Some(ProcessCpuTime::default()));
+        assert_eq!(
+            reap_process_identity(&identity, &process),
+            Some(ProcessCpuTime::default())
+        );
         assert!(namespace.lookup(number).is_some());
 
         drop(process);

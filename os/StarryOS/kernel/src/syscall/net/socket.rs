@@ -32,7 +32,9 @@ use crate::{
 };
 
 const SOCK_TYPE_MASK: u32 = 0xf;
+
 const SOCK_MAX: u32 = 11;
+
 const SOCK_FLAGS_MASK: u32 = O_NONBLOCK | O_CLOEXEC;
 
 pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> StarryResult<isize> {
@@ -100,7 +102,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> StarryResult<isize> {
             if proto == NETLINK_KOBJECT_UEVENT && ty != SOCK_RAW {
                 return Err(StarryError::from(Errno::ESOCKTNOSUPPORT));
             }
-            let socket = NetlinkSocket::new(proto);
+            let socket = NetlinkSocket::new(proto, ty);
             if raw_ty & O_NONBLOCK != 0 {
                 socket.set_nonblocking(true)?;
             }
@@ -327,27 +329,37 @@ pub fn sys_socketpair(
     Ok(0)
 }
 
-#[cfg(axtest)]
-pub(crate) fn net_socket_constants_hold_for_test() -> bool {
-    // Address family constants
-    assert!(AF_INET == 2);
-    assert!(AF_INET6 == 10);
-    assert!(AF_UNIX == 1);
-    assert!(AF_NETLINK == 16);
-    assert!(AF_PACKET == 17);
+#[cfg(all(test, not(axtest)))]
+fn net_socket_constants_hold_for_test() -> bool {
+    const {
+        assert!(AF_INET == 2);
+        assert!(AF_INET6 == 10);
+        assert!(AF_UNIX == 1);
+        assert!(AF_NETLINK == 16);
+        assert!(AF_PACKET == 17);
+
+        assert!(SOCK_STREAM == 1);
+        assert!(SOCK_DGRAM == 2);
+        assert!(SOCK_RAW == 3);
+        assert!(SOCK_SEQPACKET == 5);
+
+        assert!(SHUT_RD == 0);
+        assert!(SHUT_WR == 1);
+        assert!(SHUT_RDWR == 2);
+    }
+
     #[cfg(feature = "vsock")]
-    assert!(AF_VSOCK == 40);
-
-    // Socket type constants
-    assert!(SOCK_STREAM == 1);
-    assert!(SOCK_DGRAM == 2);
-    assert!(SOCK_RAW == 3);
-    assert!(SOCK_SEQPACKET == 5);
-
-    // Shutdown constants
-    assert!(SHUT_RD == 0);
-    assert!(SHUT_WR == 1);
-    assert!(SHUT_RDWR == 2);
+    const {
+        assert!(AF_VSOCK == 40);
+    }
 
     true
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    #[test]
+    fn net_socket_constants_hold() {
+        assert!(super::net_socket_constants_hold_for_test());
+    }
 }

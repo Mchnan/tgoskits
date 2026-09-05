@@ -11,8 +11,9 @@ use std::{
 use ax_memory_addr::PhysAddr;
 use axaddrspace::{AddrSpaceError, AddrSpaceResult, GuestMemoryAccessor};
 use axdevice_base::{
-    BusAccess, BusKind, BusResponse, ControllerInputId, Device, DeviceId, InterruptControllerId,
-    InterruptTriggerMode, IrqResult, NoopDeviceAccess, Resource, WiredIrqInput, WiredIrqSink,
+    BusKind, ControllerInputId, Device, DeviceAccess, DeviceId, DeviceVcpuId,
+    InterruptControllerId, InterruptTriggerMode, IrqResult, NoopDeviceContext, Resource,
+    WiredIrqInput, WiredIrqSink,
 };
 use axvirtio_blk::{
     BlockBackend, ManagedVirtioBlockDevice, VirtioBlockConfig, VirtioMmioBlockDevice, VirtioResult,
@@ -527,6 +528,7 @@ mod mmio_device_tests {
     const MMIO_MAGIC: u32 = 0x74726976; // "virt" in little endian
     const MMIO_VERSION: u32 = 2; // VirtIO 1.0+
     const VIRTIO_DEVICE_BLOCK: u32 = 2;
+    const VIRTIO_F_RING_EVENT_IDX: u32 = 1 << 29;
 
     fn create_test_device() -> VirtioMmioBlockDevice<MockBlockBackend, MockGuestMemoryAccessor> {
         let backend = MockBlockBackend::new(2048, 512); // 1MB device
@@ -661,6 +663,24 @@ mod mmio_device_tests {
             .unwrap();
         let high_features = device.mmio_read(features_addr, AccessWidth::Dword);
         assert!(high_features.is_ok());
+    }
+
+    #[test]
+    fn default_features_advertise_implemented_event_idx() {
+        let device = create_test_device();
+        let base_ipa = GuestPhysAddr::from(0x0a000000);
+        let features_sel_addr =
+            GuestPhysAddr::from(base_ipa.as_usize() + VIRTIO_MMIO_DEVICE_FEATURES_SEL as usize);
+        let features_addr =
+            GuestPhysAddr::from(base_ipa.as_usize() + VIRTIO_MMIO_DEVICE_FEATURES as usize);
+
+        device
+            .mmio_write(features_sel_addr, AccessWidth::Dword, 0)
+            .unwrap();
+        let advertised_features =
+            device.mmio_read(features_addr, AccessWidth::Dword).unwrap() as u32;
+
+        assert_ne!(advertised_features & VIRTIO_F_RING_EVENT_IDX, 0);
     }
 
     #[test]
@@ -910,18 +930,17 @@ fn managed_device_declares_resources_and_routes_mmio() {
             },
         ]
     );
-    let mut context = NoopDeviceAccess::new(DeviceId::new(0));
-    let response = device
-        .access(
-            &BusAccess {
-                kind: BusKind::Mmio,
-                is_read: true,
-                addr: 0x0a00_0000,
-                width: AccessWidth::Dword,
-                data: 0,
-            },
+    let mut context = NoopDeviceContext::new(DeviceId::new(0));
+    let value = device
+        .read(
+            &DeviceAccess::new(
+                DeviceVcpuId::new(0),
+                BusKind::Mmio,
+                0x0a00_0000,
+                AccessWidth::Dword,
+            ),
             &mut context,
         )
         .unwrap();
-    assert!(matches!(response, BusResponse::Read { value } if value == 0x7472_6976));
+    assert_eq!(value, 0x7472_6976);
 }

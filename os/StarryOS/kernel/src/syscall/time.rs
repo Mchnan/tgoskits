@@ -1,5 +1,5 @@
 use ax_runtime::hal::time::{
-    NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos, nanos_to_ticks, wall_time,
+    NANOS_PER_SEC, TimeValue, monotonic_time, wall_time,
 };
 use ax_task::current;
 use linux_raw_sys::general::{
@@ -59,6 +59,21 @@ pub fn sys_time(tloc: *mut usize) -> StarryResult<isize> {
     Ok(secs)
 }
 
+#[cfg(target_arch = "x86_64")]
+pub fn sys_alarm(seconds: u32) -> StarryResult<isize> {
+    let remaining_ns = seconds as usize * NANOS_PER_SEC as usize;
+    let (_, old_remaining) = current()
+        .as_thread()
+        .proc_data
+        .set_real_timer(0, remaining_ns);
+
+    let mut old_seconds = old_remaining.as_secs();
+    if old_remaining.subsec_nanos() != 0 {
+        old_seconds += 1;
+    }
+    Ok(old_seconds as isize)
+}
+
 pub fn sys_clock_getres(clock_id: __kernel_clockid_t, res: *mut timespec) -> StarryResult<isize> {
     let resolution = match clock_id as u32 {
         CLOCK_REALTIME
@@ -91,18 +106,26 @@ pub struct Tms {
 pub fn sys_times(tms: *mut Tms) -> StarryResult<isize> {
     let (utime, stime) = current().as_thread().time.borrow().output();
     let (cutime, cstime) = current().as_thread().proc_data.children_cpu_time();
+    // Linux times(2) reports every field and the return value in USER_HZ clock
+    // ticks (glibc/musl hardcode _SC_CLK_TCK = 100, so one tick is 10 ms), the
+    // same jiffies unit as the /proc/[pid]/stat writer in task::stat.
+    let ticks = |d: TimeValue| (d.as_millis() / 10) as usize;
     tms.vm_write(Tms {
-        tms_utime: utime.as_micros() as usize,
-        tms_stime: stime.as_micros() as usize,
-        tms_cutime: cutime.as_micros() as usize,
-        tms_cstime: cstime.as_micros() as usize,
+        tms_utime: ticks(utime),
+        tms_stime: ticks(stime),
+        tms_cutime: ticks(cutime),
+        tms_cstime: ticks(cstime),
     })?;
-    Ok(nanos_to_ticks(monotonic_time_nanos()) as _)
+    Ok((monotonic_time().as_millis() / 10) as _)
 }
 
 pub fn sys_getitimer(which: i32, value: *mut itimerval) -> StarryResult<isize> {
     let ty = ITimerType::from_repr(which).ok_or(StarryError::InvalidInput)?;
-    let (it_interval, it_value) = current().as_thread().time.borrow().get_itimer(ty);
+    let thread = current();
+    let (it_interval, it_value) = match ty {
+        ITimerType::Real => thread.as_thread().proc_data.get_real_timer(),
+        ITimerType::Virtual | ITimerType::Prof => thread.as_thread().time.borrow().get_itimer(ty),
+    };
 
     value.vm_write(itimerval {
         it_interval: timeval::from_time_value(it_interval),
@@ -133,11 +156,17 @@ pub fn sys_setitimer(
 
     debug!("sys_setitimer <= type: {ty:?}, interval: {interval:?}, remained: {remained:?}");
 
-    let old = curr
-        .as_thread()
-        .time
-        .borrow_mut()
-        .set_itimer(ty, interval, remained);
+    let old = match ty {
+        ITimerType::Real => curr
+            .as_thread()
+            .proc_data
+            .set_real_timer(interval, remained),
+        ITimerType::Virtual | ITimerType::Prof => curr
+            .as_thread()
+            .time
+            .borrow_mut()
+            .set_itimer(ty, interval, remained),
+    };
 
     if let Some(old_value) = old_value.nullable() {
         old_value.vm_write(itimerval {
@@ -276,8 +305,8 @@ pub fn sys_timer_delete(timerid: __kernel_timer_t) -> StarryResult<isize> {
     }
 }
 
-#[cfg(axtest)]
-pub(crate) fn time_clock_id_validation_rules_hold_for_test() -> bool {
+#[cfg(all(test, not(axtest)))]
+fn time_clock_id_validation_rules_hold_for_test() -> bool {
     use linux_raw_sys::general::{
         CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
         CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID,
@@ -285,25 +314,27 @@ pub(crate) fn time_clock_id_validation_rules_hold_for_test() -> bool {
 
     // Test valid clock IDs for clock_gettime
     let valid_clocks = [
-        CLOCK_REALTIME as u32,
-        CLOCK_REALTIME_COARSE as u32,
-        CLOCK_MONOTONIC as u32,
-        CLOCK_MONOTONIC_RAW as u32,
-        CLOCK_MONOTONIC_COARSE as u32,
-        CLOCK_BOOTTIME as u32,
-        CLOCK_PROCESS_CPUTIME_ID as u32,
-        CLOCK_THREAD_CPUTIME_ID as u32,
+        CLOCK_REALTIME,
+        CLOCK_REALTIME_COARSE,
+        CLOCK_MONOTONIC,
+        CLOCK_MONOTONIC_RAW,
+        CLOCK_MONOTONIC_COARSE,
+        CLOCK_BOOTTIME,
+        CLOCK_PROCESS_CPUTIME_ID,
+        CLOCK_THREAD_CPUTIME_ID,
     ];
 
-    // All these should be valid (non-zero to distinguish from invalid)
-    for &clock in &valid_clocks {
-        assert!(clock > 0 || clock == 0); // Just verify they're valid constants
-    }
-
-    // Test that invalid clock IDs would be rejected
-    // Clock ID 999 should be invalid
-    assert!(999u32 != CLOCK_REALTIME as u32);
-    assert!(999u32 != CLOCK_MONOTONIC as u32);
+    assert!(valid_clocks.contains(&CLOCK_REALTIME));
+    assert!(valid_clocks.contains(&CLOCK_MONOTONIC));
+    assert!(!valid_clocks.contains(&999u32));
 
     true
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    #[test]
+    fn time_clock_id_validation_rules_hold() {
+        assert!(super::time_clock_id_validation_rules_hold_for_test());
+    }
 }

@@ -6,11 +6,11 @@ use ax_io::IoError;
 use ax_memory_set::MappingError;
 use ax_mm::MmError;
 use ax_net::NetError;
-use ax_runtime::RuntimeError;
+use ax_runtime::{RuntimeError, serial::ConfigError};
 use ax_task::future::{Elapsed, Interrupted, PollIoError, TaskError};
 use axfs_ng_vfs::VfsError;
 use dma_api::DmaError;
-#[cfg(any(test, axtest))]
+#[cfg(all(test, not(axtest)))]
 use rdif_block::{BlkError, RequestOp};
 #[cfg(feature = "sg2002")]
 use sg2002_tpu::{ion::IonError, tpu::error::TpuError};
@@ -305,6 +305,7 @@ fn cgroup_errno(error: CgroupError) -> Errno {
         CgroupError::NotFound => Errno::ENOENT,
         CgroupError::AlreadyExists => Errno::EEXIST,
         CgroupError::ResourceBusy => Errno::EBUSY,
+        CgroupError::LimitExceeded => Errno::EAGAIN,
         CgroupError::NoSuchProcess => Errno::ESRCH,
         CgroupError::DirectoryNotEmpty => Errno::ENOTEMPTY,
     }
@@ -325,7 +326,9 @@ fn vfs_error_from_errno(errno: Errno) -> VfsError {
         Errno::EFAULT => VfsError::BadAddress,
         Errno::EBADF => VfsError::BadFileDescriptor,
         Errno::EXDEV => VfsError::CrossesDevices,
+        Errno::ENODATA => VfsError::DataMissing,
         Errno::ENOTEMPTY => VfsError::DirectoryNotEmpty,
+        Errno::EUCLEAN => VfsError::FilesystemCorrupted,
         Errno::ELOOP => VfsError::FilesystemLoop,
         Errno::EFBIG => VfsError::FileTooLarge,
         Errno::EINVAL => VfsError::InvalidInput,
@@ -342,11 +345,14 @@ fn vfs_error_from_errno(errno: Errno) -> VfsError {
         Errno::EPERM => VfsError::OperationNotPermitted,
         Errno::EOPNOTSUPP => VfsError::OperationNotSupported,
         Errno::EACCES => VfsError::PermissionDenied,
+        Errno::EDQUOT => VfsError::QuotaExceeded,
         Errno::EROFS => VfsError::ReadOnlyFilesystem,
         Errno::EBUSY => VfsError::ResourceBusy,
         Errno::ENOSPC => VfsError::StorageFull,
         Errno::ETIMEDOUT => VfsError::TimedOut,
+        Errno::EMLINK => VfsError::TooManyLinks,
         Errno::ENOSYS => VfsError::Unsupported,
+        Errno::EOVERFLOW => VfsError::ValueOverflow,
         Errno::EAGAIN => VfsError::WouldBlock,
         _ => VfsError::Io,
     }
@@ -354,6 +360,14 @@ fn vfs_error_from_errno(errno: Errno) -> VfsError {
 
 fn runtime_errno(error: &RuntimeError) -> Errno {
     match error {
+        RuntimeError::SerialConfig(error) => match error {
+            ConfigError::InvalidBaudrate
+            | ConfigError::UnsupportedDataBits
+            | ConfigError::UnsupportedStopBits
+            | ConfigError::UnsupportedParity => Errno::EINVAL,
+            ConfigError::Timeout => Errno::ETIMEDOUT,
+            ConfigError::RegisterError => Errno::EIO,
+        },
         RuntimeError::SerialNotStarted => Errno::EFAULT,
         RuntimeError::SerialControlBusy => Errno::EBUSY,
         RuntimeError::WouldBlock => Errno::EAGAIN,
@@ -476,7 +490,9 @@ fn vfs_errno(error: VfsError) -> Errno {
         VfsError::BadAddress | VfsError::BadState => Errno::EFAULT,
         VfsError::BadFileDescriptor => Errno::EBADF,
         VfsError::CrossesDevices => Errno::EXDEV,
+        VfsError::DataMissing => Errno::ENODATA,
         VfsError::DirectoryNotEmpty => Errno::ENOTEMPTY,
+        VfsError::FilesystemCorrupted => Errno::EUCLEAN,
         VfsError::FilesystemLoop => Errno::ELOOP,
         VfsError::FileTooLarge => Errno::EFBIG,
         VfsError::InvalidData | VfsError::InvalidInput => Errno::EINVAL,
@@ -493,23 +509,26 @@ fn vfs_errno(error: VfsError) -> Errno {
         VfsError::OperationNotPermitted => Errno::EPERM,
         VfsError::OperationNotSupported => Errno::EOPNOTSUPP,
         VfsError::PermissionDenied => Errno::EACCES,
+        VfsError::QuotaExceeded => Errno::EDQUOT,
         VfsError::ReadOnlyFilesystem => Errno::EROFS,
         VfsError::ResourceBusy => Errno::EBUSY,
         VfsError::StorageFull => Errno::ENOSPC,
         VfsError::TimedOut => Errno::ETIMEDOUT,
+        VfsError::TooManyLinks => Errno::EMLINK,
         VfsError::Unsupported => Errno::ENOSYS,
+        VfsError::ValueOverflow => Errno::EOVERFLOW,
         VfsError::WouldBlock => Errno::EAGAIN,
     }
 }
 
-#[cfg(any(test, axtest))]
+#[cfg(all(test, not(axtest)))]
 fn errno_cases_hold<const N: usize>(cases: [(StarryError, Errno); N]) -> bool {
     cases
         .into_iter()
         .all(|(error, expected)| error.linux_errno() == expected)
 }
 
-#[cfg(any(test, axtest))]
+#[cfg(all(test, not(axtest)))]
 fn memory_errno_mappings_hold() -> bool {
     errno_cases_hold([
         (VmError::BadAddress.into(), Errno::EFAULT),
@@ -545,13 +564,14 @@ fn memory_errno_mappings_hold() -> bool {
         (CgroupError::NotFound.into(), Errno::ENOENT),
         (CgroupError::AlreadyExists.into(), Errno::EEXIST),
         (CgroupError::ResourceBusy.into(), Errno::EBUSY),
+        (CgroupError::LimitExceeded.into(), Errno::EAGAIN),
         (CgroupError::InvalidInput.into(), Errno::EINVAL),
         (CgroupError::NoSuchProcess.into(), Errno::ESRCH),
         (CgroupError::DirectoryNotEmpty.into(), Errno::ENOTEMPTY),
     ])
 }
 
-#[cfg(any(test, axtest))]
+#[cfg(all(test, not(axtest)))]
 fn vfs_errno_mappings_hold() -> bool {
     errno_cases_hold([
         (VfsError::AlreadyExists.into(), Errno::EEXIST),
@@ -559,7 +579,9 @@ fn vfs_errno_mappings_hold() -> bool {
         (VfsError::BadFileDescriptor.into(), Errno::EBADF),
         (VfsError::BadState.into(), Errno::EFAULT),
         (VfsError::CrossesDevices.into(), Errno::EXDEV),
+        (VfsError::DataMissing.into(), Errno::ENODATA),
         (VfsError::DirectoryNotEmpty.into(), Errno::ENOTEMPTY),
+        (VfsError::FilesystemCorrupted.into(), Errno::EUCLEAN),
         (VfsError::FilesystemLoop.into(), Errno::ELOOP),
         (VfsError::FileTooLarge.into(), Errno::EFBIG),
         (VfsError::InvalidData.into(), Errno::EINVAL),
@@ -577,16 +599,19 @@ fn vfs_errno_mappings_hold() -> bool {
         (VfsError::OperationNotPermitted.into(), Errno::EPERM),
         (VfsError::OperationNotSupported.into(), Errno::EOPNOTSUPP),
         (VfsError::PermissionDenied.into(), Errno::EACCES),
+        (VfsError::QuotaExceeded.into(), Errno::EDQUOT),
         (VfsError::ReadOnlyFilesystem.into(), Errno::EROFS),
         (VfsError::ResourceBusy.into(), Errno::EBUSY),
         (VfsError::StorageFull.into(), Errno::ENOSPC),
         (VfsError::TimedOut.into(), Errno::ETIMEDOUT),
+        (VfsError::TooManyLinks.into(), Errno::EMLINK),
         (VfsError::Unsupported.into(), Errno::ENOSYS),
+        (VfsError::ValueOverflow.into(), Errno::EOVERFLOW),
         (VfsError::WouldBlock.into(), Errno::EAGAIN),
     ])
 }
 
-#[cfg(any(test, axtest))]
+#[cfg(all(test, not(axtest)))]
 fn io_errno_mappings_hold() -> bool {
     errno_cases_hold([
         (IoError::AddrInUse.into(), Errno::EADDRINUSE),
@@ -647,7 +672,7 @@ fn io_errno_mappings_hold() -> bool {
     ])
 }
 
-#[cfg(any(test, axtest))]
+#[cfg(all(test, not(axtest)))]
 fn block_errno_mappings_hold() -> bool {
     let device_error = |source| {
         StarryError::from(BlockError::Device {
@@ -680,7 +705,7 @@ fn block_errno_mappings_hold() -> bool {
     ])
 }
 
-#[cfg(any(test, axtest))]
+#[cfg(all(test, not(axtest)))]
 fn leaf_errno_mappings_hold() -> bool {
     errno_cases_hold([
         (StarryError::AlreadyExists, Errno::EEXIST),
@@ -734,6 +759,30 @@ fn leaf_errno_mappings_hold() -> bool {
             Errno::EBUSY,
         ),
         (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::InvalidBaudrate)),
+            Errno::EINVAL,
+        ),
+        (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::UnsupportedDataBits)),
+            Errno::EINVAL,
+        ),
+        (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::UnsupportedStopBits)),
+            Errno::EINVAL,
+        ),
+        (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::UnsupportedParity)),
+            Errno::EINVAL,
+        ),
+        (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::Timeout)),
+            Errno::ETIMEDOUT,
+        ),
+        (
+            StarryError::Runtime(RuntimeError::SerialConfig(ConfigError::RegisterError)),
+            Errno::EIO,
+        ),
+        (
             StarryError::Runtime(RuntimeError::WouldBlock),
             Errno::EAGAIN,
         ),
@@ -762,7 +811,7 @@ fn leaf_errno_mappings_hold() -> bool {
     ])
 }
 
-#[cfg(any(test, axtest))]
+#[cfg(all(test, not(axtest)))]
 fn domain_errno_mappings_hold() -> bool {
     memory_errno_mappings_hold()
         && vfs_errno_mappings_hold()
@@ -773,15 +822,10 @@ fn domain_errno_mappings_hold() -> bool {
         && StarryError::from(Errno::new(4094)).linux_errno().into_raw() == 4094
 }
 
-#[cfg(axtest)]
-pub(crate) fn domain_errno_mappings_hold_for_test() -> bool {
-    domain_errno_mappings_hold()
-}
-
 /// A result returned by Starry-owned kernel operations.
 pub type StarryResult<T = ()> = Result<T, StarryError>;
 
-#[cfg(test)]
+#[cfg(all(test, not(axtest)))]
 mod tests {
     use super::*;
 

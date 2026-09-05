@@ -15,6 +15,9 @@ test-suit/starryos/<build_wrapper>/<case>/<runtime-config>.toml
 
 - QEMU 用例通过 `<case>/qemu-<arch>.toml` 发现。
 - Board 用例通过 `<case>/board-<board>.toml` 发现。
+- 只在非空宿主环境变量存在时才能运行的 Board 用例，在同一 case 目录的
+  `requirements.toml` 中声明 `required_env = ["NAME", ...]`。缺失或空值会保留
+  `--list` 可见性并输出明确的 skipped 结果，不构建或占用板卡。
 - `<build_wrapper>` 用于共享构建配置，例如 `qemu`、`board-orangepi-5-plus`。
 - 构建配置位于 case 或最近的 build wrapper 中，文件名为 `build-<target>.toml`。
 - 如果目录自身同时包含 `build-*` 和 `qemu-*` / `board-*`，它本身也可以作为 case 被发现。
@@ -30,6 +33,18 @@ test-suit/starryos/<build_wrapper>/<case>/<runtime-config>.toml
 
 旧的 Starry `--test-group` 和 `--stress` 入口已经移除。需要运行迁出的压力、K230、
 visual 或 golden 类用例时，使用 `cargo xtask starry app ...` 或对应脚本。
+
+## CI 精确路由
+
+CI 路由不改变上述 xtask 发现规则。`.github/ci/checks/starry.toml` 通过 check 下的
+`[[check.suite]]` 注册当前可用的 QEMU 架构或 board runner；planner 再以实际存在的
+`qemu-<arch>.toml`、`board-<board>.toml` 和最近的 `build-<target>.toml` 解析 case。
+不要从目录名字手工拼接 CI job，也不要为未在 CI 中运行的板卡借用其他 runner。
+
+PR 的有效改动全部位于 `test-suit/**` 时，只运行匹配的已注册 case。多个 case 取
+稳定去重并集；共享 build wrapper 变更展开到该 wrapper 下所有已注册 case。
+`qemu/system/<subcase>` 源码变更会生成 `qemu/<subcase>` selector。若新增 case 或
+board 尚未在 manifest 注册，`Plan CI` 会明确失败，而不是静默跳过或自动启用真机。
 
 ## 当前目录概览
 
@@ -133,6 +148,24 @@ STARRY_SYSTEM_TEST_SUMMARY: total=1 passed=1 failed=0 elapsed_s=1
 ```cmake
 install(TARGETS mytest RUNTIME DESTINATION usr/bin/starry-test-suit)
 ```
+
+串口/TTY 事务回归由 `qemu/system/test-tty-termios-transaction` 覆盖。它在真实
+`/dev/ttyS0` 上验证配置错误不会发布新 termios，并让普通输出与
+`TCSETSW2`/`TCSETSF2` 并发；同时通过 PTY 验证 `TCSETSF2` 在配置事务完成后清理旧输入。
+该子目录不放自己的 `qemu-*.toml`，而是由 `qemu/system/qemu-*.toml` 的统一 SMP4 guest
+承载。单独运行四个架构时使用：
+
+```bash
+cargo xtask starry test qemu --arch x86_64 -c qemu/system/test-tty-termios-transaction
+cargo xtask starry test qemu --arch riscv64 -c qemu/system/test-tty-termios-transaction
+cargo xtask starry test qemu --arch aarch64 -c qemu/system/test-tty-termios-transaction
+cargo xtask starry test qemu --arch loongarch64 -c qemu/system/test-tty-termios-transaction
+```
+
+同一 grouped runner 还必须保留 `test-tty-flush` 和
+`tty-bugfix-bug-raw-terminal-polling`。前者保持 `TCIFLUSH`、`TCOFLUSH`、`TCIOFLUSH`
+以及串口 output flush 的断言，后者保持 raw mode 下 `poll()` 超时的原有成功/失败条件。
+`tty-console-input-burst` 继续作为独立 shell-injection case，不迁入 grouped runner。
 
 如果某个 C 子测例只支持部分架构，优先使用 `system/common/starry_arch_filter.cmake`
 生成 skip 二进制。skip 输出要清楚说明目标和原因，并返回 0。
@@ -393,6 +426,13 @@ session_files = [
 - `${boardServerHttpBaseUrl}`：板端可访问的 session HTTP 基础 URL。
 - `${sessionFile:<relative-path>}`：对应共享文件的完整下载 URL。
 
+AKA 的安全 Wi-Fi board case 在构建时从 `STARRY_WIFI_SSID` 和
+`STARRY_WIFI_PASSWORD` 生成 AIC station 启动事务。凭据不使用额外 sidecar 或 guest
+helper；连接和 DHCP 完成后，脚本仍按上面的普通 HTTP session file 机制下载。runner
+只为可信 boot entropy 创建带 `/chosen/rng-seed` 的临时 DTB 副本，不修改仓库 DTB。
+空 `STARRY_WIFI_SSID` 只禁用 station 启动连接；AIC8800 驱动仍初始化并注册 `wlan0`，
+且其他 AKA board case 继续运行。只有 `wifi-iperf-smoke` 因无法联网而记为 skipped。
+
 普通 shell 变量（例如 `${HOME}`）保持原样。未解析的 session 保留变量会在上板运行
 前报错；无论上传、展开还是运行失败，xtask 都会释放 session。
 
@@ -505,12 +545,12 @@ cargo xtask starry board \
 
 两条路径都必须进入 `root@starry:/root #` 并打印独立的
 `STARRY_ROCK4D_BOOT_OK` 成功行。RK3576 的固件、PSCI、CPU 拓扑和 CRU/PMU
-检查点见 `.claude/skills/arch-platform-porting/references/boot-debugging.md`。
+检查点见 `.agents/skills/arch-platform-porting/references/boot-debugging.md`。
 
 `board-aka-00-sg2002/usb2-libuvc-init` 提供静态交叉编译固定版本上游 libuvc 的
-C 资产和 `board-aka-00-sg2002.toml.disabled` 配置模板。AKA-00-SG2002 当前没有
-StarryOS 网络设备，无法从 session HTTP URL 下载程序，因此该模板不会被 board
-discovery 或 CI 启用。后续网络可用时移除 `.disabled` 后缀；其
+C 资产和 `board-aka-00-sg2002.toml.disabled` 配置模板。该 USB 用例尚未完成
+AKA 实板验收，因此模板不会被 board discovery 或 CI 启用。完成验证后可移除
+`.disabled` 后缀；其
 `shell_init_cmd` 会使用 `wget` 下载程序，并只验证 `uvc_init` / `uvc_exit`，不枚举
 摄像头、不采集帧，也不验证 DWC2 isochronous 传输。
 
