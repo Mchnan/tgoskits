@@ -69,7 +69,8 @@ use super::drm::{
     DRM_MODE_OBJECT_BLOB, DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_OBJECT_CRTC,
     DRM_MODE_OBJECT_FB, DRM_MODE_OBJECT_PLANE,
     DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_ATOMIC, DRM_MODE_PROP_BLOB, DRM_MODE_PROP_ENUM,
-    DRM_MODE_PROP_IMMUTABLE, DRM_MODE_PROP_OBJECT, DRM_MODE_PROP_RANGE, DRM_PLANE_TYPE_PRIMARY,
+    DRM_MODE_PROP_IMMUTABLE, DRM_MODE_PROP_OBJECT, DRM_MODE_PROP_RANGE,
+    DRM_MODE_PROP_SIGNED_RANGE, DRM_PLANE_TYPE_PRIMARY,
     DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_IMPORT, DRM_PROP_NAME_LEN, DrmAuth, DrmEvent,
     DrmEventVblank, DrmGetCap, DrmModeAtomic, DrmModeCardRes, DrmModeCreateBlob, DrmModeCreateDumb,
     DrmModeCrtc, DrmModeCrtcPageFlip, DrmModeDestroyBlob, DrmModeDestroyDumb, DrmModeDirtyFB,
@@ -130,6 +131,12 @@ const PROP_PLANE_CRTC_H: u32 = 0x10A;
 /// `IN_FORMATS` — immutable blob property advertising the (format,
 /// modifier) tuples this plane accepts.
 const PROP_PLANE_IN_FORMATS: u32 = 0x10B;
+/// `IN_FENCE_FD` — signed-range fence-fd property on every plane. The
+/// emulation presents synchronously, so the fence carries no timing
+/// information; advertising it keeps strict-fencing compositors (denial
+/// requires it on the primary plane) functional. Commits consume the fd
+/// like Linux so strict-fencing clients do not leak one fd per frame.
+const PROP_PLANE_IN_FENCE_FD: u32 = 0x10C;
 
 const PROP_CRTC_ACTIVE: u32 = 0x200;
 const PROP_CRTC_MODE_ID: u32 = 0x201;
@@ -149,6 +156,7 @@ const PLANE_PROPS: &[u32] = &[
     PROP_PLANE_CRTC_W,
     PROP_PLANE_CRTC_H,
     PROP_PLANE_IN_FORMATS,
+    PROP_PLANE_IN_FENCE_FD,
 ];
 const CRTC_PROPS: &[u32] = &[PROP_CRTC_ACTIVE, PROP_CRTC_MODE_ID];
 const CONN_PROPS: &[u32] = &[PROP_CONN_CRTC_ID];
@@ -1310,6 +1318,8 @@ fn plane_prop_values(s: &ModesetState, in_formats: u64) -> Vec<u64> {
         s.plane_crtc_w,
         s.plane_crtc_h,
         in_formats,
+        // No fence is ever pending outside a commit request.
+        u64::MAX,
     ]
 }
 
@@ -1478,6 +1488,16 @@ fn property_meta(id: u32) -> Option<PropMeta> {
             flags: DRM_MODE_PROP_BLOB | DRM_MODE_PROP_IMMUTABLE,
             kind: PropKind::Blob,
         },
+        PROP_PLANE_IN_FENCE_FD => PropMeta {
+            name: "IN_FENCE_FD",
+            // Linux declares this as a signed range [-1, INT_MAX] where -1
+            // (reported as u64::MAX) means "no fence".
+            flags: DRM_MODE_PROP_SIGNED_RANGE | atomic,
+            kind: PropKind::RangeU64 {
+                min: u64::MAX,
+                max: i32::MAX as u64,
+            },
+        },
         PROP_CRTC_ACTIVE => PropMeta {
             name: "ACTIVE",
             // weston's drm-backend specifically rejects ACTIVE if it
@@ -1509,6 +1529,18 @@ fn range_u32(name: &'static str, atomic: u32) -> PropMeta {
             max: u32::MAX as u64,
         },
     }
+}
+
+/// Per-commit side effects collected by `apply_prop`. Both fields are
+/// published only after the whole batch validates so a TEST_ONLY commit
+/// or a later property error leaves committed state untouched.
+#[derive(Default)]
+struct CommitEffects {
+    /// Outer Option: "the commit assigned MODE_ID at least once".
+    /// Inner Option: the resolved Arc (None means clearing MODE_ID to 0).
+    new_mode_blob: Option<Option<Arc<Vec<u8>>>>,
+    /// IN_FENCE_FD user fd to consume after a successful real commit.
+    pending_fence_close: Option<i32>,
 }
 
 impl Card0 {
@@ -1634,12 +1666,7 @@ impl Card0 {
 
         let mut state = self.state.lock();
         let mut proposed = *state;
-        // Outer Option: "the commit assigned MODE_ID at least once".
-        // Inner Option: the resolved Arc (None means clearing MODE_ID to 0).
-        // Only published into `mode_id_blob_ref` after the whole batch
-        // validates so a TEST_ONLY commit or a later property error
-        // leaves the committed mode blob ref untouched.
-        let mut new_mode_blob: Option<Option<Arc<Vec<u8>>>> = None;
+        let mut effects = CommitEffects::default();
         let mut idx = 0;
         for (obj_i, &obj_id) in objs.iter().enumerate() {
             let obj_type = object_type_of(obj_id).ok_or(VfsError::NotFound)?;
@@ -1653,7 +1680,7 @@ impl Card0 {
                     prop_id,
                     value,
                     &mut proposed,
-                    &mut new_mode_blob,
+                    &mut effects,
                 )? {
                     return Err(VfsError::InvalidInput);
                 }
@@ -1661,13 +1688,19 @@ impl Card0 {
         }
 
         if a.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 {
+            // TEST_ONLY never consumes the fence fd.
             return Ok(0);
+        }
+        if let Some(fd) = effects.pending_fence_close {
+            // Linux takes ownership of IN_FENCE_FD on a real commit; the
+            // emulation has no use for the fence, so just close it.
+            let _ = crate::file::close_file_like(fd);
         }
 
         let current_fb = proposed.plane_fb_id;
         *state = proposed;
         drop(state);
-        if let Some(new_ref) = new_mode_blob {
+        if let Some(new_ref) = effects.new_mode_blob {
             *self.mode_id_blob_ref.lock() = new_ref;
         }
         if current_fb != 0 {
@@ -1689,7 +1722,7 @@ impl Card0 {
         prop_id: u32,
         value: u64,
         s: &mut ModesetState,
-        new_mode_blob: &mut Option<Option<Arc<Vec<u8>>>>,
+        effects: &mut CommitEffects,
     ) -> VfsResult<bool> {
         match (obj_type, prop_id) {
             (DRM_MODE_OBJECT_PLANE, PROP_PLANE_TYPE) => {
@@ -1724,6 +1757,20 @@ impl Card0 {
             }
             (DRM_MODE_OBJECT_PLANE, PROP_PLANE_CRTC_W) => s.plane_crtc_w = value,
             (DRM_MODE_OBJECT_PLANE, PROP_PLANE_CRTC_H) => s.plane_crtc_h = value,
+            (DRM_MODE_OBJECT_PLANE, PROP_PLANE_IN_FENCE_FD) => {
+                // [-1, INT_MAX] signed range; -1 (u64::MAX) means "no
+                // fence". A real commit consumes the fd like Linux, but a
+                // TEST_ONLY commit or a failed batch must leave it intact,
+                // so the close is deferred to the commit path.
+                if value == u64::MAX {
+                    return Ok(true);
+                }
+                let fd = i64::try_from(value).map_err(|_| VfsError::InvalidInput)?;
+                if fd < 0 || fd > i32::MAX as i64 {
+                    return Err(VfsError::InvalidInput);
+                }
+                effects.pending_fence_close = Some(fd as i32);
+            }
             (DRM_MODE_OBJECT_CRTC, PROP_CRTC_ACTIVE) => {
                 if value > 1 {
                     return Err(VfsError::InvalidInput);
@@ -1752,7 +1799,7 @@ impl Card0 {
                     Some(arc.ok_or(VfsError::InvalidInput)?)
                 };
                 s.crtc_mode_id = blob;
-                *new_mode_blob = Some(arc);
+                effects.new_mode_blob = Some(arc);
             }
             (DRM_MODE_OBJECT_CONNECTOR, PROP_CONN_CRTC_ID) => {
                 let c = value as u32;

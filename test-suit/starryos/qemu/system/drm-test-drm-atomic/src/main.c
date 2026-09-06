@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE
 #include "test_framework.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
@@ -100,6 +101,7 @@ struct drm_event_vblank {
 #define DRM_MODE_OBJECT_PLANE       0xeeeeeeee
 #define DRM_MODE_ATOMIC_TEST_ONLY   0x0100
 #define DRM_MODE_PAGE_FLIP_EVENT    0x01
+#define DRM_MODE_PROP_SIGNED_RANGE  (1u << 7)
 #define DRM_CLIENT_CAP_UNIVERSAL_PLANES 2
 #define DRM_CLIENT_CAP_ATOMIC       3
 #define DRM_FORMAT_XRGB8888         0x34325258
@@ -402,6 +404,81 @@ int main(void)
                   "GETPLANE after atomic commit");
         CHECK(gp2.fb_id == fb.fb_id, "GETPLANE reports committed fb_id");
         CHECK(gp2.crtc_id == crtcs[0], "GETPLANE reports committed crtc_id");
+    }
+
+    /* --- IN_FENCE_FD ---
+     * 严格 fence 的合成器（denial 要求 primary plane 必须广播）把它声明为
+     * 符号范围 [-1, INT_MAX]；真实提交要按 Linux 语义消费 fence fd，
+     * 否则逐帧 fence 的客户端会泄漏 fd。 */
+    uint32_t P_PLANE_IN_FENCE_FD = find_prop(fd, planes[0],
+                                             DRM_MODE_OBJECT_PLANE,
+                                             "IN_FENCE_FD");
+    CHECK(P_PLANE_IN_FENCE_FD != 0, "plane advertises IN_FENCE_FD");
+    {
+        struct drm_mode_get_property g = {0};
+        g.prop_id = P_PLANE_IN_FENCE_FD;
+        uint64_t vals[2] = {0};
+        g.count_values = 2;
+        g.values_ptr = (uint64_t)(uintptr_t)vals;
+        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &g), 0,
+                  "GETPROPERTY IN_FENCE_FD");
+        CHECK(g.flags & DRM_MODE_PROP_SIGNED_RANGE,
+              "IN_FENCE_FD is SIGNED_RANGE");
+        CHECK(g.count_values == 2, "IN_FENCE_FD reports two range values");
+        CHECK(vals[0] == (uint64_t)-1, "IN_FENCE_FD min == -1");
+        CHECK(vals[1] == 2147483647ULL, "IN_FENCE_FD max == INT_MAX");
+        CHECK(obj_prop_value(fd, planes[0], DRM_MODE_OBJECT_PLANE,
+                             P_PLANE_IN_FENCE_FD) == (uint64_t)-1,
+              "IN_FENCE_FD idle value == -1");
+    }
+    {
+        uint32_t t_objs[1] = { planes[0] };
+        uint32_t t_counts[1] = { 1 };
+        uint32_t t_props[1] = { P_PLANE_IN_FENCE_FD };
+        uint64_t t_values[1] = { (uint64_t)-1 };
+        struct drm_mode_atomic t = {
+            .flags = DRM_MODE_ATOMIC_TEST_ONLY,
+            .count_objs = 1,
+            .objs_ptr = (uint64_t)(uintptr_t)t_objs,
+            .count_props_ptr = (uint64_t)(uintptr_t)t_counts,
+            .props_ptr = (uint64_t)(uintptr_t)t_props,
+            .prop_values_ptr = (uint64_t)(uintptr_t)t_values,
+        };
+        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &t), 0,
+                  "TEST_ONLY IN_FENCE_FD=-1 accepted");
+        t_values[0] = (uint64_t)-2;
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &t), EINVAL,
+                  "IN_FENCE_FD=-2 rejected");
+        /* TEST_ONLY 不消费真实 fd。 */
+        int probe = open("/dev/zero", O_RDONLY | O_CLOEXEC);
+        CHECK(probe >= 0, "open fence probe fd");
+        t_values[0] = (uint64_t)probe;
+        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &t), 0,
+                  "TEST_ONLY with real fd accepted");
+        CHECK(fcntl(probe, F_GETFD) != -1,
+              "TEST_ONLY did not consume the fence fd");
+        close(probe);
+    }
+    {
+        /* 真实提交消费 fence fd。 */
+        int fence = open("/dev/zero", O_RDONLY | O_CLOEXEC);
+        CHECK(fence >= 0, "open fence fd");
+        uint32_t r_objs[1] = { planes[0] };
+        uint32_t r_counts[1] = { 1 };
+        uint32_t r_props[1] = { P_PLANE_IN_FENCE_FD };
+        uint64_t r_values[1] = { (uint64_t)fence };
+        struct drm_mode_atomic r = {
+            .flags = 0,
+            .count_objs = 1,
+            .objs_ptr = (uint64_t)(uintptr_t)r_objs,
+            .count_props_ptr = (uint64_t)(uintptr_t)r_counts,
+            .props_ptr = (uint64_t)(uintptr_t)r_props,
+            .prop_values_ptr = (uint64_t)(uintptr_t)r_values,
+        };
+        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &r), 0,
+                  "commit with IN_FENCE_FD accepted");
+        CHECK(fcntl(fence, F_GETFD) == -1 && errno == EBADF,
+              "commit consumed the fence fd");
     }
 
     /* page flip event 应可读。 */

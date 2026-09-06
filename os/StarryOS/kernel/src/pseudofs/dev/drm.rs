@@ -447,6 +447,7 @@ pub const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
 pub const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 pub const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
 pub const DRM_MODE_PROP_OBJECT: u32 = 1 << 6;
+pub const DRM_MODE_PROP_SIGNED_RANGE: u32 = 1 << 7;
 pub const DRM_MODE_PROP_ATOMIC: u32 = 0x8000_0000;
 
 /// `DRM_PROP_NAME_LEN` from Linux uapi.
