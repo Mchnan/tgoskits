@@ -94,6 +94,8 @@ struct drm_event_vblank {
 #define DRM_IOCTL_SET_CLIENT_CAP          _IOW('d', 0x0d, struct drm_set_client_cap)
 
 #define DRM_MODE_OBJECT_CRTC        0xcccccccc
+#define DRM_MODE_OBJECT_FB          0xfbfbfbfb
+#define DRM_MODE_OBJECT_BLOB        0xbbbbbbbb
 #define DRM_MODE_OBJECT_CONNECTOR   0xc0c0c0c0
 #define DRM_MODE_OBJECT_PLANE       0xeeeeeeee
 #define DRM_MODE_ATOMIC_TEST_ONLY   0x0100
@@ -237,6 +239,77 @@ int main(void)
         CHECK(vals[0] == 0 && vals[1] == 1, "CRTC.ACTIVE range == [0, 1]");
     }
 
+    /* OBJECT 属性必须返回 count_values==1 且 values[0] 为对象类型。
+     * drm-rs / libdrm 在此直接索引 values[0]；返回空值列表会让
+     * smithay/合成器在枚举属性时越界崩溃。 */
+    {
+        struct drm_mode_get_property gp = {0};
+        uint64_t vals[2] = {0};
+        gp.prop_id = P_CONN_CRTC_ID;
+        gp.values_ptr = (uint64_t)(uintptr_t)vals;
+        gp.count_values = 2;
+        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &gp), 0,
+                  "GETPROPERTY connector.CRTC_ID");
+        CHECK(gp.count_values == 1, "CRTC_ID exposes exactly one value");
+        CHECK(vals[0] == DRM_MODE_OBJECT_CRTC,
+              "CRTC_ID value type == DRM_MODE_OBJECT_CRTC");
+    }
+    {
+        struct drm_mode_get_property gp = {0};
+        uint64_t vals[2] = {0};
+        gp.prop_id = P_PLANE_FB_ID;
+        gp.values_ptr = (uint64_t)(uintptr_t)vals;
+        gp.count_values = 2;
+        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &gp), 0,
+                  "GETPROPERTY plane.FB_ID");
+        CHECK(gp.count_values == 1, "FB_ID exposes exactly one value");
+        CHECK(vals[0] == DRM_MODE_OBJECT_FB,
+              "FB_ID value type == DRM_MODE_OBJECT_FB");
+    }
+    {
+        struct drm_mode_get_property gp = {0};
+        uint64_t vals[2] = {0};
+        gp.prop_id = P_CRTC_MODE_ID;
+        gp.values_ptr = (uint64_t)(uintptr_t)vals;
+        gp.count_values = 2;
+        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &gp), 0,
+                  "GETPROPERTY crtc.MODE_ID");
+        CHECK(gp.count_values == 1, "MODE_ID exposes exactly one value");
+        CHECK(vals[0] == DRM_MODE_OBJECT_BLOB,
+              "MODE_ID value type == DRM_MODE_OBJECT_BLOB");
+    }
+
+    /* smithay 的 atomic 后端会对 framebuffer 也快照属性。合法对象没有
+     * 属性时必须返回空列表（count_props==0），而不是 ENOENT。 */
+    {
+        uint32_t ids[8] = {0};
+        uint64_t vals[8] = {0};
+        struct drm_mode_obj_get_properties q = {0};
+        q.obj_id = fb.fb_id;
+        q.obj_type = DRM_MODE_OBJECT_FB;
+        q.count_props = 8;
+        q.props_ptr = (uint64_t)(uintptr_t)ids;
+        q.prop_values_ptr = (uint64_t)(uintptr_t)vals;
+        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &q), 0,
+                  "OBJ_GETPROPERTIES framebuffer");
+        CHECK(q.count_props == 0, "framebuffer has empty property list");
+    }
+
+    /* PRIME 导出的 dma-buf 必须支持 lseek(SEEK_END) 返回缓冲大小。
+     * Mesa/gbm 在 dmabuf 导入时用 lseek 探测大小，ESPIPE 会让
+     * eglCreateImageKHR 以 BAD_ALLOC 失败（llvmpipe/swrast 路径）。 */
+    {
+        struct drm_prime_handle { uint32_t handle; uint32_t flags; int32_t fd; };
+#define DRM_IOCTL_PRIME_HANDLE_TO_FD _IOWR('d', 0x2d, struct drm_prime_handle)
+        struct drm_prime_handle ph = { .handle = cd.handle, .flags = 0x80000 };
+        CHECK_RET(ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph), 0,
+                  "PRIME_HANDLE_TO_FD");
+        CHECK(ph.fd >= 0, "PRIME export returns an fd");
+        off_t sz = lseek(ph.fd, 0, SEEK_END);
+        CHECK(sz == (off_t)cd.size, "dmabuf lseek SEEK_END == buffer size");
+        close(ph.fd);
+    }
+
     /* --- blob round-trip --- */
     struct drm_mode_create_blob cb = {
         .data = (uint64_t)(uintptr_t)&modes[0],
@@ -308,6 +381,28 @@ int main(void)
     CHECK(obj_prop_value(fd, conns[0], DRM_MODE_OBJECT_CONNECTOR, P_CONN_CRTC_ID)
               == crtcs[0],
           "commit set connector.CRTC_ID");
+
+    /* GETPLANE（legacy 结构体）也必须回读 atomic 提交后的实时状态。
+     * deniald 的初始扫描验证提交后用 GETPLANE 检查 primary plane 是否
+     * 真的在扫描 framebuffer；硬编码 fb_id=0 会让合成器直接失败。 */
+    {
+        struct drm_mode_get_plane {
+            uint32_t plane_id;
+            uint32_t fb_id; uint32_t crtc_id; uint32_t crtcs_possible;
+            uint32_t gamma_size; uint32_t count_format_types;
+            uint64_t format_type_ptr;
+        };
+#define DRM_IOCTL_MODE_GETPLANE _IOWR('d', 0xB6, struct drm_mode_get_plane)
+        uint32_t fmts[8] = {0};
+        struct drm_mode_get_plane gp2 = {0};
+        gp2.plane_id = planes[0];
+        gp2.count_format_types = 8;
+        gp2.format_type_ptr = (uint64_t)(uintptr_t)fmts;
+        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &gp2), 0,
+                  "GETPLANE after atomic commit");
+        CHECK(gp2.fb_id == fb.fb_id, "GETPLANE reports committed fb_id");
+        CHECK(gp2.crtc_id == crtcs[0], "GETPLANE reports committed crtc_id");
+    }
 
     /* page flip event 应可读。 */
     struct pollfd pfd = { .fd = fd, .events = POLLIN };

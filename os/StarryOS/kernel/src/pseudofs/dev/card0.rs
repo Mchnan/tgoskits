@@ -66,7 +66,8 @@ use super::drm::{
     DRM_IOCTL_SET_VERSION, DRM_IOCTL_VERSION, DRM_IOCTL_WAIT_VBLANK, DRM_MODE_ATOMIC_ALLOW_MODESET,
     DRM_MODE_ATOMIC_NONBLOCK, DRM_MODE_ATOMIC_TEST_ONLY, DRM_MODE_CONNECTED,
     DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_FB_MODIFIERS,
-    DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_OBJECT_CRTC, DRM_MODE_OBJECT_PLANE,
+    DRM_MODE_OBJECT_BLOB, DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_OBJECT_CRTC,
+    DRM_MODE_OBJECT_FB, DRM_MODE_OBJECT_PLANE,
     DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_ATOMIC, DRM_MODE_PROP_BLOB, DRM_MODE_PROP_ENUM,
     DRM_MODE_PROP_IMMUTABLE, DRM_MODE_PROP_OBJECT, DRM_MODE_PROP_RANGE, DRM_PLANE_TYPE_PRIMARY,
     DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_IMPORT, DRM_PROP_NAME_LEN, DrmAuth, DrmEvent,
@@ -249,6 +250,10 @@ struct DmaBufGem {
 impl FileLike for DmaBufGem {
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:dmabuf".into()
+    }
+
+    fn seekable_size(&self) -> Option<u64> {
+        Some(self.size)
     }
 
     fn device_mmap(&self, offset: u64, length: u64) -> StarryResult<DeviceMmap> {
@@ -600,7 +605,7 @@ impl DeviceOps for Card0 {
             DRM_IOCTL_MODE_DESTROY_DUMB => self.handle_destroy_dumb(arg),
 
             DRM_IOCTL_MODE_GETPLANERESOURCES => handle_get_plane_resources(arg),
-            DRM_IOCTL_MODE_GETPLANE => handle_get_plane(arg),
+            DRM_IOCTL_MODE_GETPLANE => handle_get_plane(self, arg),
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.handle_obj_get_properties(arg),
             DRM_IOCTL_MODE_GETPROPERTY => handle_get_property(arg),
             DRM_IOCTL_MODE_PAGE_FLIP => self.handle_page_flip(arg),
@@ -1235,14 +1240,22 @@ fn handle_get_plane_resources(arg: usize) -> VfsResult<usize> {
     Ok(0)
 }
 
-fn handle_get_plane(arg: usize) -> VfsResult<usize> {
+fn handle_get_plane(card: &Card0, arg: usize) -> VfsResult<usize> {
     let ptr = arg as *mut DrmModeGetPlane;
     let mut p: DrmModeGetPlane = ptr.vm_read().map_err(|_| VfsError::BadAddress)?;
     if p.plane_id != PLANE_ID {
         return Err(VfsError::InvalidInput);
     }
-    p.crtc_id = CRTC_ID;
-    p.fb_id = 0;
+    // Report the live atomic state: compositors (deniald) verify an atomic
+    // commit by reading GETPLANE back and checking the primary plane really
+    // is scanning out the committed framebuffer.
+    let state = *card.state.lock();
+    p.fb_id = state.plane_fb_id;
+    p.crtc_id = if state.plane_fb_id != 0 {
+        state.plane_crtc_id
+    } else {
+        0
+    };
     p.possible_crtcs = 1;
     p.gamma_size = 0;
     p.count_format_types =
@@ -1264,6 +1277,15 @@ impl Card0 {
             }
             (DRM_MODE_OBJECT_CRTC, CRTC_ID) => (CRTC_PROPS, crtc_prop_values(&state)),
             (DRM_MODE_OBJECT_CONNECTOR, CONNECTOR_ID) => (CONN_PROPS, conn_prop_values(&state)),
+            // smithay's atomic backend snapshots properties for framebuffers
+            // as well. Valid objects without properties report an empty list
+            // (count 0), not ENOENT, matching Linux.
+            (DRM_MODE_OBJECT_FB, fb_id) => {
+                if !self.fbs.lock().contains_key(&fb_id) {
+                    return Err(VfsError::NotFound);
+                }
+                (&[], Vec::new())
+            }
             _ => return Err(VfsError::NotFound),
         };
         report_user_array(q.props_ptr, q.count_props, prop_ids)?;
@@ -1371,8 +1393,17 @@ fn handle_get_property(arg: usize) -> VfsResult<usize> {
             g.count_values = report_user_array(g.values_ptr, g.count_values, &limits)?;
             g.count_enum_blobs = 0;
         }
-        PropKind::Object | PropKind::Blob => {
-            g.count_values = 0;
+        // Linux returns values[0] == DRM_MODE_OBJECT_* for OBJECT
+        // properties and values[0] == DRM_MODE_OBJECT_BLOB for BLOB
+        // properties; drm-rs indexes values[0] unconditionally.
+        PropKind::Object(object_type) => {
+            let values = [object_type as u64];
+            g.count_values = report_user_array(g.values_ptr, g.count_values, &values)?;
+            g.count_enum_blobs = 0;
+        }
+        PropKind::Blob => {
+            let values = [DRM_MODE_OBJECT_BLOB as u64];
+            g.count_values = report_user_array(g.values_ptr, g.count_values, &values)?;
             g.count_enum_blobs = 0;
         }
     }
@@ -1389,7 +1420,7 @@ struct PropMeta {
 enum PropKind {
     Enum(&'static [DrmModePropertyEnum]),
     RangeU64 { min: u64, max: u64 },
-    Object,
+    Object(u32),
     Blob,
 }
 
@@ -1427,12 +1458,12 @@ fn property_meta(id: u32) -> Option<PropMeta> {
         PROP_PLANE_FB_ID => PropMeta {
             name: "FB_ID",
             flags: DRM_MODE_PROP_OBJECT | atomic,
-            kind: PropKind::Object,
+            kind: PropKind::Object(DRM_MODE_OBJECT_FB),
         },
         PROP_PLANE_CRTC_ID => PropMeta {
             name: "CRTC_ID",
             flags: DRM_MODE_PROP_OBJECT | atomic,
-            kind: PropKind::Object,
+            kind: PropKind::Object(DRM_MODE_OBJECT_CRTC),
         },
         PROP_PLANE_SRC_X => range_u32("SRC_X", atomic),
         PROP_PLANE_SRC_Y => range_u32("SRC_Y", atomic),
@@ -1462,7 +1493,7 @@ fn property_meta(id: u32) -> Option<PropMeta> {
         PROP_CONN_CRTC_ID => PropMeta {
             name: "CRTC_ID",
             flags: DRM_MODE_PROP_OBJECT | atomic,
-            kind: PropKind::Object,
+            kind: PropKind::Object(DRM_MODE_OBJECT_CRTC),
         },
         _ => return None,
     };
