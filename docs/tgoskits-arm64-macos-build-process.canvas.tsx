@@ -1231,6 +1231,59 @@ deniald: cargo build --release --features flutter   # aarch64 glibc 一次通过
               </Stack>
             </CardBody>
           </Card>
+
+          <Card>
+            <CardHeader>
+              <H3>9.11 无侵入采样定位「只有 deniald 却全卡」：aspace 锁饥饿（2026-09-09）</H3>
+            </CardHeader>
+            <CardBody>
+              <Stack gap={8}>
+                <Text>
+                  质疑「多线程 llvmpipe 慢」的算力解释后改用无侵入采样：QEMU 加
+                  <Code>-gdb unix:/tmp/prof/gdb.sock,server=on,wait=off</Code>，
+                  宿主 python 循环 vCont;t 停机 → ? 确认 T05 → 逐 vCPU 读
+                  g 包（PC/CPSR/x0-x2/x30）→ vCont;c；CPSR.M[3:2] 区分
+                  EL0/EL1，PC 用 starryos ELF 符号表符号化并反混淆，函数参数
+                  与返回地址一并记录，guest 内核零改动。
+                </Text>
+                <Text>
+                  根因链（全部有采样证据）：deniald/flutter 存在用户态时钟轮询
+                  （Linux 上走 vDSO 零成本），StarryOS 无 vDSO 使每次时钟读都是
+                  真系统调用；采样抓到该循环写 16 字节 timespec（x2=0x10 恒定，
+                  缓冲落在用户栈），每次都走
+                  <Code>prepare_user_memory</Code> 慢路径拿
+                  <Code>AddrSpace</Code> 全局锁（调用方 LR 为
+                  <Code>prepare_user_memory+0x27c</Code>），自旋线程近乎连续
+                  持锁，同进程全部线程的任意系统调用饿死在这把锁上——
+                  20 秒窗口 44/172 busy 全部集中在 tid1，其余三核
+                  <Code>run_idle</Code>。top 的 99% sys 另是记账幻象
+                  （线程阻塞期间的 off-CPU 时间被下次状态切换补记成 stime）。
+                </Text>
+                <Text>
+                  fastpath A/B：board 配置启用
+                  <Code>starry-kernel/user-access-fastpath</Code>（免锁 AT
+                  探测）重建后 can_access_range 风暴从样本中消失、busy 分散
+                  多核——机制验证成立；但桌面黑屏不渲染。回退后同流程
+                  +30s 锁屏出画（HMP screendump 亮像素 16.5% 稳定）→
+                  保持回退保 baseline，最终修复等上游 #2261/#2302 重写的
+                  UserAccess/VMA 路径随 repatch 落地。ash 对照另证：
+                  34/34 用户态样本全在 tid1，CPU0 堆叠（#1775 修复）
+                  是次要因素。
+                </Text>
+                <Text>
+                  诊断工具链坑（全部踩实）：串口 chardev socket 断开后 QEMU
+                  不再重接受（须常驻进程持有连接）；guest 忙时串口输入饿死、
+                  输出超 4KB 冻结、积压以分钟级速度消化——串口只适合 boot
+                  阶段；诊断通道用 unix gdbstub（独立监听、忙时可用）+
+                  HMP screendump 亮度作客观指标（cocoa 显示锁定可见）。
+                  僵尸守护进程会偷 FIFO 命令行，重启实例前先 pkill 旧的。
+                  现状：baseline 内核（无 fastpath）+ QEMU 运行中锁屏可见；
+                  结论入库 AGENTS.md §3（2f3b741c7），repatch 范围 =
+                  上游 #1775/#2261/#2302 终态 + 移植 #2295/#2296/#2284。
+                </Text>
+              </Stack>
+            </CardBody>
+          </Card>
     </Stack>
   );
 }
