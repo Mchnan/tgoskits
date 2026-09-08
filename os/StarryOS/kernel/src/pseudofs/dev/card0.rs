@@ -629,7 +629,7 @@ impl DeviceOps for Card0 {
             DRM_IOCTL_MODE_DESTROY_DUMB => self.handle_destroy_dumb(current, arg),
 
             DRM_IOCTL_MODE_GETPLANERESOURCES => handle_get_plane_resources(current, arg),
-            DRM_IOCTL_MODE_GETPLANE => handle_get_plane(current, arg),
+            DRM_IOCTL_MODE_GETPLANE => self.handle_get_plane(current, arg),
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.handle_obj_get_properties(current, arg),
             DRM_IOCTL_MODE_GETPROPERTY => handle_get_property(current, arg),
             DRM_IOCTL_MODE_PAGE_FLIP => self.handle_page_flip(current, arg),
@@ -1308,16 +1308,17 @@ fn handle_get_plane_resources(current: &crate::task::UserTaskRef, arg: usize) ->
     Ok(0)
 }
 
-fn handle_get_plane(current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
-    let ptr = arg as *mut DrmModeGetPlane;
-    let mut p: DrmModeGetPlane = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
-    if p.plane_id != PLANE_ID {
-        return Err(VfsError::InvalidInput);
-    }
-    // Report the live atomic state: compositors (deniald) verify an atomic
-    // commit by reading GETPLANE back and checking the primary plane really
-    // is scanning out the committed framebuffer.
-    let state = *card.state.lock();
+impl Card0 {
+    fn handle_get_plane(&self, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
+        let ptr = arg as *mut DrmModeGetPlane;
+        let mut p: DrmModeGetPlane = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
+        if p.plane_id != PLANE_ID {
+            return Err(VfsError::InvalidInput);
+        }
+        // Report the live atomic state: compositors (deniald) verify an atomic
+        // commit by reading GETPLANE back and checking the primary plane really
+        // is scanning out the committed framebuffer.
+        let state = *self.state.lock();
     p.fb_id = state.plane_fb_id;
     p.crtc_id = if state.plane_fb_id != 0 {
         state.plane_crtc_id
@@ -1333,7 +1334,8 @@ fn handle_get_plane(current: &crate::task::UserTaskRef, arg: usize) -> VfsResult
         SUPPORTED_FORMATS,
     )?;
     ptr.vm_write(current, p).map_err(|_| VfsError::BadAddress)?;
-    Ok(0)
+        Ok(0)
+    }
 }
 
 impl Card0 {
@@ -1478,12 +1480,12 @@ fn handle_get_property(current: &crate::task::UserTaskRef, arg: usize) -> VfsRes
         // properties; drm-rs indexes values[0] unconditionally.
         PropKind::Object(object_type) => {
             let values = [object_type as u64];
-            g.count_values = report_user_array(g.values_ptr, g.count_values, &values)?;
+            g.count_values = report_user_array(current, g.values_ptr, g.count_values, &values)?;
             g.count_enum_blobs = 0;
         }
         PropKind::Blob => {
             let values = [DRM_MODE_OBJECT_BLOB as u64];
-            g.count_values = report_user_array(g.values_ptr, g.count_values, &values)?;
+            g.count_values = report_user_array(current, g.values_ptr, g.count_values, &values)?;
             g.count_enum_blobs = 0;
         }
     }

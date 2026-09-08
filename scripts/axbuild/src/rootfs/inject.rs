@@ -926,12 +926,21 @@ mod tests {
             let marker = root.path().join("debugfs-runs");
             write_executable(
                 &debugfs,
-                "#!/bin/sh\nprintf 'ran\\n' >> \"$AXBUILD_TEST_EXTRACTION_MARKER\"\n",
+                // The extraction success path also validates top-level
+                // completeness with an `ls -p /` request, so the fake helper
+                // must answer that with a plausible listing; the marker must
+                // only record the rdump invocation.
+                "#!/bin/sh\ncase \"$*\" in\n*ls*-p*) printf '%s\\n' '/2/040755/0/0/etc//'; exit 0 \
+                 ;;\nesac\nprintf 'ran\\n' >> \"$AXBUILD_TEST_EXTRACTION_MARKER\"\n",
             );
             write_executable(
                 &fakeroot,
                 "#!/bin/sh\ntest \"$1\" = -- || exit 91\nshift\nexec \"$@\"\n",
             );
+            // The fake rdump writes nothing; provide the entry that the
+            // top-level completeness check compares against the `ls -p /`
+            // listing.
+            fs::create_dir(root.path().join("etc")).unwrap();
             let mut attempts = 0;
             RootfsExtraction {
                 rootfs_img: Path::new("rootfs.img"),
