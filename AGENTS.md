@@ -54,3 +54,5 @@
 - 启动：HVF + `-smp 4` + virtio-gpu/input + nvme rootfs + cocoa 显示（SOP §2），登录后 deniald 命令必须带 `--flutter-bundle /opt/denial/shell-bundle` 与 `LD_PRELOAD=/usr/lib/libdenialshim.so`（SOP §3）。
 - 关键坑：漏 `--flutter-bundle` 会静默降级诊断模式（蓝闪→永远黑屏+光标，唯一线索是 dd.log 的 `presentation="diagnostic-atlas"`）；不能硬杀 QEMU（guest ext4 数据块丢失、文件变全零），关机用 guest 内 `sync; poweroff`；同一 rootfs 镜像不能双开（写锁）。
 - 性能基线（旧调度器快照树）：LP_NUM_THREADS=1 锁屏约 t50s，默认多线程约 t90–150s（多线程 llvmpipe 反而慢约 3 倍）；根因是唤醒/派生永远本地放置、无负载均衡，上游 PR #1775（2026-09-08 调度器重建）已修复，repatch 后更新基线。
+- 诊断工具（2026-09-09 实战验证）：QEMU 加 `-gdb unix:/tmp/prof/gdb.sock,server=on,wait=off`，串口用 `-chardev socket,...,server=on,wait=off,logfile=console.log` 并由常驻进程持有连接（chardev socket 断开后重连会被饿死，gdbstub 有独立监听不受影响）；采样循环 `vCont;t → ? 确认 T05 → 逐 vCPU g 包读 PC/CPSR（CPSR.M[3:2] 区分 EL0/EL1）→ vCont;c`，符号化用同目录 `starryos` ELF。脚本在会话 /tmp/prof/{probe,flame,guesthold}.py。
+- 已证实结论：快照树 `/proc/stat` 的 sys 包含线程阻塞期间的 off-CPU 时间（`TimeManager.poll` 在下次切换补记全量 delta），top 的 99% sys 是记账幻象，以采样器为准；真实瓶颈是老调度器把全部用户任务放在 CPU0（采样 34/34 个用户态样本全在 tid1）、三核空转，内核侧非空闲热点为 `AddrSpace::can_access_range` 逐页探测与 epoll 扫描（上游 #2261/#2302 已针对性优化）。
