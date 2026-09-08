@@ -1207,6 +1207,27 @@ deniald: cargo build --release --features flutter   # aarch64 glibc 一次通过
                   3 倍且单 vCPU 打满；点击 Unlock 后 6 秒内截图无可见反馈，判断为
                   慢帧未完成或 shell 侧行为，输入到内核/libinput 链路已证通。
                 </Text>
+                <Text>
+                  运行命令修正（2026-09-09 凌晨定位，SOP 已重写为
+                  <Code>docs/sop-run-starryos-denial-qemu.md</Code>）：denial M2 桌面
+                  <Code>必须</Code>带
+                  <Code>--flutter-bundle /opt/denial/shell-bundle</Code>——该参数无默认值，
+                  漏了时 deniald 静默降级 diagnostic-atlas 诊断模式，症状为蓝屏闪一下
+                  （诊断图集蓝矩形）→永远黑屏+光标可动、无锁屏，唯一线索是 dd.log 里
+                  <Code>presentation="diagnostic-atlas"</Code>（正常应为
+                  <Code>native-output-pools</Code>）并缺席 Impeller/engine_session/
+                  visibility 整段 Flutter 运行时启动行。完整命令另需
+                  <Code>chmod 1777 /tmp/.X11-unix</Code>、
+                  <Code>LD_PRELOAD=/usr/lib/libdenialshim.so</Code>、
+                  <Code>DENIA_RENDER_AUDIT=1</Code>。实测基线（快照树，旧调度器）：
+                  LP_NUM_THREADS=1 锁屏约 t50s，默认 4 线程约 t90–150s（多线程
+                  llvmpipe 反而慢约 3 倍，重申 9.10 上段结论）。排查中曾疑 rootfs 被
+                  硬杀损坏——对 bundle 三件套（libapp.so/libflutter_engine.so/
+                  icudtl.dat）做 ELF/ICU magic 与中段字节抽查全部完好，
+                  <Code>diagnostic-atlas</Code> 是参数缺失的按设计降级，不是镜像损坏。
+                  知识已同步写入 AGENTS.md §3 与 SOP；上游调度器重建（#1775）的
+                  repatch 完成后应更新耗时基线。
+                </Text>
               </Stack>
             </CardBody>
           </Card>

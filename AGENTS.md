@@ -47,3 +47,10 @@
 - 分支新增或修改提交后，更新拉取请求描述，使其与已提交改动保持同步。
 - 除非用户明确要求，不得加入与代理相关的标签、签名、品牌或宣传性措辞，例如 `codex`、`agent`、`AI`。
 - 修改体系结构启动逻辑、someboot 启动顺序、统一可扩展固件接口交接、对称多处理启动、动态平台契约、目标描述文件假设或推荐调试流程时，在同一改动中更新 `arch-platform-porting` 技能或其参考资料。
+
+## 3. denial 桌面 QEMU 速查（macOS arm64；完整步骤与坑见 docs/sop-run-starryos-denial-qemu.md，改启动方式或板卡假设时同步更新该 SOP）
+
+- 编译：先设 musl 工具链 PATH 与 `BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl`（lwprintf-rs 的 bindgen 需要，配方在 SOP §1），再 `cargo xtask starry build -c os/StarryOS/configs/board/qemu-aarch64.toml --smp 4`；跑完 unset 该环境变量。
+- 启动：HVF + `-smp 4` + virtio-gpu/input + nvme rootfs + cocoa 显示（SOP §2），登录后 deniald 命令必须带 `--flutter-bundle /opt/denial/shell-bundle` 与 `LD_PRELOAD=/usr/lib/libdenialshim.so`（SOP §3）。
+- 关键坑：漏 `--flutter-bundle` 会静默降级诊断模式（蓝闪→永远黑屏+光标，唯一线索是 dd.log 的 `presentation="diagnostic-atlas"`）；不能硬杀 QEMU（guest ext4 数据块丢失、文件变全零），关机用 guest 内 `sync; poweroff`；同一 rootfs 镜像不能双开（写锁）。
+- 性能基线（旧调度器快照树）：LP_NUM_THREADS=1 锁屏约 t50s，默认多线程约 t90–150s（多线程 llvmpipe 反而慢约 3 倍）；根因是唤醒/派生永远本地放置、无负载均衡，上游 PR #1775（2026-09-08 调度器重建）已修复，repatch 后更新基线。
