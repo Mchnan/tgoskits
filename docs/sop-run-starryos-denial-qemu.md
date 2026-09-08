@@ -57,15 +57,23 @@ LD_PRELOAD=/usr/lib/libdenialshim.so /usr/bin/deniald --device /dev/dri/card0 --
 - `LD_PRELOAD=libdenialshim.so` 必须带上（Rust std 引用 `__res_init`，gcompat 不提供；
   缺了 deniald 直接 exit 127）。
 - `DENIA_NO_PREDECESSOR=1` 跳过"前任 KMS 状态"捕获（unikernel 冷启动没有已绑定的 plane）。
+- 启动日志里 `sys_prctl: unsupported option` 警告无害（glibc loader 的
+  PR_SET_VMA 类调用，内核未实现，不影响运行）。
 
 ## 5. 预期现象与耗时基线
 
-- 默认（多线程 llvmpipe，LP_NUM_THREADS=4）：**完整锁屏约 t90–150 秒**（时钟逐秒走动 +
-  Welcome back 解锁面板 + blur backdrop）。这是当前已知慢项（旧调度器放置策略 + 软渲染），
-  不是卡死，耐心等。
-- 加 `export LP_NUM_THREADS=1` 重启 deniald：首个完整桌面约 **t35 秒**，重帧约快 3 倍。
-- 日志检查点：`grep -a "event0\|event1" /tmp/dd.log` 应看到 libinput 添加键盘/鼠标设备；
-  PAM、Xwayland、Impeller 渲染 pass 应全 alive。
+- 启动后**先闪一下蓝屏、然后黑屏 + 可跟随的白色光标条**：蓝屏闪现是首次 KMS
+  present 把尚未绘制的帧缓冲扫出（一次性）；之后黑屏 + 光标随动 =
+  virtio-gpu 光标平面在更新，扫描输出链路是活的，只等 shell 首帧。
+- 默认（多线程 llvmpipe，LP_NUM_THREADS=4）：**完整锁屏约 t90–150 秒**
+  （时钟逐秒走动 + Welcome back 解锁面板 + blur backdrop）。这是当前已知慢项
+  （旧调度器放置策略 + 软渲染），不是卡死，耐心等。
+- 想快 3 倍：kill 掉 deniald 后加 `export LP_NUM_THREADS=1` 再启动，
+  首个完整桌面约 **t35 秒**。
+- 渲染进行中的证据：`top` 里 deniald 应占高 CPU（llvmpipe 软渲染吃满一个
+  vCPU）；`tail -20 /tmp/dd.log` 应看到 libinput 添加 event0/event1、PAM、
+  Xwayland、引擎+Dart shell+Impeller 渲染 pass 全 alive。
+- 超过约 3 分钟仍全黑才算异常，届时按第 7 节 screendump 取证并查 dd.log。
 
 ## 6. 键鼠操作
 
