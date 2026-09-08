@@ -184,6 +184,18 @@ impl PollSet {
         Self(OnceLock::new())
     }
 
+    /// Returns `true` if at least one waker is currently registered.
+    ///
+    /// Waiters appear while tasks are parked in a poll/wait loop on this set
+    /// and disappear when a matching [`Self::wake`](Self::wake) drains them,
+    /// so this reports whether any consumer is blocked on the associated
+    /// resource right now.
+    pub fn has_waiters(&self) -> bool {
+        self.0
+            .get()
+            .is_some_and(|inner| !inner.lock_irqsave().is_empty())
+    }
+
     /// Registers a waker for the requested I/O events.
     ///
     /// # Safety
