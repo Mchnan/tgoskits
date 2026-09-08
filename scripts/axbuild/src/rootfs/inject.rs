@@ -13,11 +13,13 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     thread,
 };
 
 use anyhow::{Context, bail, ensure};
+
+use crate::support::process::retry_text_file_busy;
 
 /// Reads a text file from a rootfs image with `debugfs`.
 ///
@@ -154,9 +156,18 @@ struct RootfsExtraction<'a> {
 
 impl RootfsExtraction<'_> {
     fn run(&self) -> anyhow::Result<()> {
+        self.run_with_output(Command::output)
+    }
+
+    fn run_with_output(
+        &self,
+        mut output: impl FnMut(&mut Command) -> io::Result<Output>,
+    ) -> anyhow::Result<()> {
         let mut command = self.command();
         let rendered_command = format!("{command:?}");
-        let output = command.output().with_context(|| {
+        // A freshly published helper can still have a transient writable
+        // reference. Retry only ETXTBSY before it starts, using the shared bound.
+        let output = retry_text_file_busy(|| output(&mut command)).with_context(|| {
             if let Some(fakeroot) = self.fakeroot_program {
                 format!(
                     "failed to spawn fakeroot `{}`; rootfs extraction without full host ownership \
@@ -906,6 +917,45 @@ mod tests {
         assert!(!current_process_requires_fakeroot());
     }
 
+    #[test]
+    fn extraction_retries_a_busy_executable_before_starting_debugfs() {
+        for use_fakeroot in [false, true] {
+            let root = executable_helper_tempdir();
+            let debugfs = root.path().join("debugfs");
+            let fakeroot = root.path().join("fakeroot");
+            let marker = root.path().join("debugfs-runs");
+            write_executable(
+                &debugfs,
+                "#!/bin/sh\nprintf 'ran\\n' >> \"$AXBUILD_TEST_EXTRACTION_MARKER\"\n",
+            );
+            write_executable(
+                &fakeroot,
+                "#!/bin/sh\ntest \"$1\" = -- || exit 91\nshift\nexec \"$@\"\n",
+            );
+            let mut attempts = 0;
+            RootfsExtraction {
+                rootfs_img: Path::new("rootfs.img"),
+                output_dir: root.path(),
+                debugfs_program: &debugfs,
+                fakeroot_program: use_fakeroot.then_some(fakeroot.as_path()),
+            }
+            .run_with_output(|command| {
+                attempts += 1;
+                if attempts == 1 {
+                    // Inject the observed spawn errno at the command boundary;
+                    // an actual writer/exec race depends on the host launcher.
+                    return Err(io::Error::from_raw_os_error(libc::ETXTBSY));
+                }
+                command
+                    .env("AXBUILD_TEST_EXTRACTION_MARKER", &marker)
+                    .output()
+            })
+            .unwrap();
+            assert_eq!(attempts, 2);
+            assert_eq!(fs::read_to_string(marker).unwrap(), "ran\n");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn missing_fakeroot_fails_before_debugfs_starts() {
@@ -970,9 +1020,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn debugfs_script_discards_normal_stdout_and_receives_all_commands() {
+        use std::fs::OpenOptions;
+
         let root = executable_helper_tempdir();
         let debugfs = root.path().join("debugfs");
         let received_commands = root.path().join("received-commands");
+        let _stale_writer = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&debugfs)
+            .unwrap();
         write_executable(
             &debugfs,
             &format!(
@@ -1013,7 +1071,18 @@ mod tests {
     fn write_executable(path: &Path, contents: &str) {
         use std::os::unix::fs::PermissionsExt;
 
-        fs::write(path, contents).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut staged_name = path
+            .file_name()
+            .expect("executable helper path must have a file name")
+            .to_os_string();
+        staged_name.push(".publishing");
+        let staged_path = path.with_file_name(staged_name);
+
+        fs::write(&staged_path, contents).unwrap();
+        fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o755)).unwrap();
+        // Publish a fully closed and executable inode. A stale writer may still
+        // hold the previous destination inode, but it cannot make the newly
+        // published helper fail exec with ETXTBSY.
+        fs::rename(staged_path, path).unwrap();
     }
 }

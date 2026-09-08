@@ -44,12 +44,16 @@ feature 声明只控制编译依赖与条件模块，实际对外能力还取决
 
 启用 `vsock` 后导出：
 
-- `init_vsock(vsock_devs)`。
+- `init_vsock(vsock_inputs, registrar, active_cpus)`。
 - `vsock` 模块。
 - `Socket::Vsock` 变体。
-- `VsockDevice` / `VsockDeviceList` 类型别名。
+- `VsockDevice` / `VsockDeviceInput` / `VsockDeviceList` 和 `VsockRuntimeError`。
 
-导出项列表说明 `vsock` feature 同时改变初始化 API 和 `Socket` 枚举，因此上层必须在相同条件下编译调用代码。smoltcp feature 属于 IP 协议核心的固定能力，和这个可选 transport 边界分开维护。
+`VsockDeviceInput` 必须包含已解析 `IrqId` 以及 driver 一次性转移的
+`VsockIrqEndpoints`。feature 只决定编译能力，不允许无 IRQ 或 periodic poll 模式。
+导出项列表说明 `vsock` feature 同时改变初始化 API 和 `Socket` 枚举，因此上层必须在
+相同条件下编译调用代码。smoltcp feature 属于 IP 协议核心的固定能力，和这个可选
+transport 边界分开维护。
 
 ### 1.2 smoltcp 能力
 
@@ -199,10 +203,10 @@ pub struct StaticIpConfig {
 
 未显式匹配 `InterfaceConfig` 的 Ethernet 设备会落入确定的默认策略，而不是被忽略或猜测静态地址。该策略由初始化配置逻辑统一生成，保证新增普通 NIC 至少能以 DHCP 角色进入接口 registry，并具有可预测的名字和 metric。
 
-- 名称为 `eth{order}`。
+- 名称为 `eth{order}`；Wi-Fi 能力设备例外，改用驱动注册名（例如 `wlan0`）。
 - `InterfaceId = order + 2`。
 - metric 为 `100`。
-- 默认启用 DHCP。
+- 未显式配置时，普通 Ethernet 默认启用 DHCP；带 startup link policy 的 Wi-Fi 设备使用该策略的静态地址（SoftAP 场景不启用 DHCP client）。
 - 无静态接口级 DNS。
 
 loopback：
@@ -259,6 +263,13 @@ dns_servers()
 `NetworkRuntimeBuilder` 完成 affinity domain、worker pin、DMA refill、IRQ
 registration/rearm 后，`init_network()` 才分配接口 ID 并发布 `Service`。启动后
 新增/删除物理 NIC、无 IRQ 设备和周期 poll 模式不在当前配置面中。
+
+vsock 遵循相同的 fail-closed 原则，但使用独立的单设备 runtime。平台必须提供一个
+typed IRQ binding；runtime 将其解析为 `IrqId`，把 fixed-affinity registrar、active CPU
+集合和完整 `VsockDeviceInput` 一次性交给 `init_vsock()`。当前只允许零个或恰好一个
+设备，worker 固定到网络 protocol owner CPU。poll interval、空闲退避和连接引用计数都
+不是可配置项，因为 event 只能由 hard IRQ 或明确的 task-side ring-space notification
+驱动。
 
 ### 6.1 TX queue discipline
 
@@ -317,15 +328,15 @@ StarryOS 的 `RTM_NEWADDR` / `RTM_DELADDR` 直接映射到这两个入口。
 `SOCKET_BUFFER_SIZE` 影响 Router 协议侧 packet buffer 以及多个 socket 后端的默认容量，是内存预算和吞吐之间的全局权衡。修改该常量时需要区分字节流缓冲区与 packet metadata 容量，不能仅根据 MTU 线性推断所有队列占用。
 
 ```rust
-pub const TCP_RX_BUF_LEN: usize = 64 * 1024;
-pub const TCP_TX_BUF_LEN: usize = 64 * 1024;
+pub const TCP_RX_BUF_LEN: usize = 256 * 1024;
+pub const TCP_TX_BUF_LEN: usize = 256 * 1024;
 pub const UDP_RX_BUF_LEN: usize = 64 * 1024;
 pub const UDP_TX_BUF_LEN: usize = 64 * 1024;
 pub const RAW_RX_BUF_LEN: usize = 64 * 1024;
 pub const RAW_TX_BUF_LEN: usize = 64 * 1024;
 ```
 
-这些是每个 socket 的默认协议缓冲区大小。
+这些是每个 socket 的默认协议缓冲区大小；TCP 每方向 256 KiB，其余协议为 64 KiB。
 
 ### 7.2 设备队列
 

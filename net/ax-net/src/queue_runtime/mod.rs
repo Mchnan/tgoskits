@@ -5,19 +5,20 @@
 //! tokens cross the SPSC boundary to the single protocol executor.
 
 mod executor;
+mod notify;
 mod spsc;
 mod state;
 #[cfg(test)]
 mod tests;
 
-use alloc::{boxed::Box, collections::VecDeque, format, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, format, string::String, sync::Arc, vec::Vec};
 use core::{
     num::NonZeroUsize,
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use ax_sync::SpinLock;
-use ax_task::WaitQueue;
+use ax_task::{sched::CpuSet, sync::WaitQueue};
 use irq_framework::IrqId;
 use rd_net::{
     NetError, NetHardIrqEndpoint, NetHardIrqResult, NetIrqSourceId, PreparedNetDevice,
@@ -25,7 +26,7 @@ use rd_net::{
 };
 
 pub use self::state::NetQueueStats;
-use self::{executor::*, spsc::*, state::PollGroupState};
+use self::{executor::*, notify::QueueNotification, spsc::*, state::PollGroupState};
 use crate::device::{EthernetFramePort, EthernetFramePortList};
 
 const QUEUE_BUDGET: usize = 64;
@@ -63,7 +64,7 @@ impl WifiCommandCompletion {
 
     fn complete(&self, result: Result<(), NetError>) {
         *self.result.lock_irqsave() = Some(result);
-        self.wait.notify_all(true);
+        self.wait.notify_all();
     }
 
     fn wait(&self) -> Result<(), NetError> {
@@ -97,7 +98,7 @@ impl WifiControlQueue {
     fn submit(
         &self,
         transaction: WifiTransaction,
-        notify: &ax_task::IrqNotify,
+        notify: &QueueNotification,
     ) -> Result<(), NetError> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(NetError::Stopped);
@@ -142,7 +143,7 @@ pub(crate) struct WifiRuntimeHandle {
     device_index: usize,
     owner_cpu: usize,
     queue: Arc<WifiControlQueue>,
-    notify: Arc<ax_task::IrqNotify>,
+    notify: Arc<QueueNotification>,
 }
 
 impl WifiRuntimeHandle {
@@ -166,6 +167,12 @@ pub enum NetworkRuntimeError {
     InvalidTopology,
     #[error("network queue executor could not be pinned to CPU {0}")]
     WorkerAffinity(usize),
+    #[error("network queue executor for CPU {cpu} could not be spawned: {source}")]
+    WorkerSpawn {
+        cpu: usize,
+        #[source]
+        source: ax_task::thread::TaskError,
+    },
     #[error("network queue initialization failed: {0}")]
     QueueInit(NetError),
     #[error("network IRQ registration failed: {0}")]
@@ -239,7 +246,7 @@ pub enum PinnedNetIrqError {
 }
 
 /// Move-only registration lease.  It is created disabled.
-pub trait PinnedNetIrqRegistration: Send + 'static {
+pub trait PinnedNetIrqRegistration: Send + Sync + 'static {
     fn owner_cpu(&self) -> usize;
     fn enable(&self) -> Result<(), PinnedNetIrqError>;
     fn disable_and_synchronize(&self) -> Result<(), PinnedNetIrqError>;
@@ -314,7 +321,7 @@ impl Drop for NetworkQueueRuntime {
             core::mem::take(&mut self._controls),
             core::mem::take(&mut self.wifi_handles),
         );
-        stop_executors(&self.executors, irq_synchronized);
+        stop_executors(&mut self.executors, irq_synchronized);
         release_runtime_side_resources(runtime_side_resources, irq_synchronized);
     }
 }
@@ -323,26 +330,32 @@ impl Drop for NetworkQueueRuntime {
 pub struct NetworkRuntimeBuilder<'a> {
     devices: Vec<NetworkDeviceInput>,
     registrar: &'a dyn PinnedNetIrqRegistrar,
-    online_cpus: usize,
+    active_cpus: CpuSet,
 }
 
 impl<'a> NetworkRuntimeBuilder<'a> {
     pub fn new(
         devices: Vec<NetworkDeviceInput>,
         registrar: &'a dyn PinnedNetIrqRegistrar,
-        online_cpus: usize,
+        active_cpus: CpuSet,
     ) -> Self {
         Self {
             devices,
             registrar,
-            online_cpus,
+            active_cpus,
         }
     }
 
     pub fn build(
         self,
     ) -> Result<(NetworkQueueRuntime, EthernetFramePortList), NetworkRuntimeError> {
-        if self.online_cpus == 0 {
+        let topology_len = self.active_cpus.topology_len();
+        let active_cpus = self
+            .active_cpus
+            .iter()
+            .map(ax_task::sched::CpuId::as_usize)
+            .collect::<Vec<_>>();
+        if topology_len == 0 || active_cpus.is_empty() {
             // No owner context exists in which a driver can prove DMA has
             // stopped, so prepared device backing must not be dropped.
             release_or_quarantine(self.devices, false);
@@ -359,15 +372,15 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                 return Err(error);
             }
         };
-        let group_owners = assign_affinity_domains(&group_irq_sets, self.online_cpus);
-        let mut groups_by_cpu = (0..self.online_cpus)
+        let group_owners = assign_affinity_domains(&group_irq_sets, &active_cpus);
+        let mut groups_by_cpu = (0..topology_len)
             .map(|_| Vec::new())
             .collect::<Vec<Vec<QueueGroupExecutor>>>();
-        let mut wifi_by_cpu = (0..self.online_cpus)
+        let mut wifi_by_cpu = (0..topology_len)
             .map(|_| Vec::new())
             .collect::<Vec<Vec<WifiExecutorSlot>>>();
-        let cpu_notifies = (0..self.online_cpus)
-            .map(|_| Arc::new(ax_task::IrqNotify::new()))
+        let cpu_notifies = (0..topology_len)
+            .map(|_| Arc::new(QueueNotification::new()))
             .collect::<Vec<_>>();
         let mut endpoints = Vec::new();
         let mut ports = Vec::with_capacity(self.devices.len());
@@ -387,18 +400,31 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                 poll_groups,
             } = input.device;
             let mut protocol_groups = Vec::with_capacity(poll_groups.len());
+            let mut checksum_capabilities = None;
             let mut wifi_target = None;
             for mut group in poll_groups {
+                checksum_capabilities = Some(checksum_capabilities.map_or(
+                    group.tx.checksum_capabilities(),
+                    |current: rd_net::TxChecksumCapabilities| {
+                        current.intersection(group.tx.checksum_capabilities())
+                    },
+                ));
                 let owner_cpu = group_owners[flat_group];
                 let owner_group_index = groups_by_cpu[owner_cpu].len();
                 let shared = Arc::new(PollGroupState::new(
                     owner_cpu,
                     Arc::clone(&cpu_notifies[owner_cpu]),
                 ));
-                let (rx_ready_tx, rx_ready_rx) = spsc_ring(group.rx.capacity());
-                let (rx_recycle_tx, rx_recycle_rx) = spsc_ring(group.rx.capacity());
+                let rx_capacity = group.rx.capacity();
+                let (rx_ready_tx, rx_ready_rx) = spsc_ring(rx_capacity);
+                let (rx_recycle_tx, rx_recycle_rx) = spsc_ring(rx_capacity);
                 let (tx_ready_tx, tx_ready_rx) = spsc_ring(group.tx.capacity());
                 let (tx_free_tx, tx_free_rx) = spsc_ring(group.tx.capacity());
+                let rx_recycler = Arc::new(RxRecycler::new(
+                    rx_recycle_tx,
+                    Arc::clone(&shared),
+                    rx_capacity,
+                ));
 
                 for endpoint in group.irq_endpoints.drain(..) {
                     let irq = resolve_endpoint_irq(&input.irq_sources, endpoint.source_id())
@@ -419,10 +445,9 @@ impl<'a> NetworkRuntimeBuilder<'a> {
 
                 protocol_groups.push(ProtocolGroupPort {
                     rx_ready: rx_ready_rx,
-                    rx_recycle: rx_recycle_tx,
+                    rx_recycler: Arc::clone(&rx_recycler),
                     tx_ready: tx_ready_tx,
                     tx_free: tx_free_rx,
-                    pending_recycle: Vec::with_capacity(group.rx.capacity()),
                     tx_spares: Vec::with_capacity(group.tx.capacity()),
                     shared: Arc::clone(&shared),
                 });
@@ -430,10 +455,13 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                     group,
                     rx_ready: rx_ready_tx,
                     rx_recycle: rx_recycle_rx,
+                    rx_recycler,
+                    rx_spares: Vec::with_capacity(rx_capacity.max(QUEUE_BUDGET)),
+                    rx_extra_buffers: 0,
                     tx_ready: tx_ready_rx,
                     tx_free: tx_free_tx,
                     pending_rx: None,
-                    pending_rx_recycle: None,
+                    pending_rx_refill: VecDeque::with_capacity(rx_capacity),
                     pending_tx: None,
                     pending_tx_free: None,
                     retry_at: None,
@@ -475,6 +503,8 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                 pending_tx: VecDeque::new(),
                 next_rx: 0,
                 next_tx: 0,
+                checksum_capabilities: checksum_capabilities
+                    .unwrap_or(rd_net::TxChecksumCapabilities::NONE),
             }) as Box<dyn EthernetFramePort>);
         }
 
@@ -491,21 +521,36 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                 startup_error: SpinLock::new(None),
                 notify: Arc::clone(&cpu_notifies[owner_cpu]),
             });
+            let mut affinity = CpuSet::empty(topology_len);
+            if !affinity.insert(ax_task::sched::CpuId::new(owner_cpu as u32)) {
+                stop_executors(&mut executors, true);
+                return Err(NetworkRuntimeError::InvalidTopology);
+            }
             let task_control = Arc::clone(&control);
-            let task = ax_task::spawn_with_name(
-                move || queue_executor_main(groups, wifi, task_control),
-                format!("net-queue-cpu{owner_cpu}"),
-            );
+            let task =
+                match ax_task::thread::ThreadBuilder::new(format!("net-queue-cpu{owner_cpu}"))
+                    .affinity(affinity)
+                    .spawn(move || queue_executor_main(groups, wifi, task_control))
+                {
+                    Ok(task) => task,
+                    Err(source) => {
+                        stop_executors(&mut executors, true);
+                        return Err(NetworkRuntimeError::WorkerSpawn {
+                            cpu: owner_cpu,
+                            source,
+                        });
+                    }
+                };
             executors.push(ExecutorLease { control, task });
         }
-        for executor in &executors {
+        let failed_owner = executors.iter().find_map(|executor| {
             wait_status(&executor.control.affinity_status);
-            if executor.control.affinity_status.load(Ordering::Acquire) != STATUS_READY {
-                stop_executors(&executors, true);
-                return Err(NetworkRuntimeError::WorkerAffinity(
-                    executor.control.owner_cpu,
-                ));
-            }
+            (executor.control.affinity_status.load(Ordering::Acquire) != STATUS_READY)
+                .then_some(executor.control.owner_cpu)
+        });
+        if let Some(owner_cpu) = failed_owner {
+            stop_executors(&mut executors, true);
+            return Err(NetworkRuntimeError::WorkerAffinity(owner_cpu));
         }
 
         let mut registrations = Vec::new();
@@ -537,7 +582,7 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                     Ok(registration) => {
                         registrations.push(registration);
                         let irq_synchronized = release_registrations(registrations);
-                        stop_executors(&executors, irq_synchronized);
+                        stop_executors(&mut executors, irq_synchronized);
                         release_runtime_side_resources(
                             (
                                 controls,
@@ -555,7 +600,7 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                     }
                     Err(error) => {
                         let irq_synchronized = release_registrations(registrations);
-                        stop_executors(&executors, irq_synchronized);
+                        stop_executors(&mut executors, irq_synchronized);
                         release_runtime_side_resources(
                             (
                                 controls,
@@ -579,7 +624,7 @@ impl<'a> NetworkRuntimeBuilder<'a> {
         for registration in &registrations {
             if let Err(error) = registration.enable() {
                 let irq_synchronized = release_registrations(registrations);
-                stop_executors(&executors, irq_synchronized);
+                stop_executors(&mut executors, irq_synchronized);
                 release_runtime_side_resources(
                     (
                         controls,
@@ -613,7 +658,7 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                     .take()
                     .unwrap_or(NetError::InvalidParts);
                 let irq_synchronized = release_registrations(registrations);
-                stop_executors(&executors, irq_synchronized);
+                stop_executors(&mut executors, irq_synchronized);
                 release_runtime_side_resources(
                     (
                         controls,
@@ -629,7 +674,7 @@ impl<'a> NetworkRuntimeBuilder<'a> {
                 return Err(NetworkRuntimeError::QueueInit(error));
             }
         }
-        let protocol_owner_cpu = select_protocol_owner(&group_owners, self.online_cpus);
+        let protocol_owner_cpu = select_protocol_owner(&group_owners, &active_cpus);
         let mut runtime = NetworkQueueRuntime {
             registrations,
             executors,
@@ -720,7 +765,7 @@ fn resolve_endpoint_irq(
     Ok(irq)
 }
 
-fn assign_affinity_domains(irq_sets: &[Vec<IrqId>], cpu_count: usize) -> Vec<usize> {
+fn assign_affinity_domains(irq_sets: &[Vec<IrqId>], active_cpus: &[usize]) -> Vec<usize> {
     let mut parents = (0..irq_sets.len()).collect::<Vec<_>>();
     for left in 0..irq_sets.len() {
         for right in (left + 1)..irq_sets.len() {
@@ -743,7 +788,7 @@ fn assign_affinity_domains(irq_sets: &[Vec<IrqId>], cpu_count: usize) -> Vec<usi
                 roots.len() - 1
             }
         };
-        owners.push(domain_index % cpu_count);
+        owners.push(active_cpus[domain_index % active_cpus.len()]);
     }
     owners
 }
@@ -770,21 +815,22 @@ fn union(parents: &mut [usize], left: usize, right: usize) {
     }
 }
 
-fn select_protocol_owner(group_owners: &[usize], cpu_count: usize) -> usize {
-    let mut load = vec![0usize; cpu_count];
-    for &owner in group_owners {
-        load[owner] += 1;
-    }
-    load.iter()
-        .enumerate()
-        .min_by_key(|(cpu, groups)| (**groups, *cpu))
-        .map(|(cpu, _)| cpu)
+fn select_protocol_owner(group_owners: &[usize], active_cpus: &[usize]) -> usize {
+    active_cpus
+        .iter()
+        .copied()
+        .min_by_key(|cpu| {
+            (
+                group_owners.iter().filter(|owner| **owner == *cpu).count(),
+                *cpu,
+            )
+        })
         .unwrap_or(0)
 }
 
 fn wait_status(status: &AtomicU8) {
     while status.load(Ordering::Acquire) == STATUS_PENDING {
-        ax_task::yield_now();
+        crate::yield_network_thread();
     }
 }
 
@@ -816,11 +862,16 @@ fn release_runtime_side_resources<T>(resource: T, irq_synchronized: bool) {
     release_or_quarantine(resource, irq_synchronized);
 }
 
-fn stop_executors(executors: &[ExecutorLease], irq_synchronized: bool) {
+fn stop_executors(executors: &mut Vec<ExecutorLease>, irq_synchronized: bool) {
     for executor in executors.iter().rev() {
         executor.stop(irq_synchronized);
     }
-    for executor in executors.iter().rev() {
-        executor.task.join();
+    while let Some(executor) = executors.pop() {
+        if let Err(error) = executor.task.join() {
+            log::error!(
+                "failed to join network queue executor for CPU {}: {error}",
+                executor.control.owner_cpu
+            );
+        }
     }
 }

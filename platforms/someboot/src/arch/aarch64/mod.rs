@@ -170,8 +170,12 @@ impl ArchTrait for Arch {
         MPIDR_EL1.get() as usize & MASK
     }
 
-    fn kernel_space() -> core::ops::Range<usize> {
-        PAGE_OFFSET..usize::MAX
+    fn virtual_address_space()
+    -> Result<crate::mem::VirtualAddressSpaceLayout, crate::mem::VirtualAddressSpaceError> {
+        crate::mem::VirtualAddressSpaceLayout::try_new(
+            crate::mem::configured_user_space(1usize << 48),
+            PAGE_OFFSET..usize::MAX,
+        )
     }
 
     fn is_mmu_enabled() -> bool {
@@ -239,6 +243,7 @@ impl SystimerArch for Arch {
     }
 
     fn systimer_enable() {
+        elx::systick_stop_oneshot();
         elx::systick_enable();
     }
 
@@ -254,8 +259,25 @@ impl SystimerArch for Arch {
         elx::systick_irq_is_enabled()
     }
 
-    fn systimer_set_interval(ticks: usize) {
-        elx::systick_set_interval(ticks);
+    fn systimer_set_deadline(deadline_ticks: u64) {
+        elx::systick_set_deadline(deadline_ticks);
+    }
+
+    fn systimer_requires_irq_quiesce() -> bool {
+        true
+    }
+
+    fn systimer_cancel_oneshot() {
+        elx::systick_stop_oneshot();
+    }
+
+    fn systimer_resume_oneshot(deadline_ticks: u64) {
+        // The Arm timer is level-triggered. Replace the expired compare value
+        // before unmasking it so controller EOI cannot expose a stale level.
+        timer::resume_masked_level_oneshot(
+            || elx::systick_set_deadline(deadline_ticks),
+            elx::systick_irq_enable,
+        );
     }
 }
 

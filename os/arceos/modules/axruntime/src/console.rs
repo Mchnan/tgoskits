@@ -9,7 +9,7 @@ use core::fmt::{self, Write};
 
 use ax_lazyinit::OnceLock;
 use ax_sync::Mutex;
-use axpoll::PollSet;
+use axpoll_set::PollSet;
 
 pub use crate::serial::RxItem;
 use crate::{
@@ -17,7 +17,7 @@ use crate::{
     raw_console::RawConsoleInput,
     serial,
     structured_log::{RuntimeLogContext, write_record},
-    sync::SpinLock,
+    task::sync::SpinLock,
 };
 
 static ACTIVATION: OnceLock<ConsoleActivation> = OnceLock::new();
