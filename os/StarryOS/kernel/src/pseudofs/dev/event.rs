@@ -287,14 +287,17 @@ impl EventDev {
             move || {
                 let mut empty_count = 0u32;
                 loop {
-                    let polling_requested = dev.polling_requested.load(Ordering::Acquire);
-                    let now = monotonic_time_nanos();
-                    let irq = dev.last_irq_event.load(Ordering::Acquire);
-
+                    // While a reader is blocked on this device its waker stays
+                    // registered, so the fallback must keep draining even
+                    // after the demand-driven window winds down: events that
+                    // arrive later would otherwise never reach the waiter and
+                    // it would sleep forever.
+                    let waiters = dev.waiters.has_waiters();
                     if !input_polling_fallback_should_drain(
-                        polling_requested,
-                        now,
-                        irq,
+                        dev.polling_requested.load(Ordering::Acquire),
+                        waiters,
+                        monotonic_time_nanos(),
+                        dev.last_irq_event.load(Ordering::Acquire),
                         IRQ_ALIVE_NS,
                     ) {
                         empty_count = 0;
@@ -308,6 +311,11 @@ impl EventDev {
                     if ready {
                         empty_count = 0;
                         unsafe { dev.waiters.wake(IoEvents::IN) };
+                        ax_task::sleep(Duration::from_millis(10));
+                    } else if waiters {
+                        // A waiter is parked on an empty queue: keep the drain
+                        // cadence responsive so newly arriving input is
+                        // delivered promptly.
                         ax_task::sleep(Duration::from_millis(10));
                     } else {
                         empty_count = empty_count.saturating_add(1);
