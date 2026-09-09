@@ -1284,6 +1284,69 @@ deniald: cargo build --release --features flutter   # aarch64 glibc 一次通过
               </Stack>
             </CardBody>
           </Card>
+
+          <Card>
+            <CardHeader>
+              <H3>9.12 上游 repatch 落地：调度器/UserAccess 重写吸收 + PI safe-point 恐慌根修（2026-09-09）</H3>
+            </CardHeader>
+            <CardBody>
+              <Stack gap={8}>
+                <Text>
+                  合并 <Code>origin/dev</Code> 终态（26 个提交，merge
+                  <Code>c4a00deee</Code> + 接缝修复
+                  <Code>fa91fc</Code>）：#1775+#2313 把
+                  <Code>axtask</Code> 重组为
+                  <Code>components/ax-task</Code>（cpu/remote 远程调度器、PI
+                  互斥体、调度 safe-point 校验），<Code>axpoll</Code> 重写为类型化就绪能力、
+                  唤醒注册表移入新 crate <Code>axpoll-set</Code>，evdev 换成专用
+                  <Code>evdev-irq-service</Code> 线程（register-before-park）——9.11
+                  诊断的 CPU0 堆叠与唤醒/派生本地放置问题随 #1775 根治；#2261+#2302
+                  的 UserAccess/VMA 重写把 AT 探测快路径设为默认（无需再开
+                  user-access-fastpath），9.11 定位的 aspace 锁饥饿根因随之消除。
+                  本地保留：#2295（display/rtc board）、#2284 IN_FENCE_FD、dma-buf
+                  lseek、KMS 活跃状态回读（<Code>handle_get_plane</Code> 改 Card0
+                  方法适配 #2313 的 UserTaskRef 签名）；#2296 兜底轮询随旧架构作废，
+                  键鼠由上游 IRQ 路径负责。冲突仅 6 文件；loongarch clippy 因本机无
+                  musl 交叉工具链失败，属环境限制。
+                </Text>
+                <Text>
+                  repatch 后首次拉起 deniald 即触发
+                  <Code>validate PI mutex blocking context failed</Code>恐慌（上游
+                  open bug #1709 同类）。排障三步：① 临时把
+                  <Code>panic_shutdown</Code> 改 wfi 挂死，gdbstub 事后抓全 vCPU
+                  栈（release 无帧指针，内建 backtrace 输出 BT_ERROR，改用扫 SP 起
+                  2KB 内核态字 + 宿主 nm 符号化）；② 在
+                  <Code>validate_schedule_context</Code> 加临时 GUARD-DEBUG 读数：
+                  <Code>irq=0、scheduler_baton=Finished、hard_irq=false</Code>，唯
+                  <Code>arch_preempt_depth=1</Code>；③ 干净栈扫描定锤责任链：
+                  <Code>sys_connect → UnixSocket::start_connect</Code>
+                  持 remote_addr SpinLock（ax-task SpinLock 语义=禁抢占 guard）横跨
+                  <Code>with_slot → UnixNamespace::resolve</Code> VFS 路径解析，ext4
+                  <Code>Inode::lookup_locked</Code> 的全局 SleepMutex 被并发 openat
+                  线程争用，阻塞校验按设计拒绝。上游 stream.rs 注释本就声明
+                  namespace/bind-slot 锁应在 publish 后释放，start_connect/bind
+                  违背了它。根修 73293a874：锁内仅占位地址，namespace
+                  操作移出 SpinLock 临界区、失败回滚；红→绿 = 恐慌栈复现 →
+                  修复后零恐慌。
+                </Text>
+                <Text>
+                  新基线（LP_NUM_THREADS=1，待多次复核）：锁屏出画 &lt;35s（旧树
+                  t50s）；锁屏右上角 CPU 1%（旧树 top 99% sys 记账幻象消失）；空闲
+                  采样 248 样本 88.3% 为 WFI idle，零
+                  <Code>can_access_range</Code>/
+                  <Code>prepare_user_memory</Code> 热点、零锁自旋。X11 目录现象待查：
+                  <Code>/tmp/.X11-unix</Code> 偶发在 mkdir 后、deniald 启动前消失
+                  （smithay 只删文件不删目录），重跑 mkdir 再启动即可绕过。诊断工具坑：
+                  QEMU 接 gdbstub 后 vCPU WFI 推停机帧，断点监听须「停机→查 PC→非目标
+                  则放行」循环，轮询停机流会饿死 guest 串口——正确姿势是「panic 后挂死
+                  再附加」。ax-net clippy 在 macOS 宿主因 cpu-local 的
+                  <Code>.percpu.*</Code> section 名失败，属环境限制（上游 CI 在
+                  Linux）。待办：键鼠 cocoa 实测（#2296 作废后由上游 IRQ 路径负责）、
+                  恐慌修复回报上游 #1709、多次复核新基线。
+                </Text>
+              </Stack>
+            </CardBody>
+          </Card>
     </Stack>
   );
 }
