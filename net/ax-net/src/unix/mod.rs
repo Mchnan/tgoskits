@@ -253,30 +253,49 @@ impl Configurable for UnixSocket {
 impl SocketOps for UnixSocket {
     fn bind(&self, local_addr: SocketAddrEx) -> NetResult {
         let local_addr = local_addr.into_unix()?;
-        let mut guard = self.local_addr.lock();
-        if matches!(&*guard, UnixSocketAddr::Unnamed) {
-            with_slot_or_insert(&local_addr, |slot| self.transport.bind(slot, &local_addr))?;
-            *guard = local_addr;
-            self.owns_bind.store(true, Ordering::Release);
-        } else {
-            return Err(NetError::InvalidInput);
+        {
+            let mut guard = self.local_addr.lock();
+            if !matches!(&*guard, UnixSocketAddr::Unnamed) {
+                return Err(NetError::InvalidInput);
+            }
+            // Reserve the address inside the guard, then run the namespace
+            // work outside it: a path bind creates a filesystem node and may
+            // block on contended filesystem locks, which is illegal inside
+            // the preemption exclusion held by this module's SpinLock guards.
+            *guard = local_addr.clone();
         }
+        if let Err(error) =
+            with_slot_or_insert(&local_addr, |slot| self.transport.bind(slot, &local_addr))
+        {
+            *self.local_addr.lock() = UnixSocketAddr::Unnamed;
+            return Err(error);
+        }
+        self.owns_bind.store(true, Ordering::Release);
         Ok(())
     }
 
     fn start_connect(&self, remote_addr: SocketAddrEx) -> NetResult<ConnectStatus> {
         let remote_addr = remote_addr.into_unix()?;
         let local_addr = self.local_addr.lock().clone();
-        let accept_poll = {
+        {
             let mut guard = self.remote_addr.lock();
             if guard.is_some() {
                 return Err(NetError::InvalidInput);
             }
-            let accept_poll = with_slot(&remote_addr, |slot| {
-                self.transport.connect(slot, &local_addr)
-            })?;
-            *guard = Some(remote_addr);
-            accept_poll
+            // Reserve the address inside the guard for the same reason as in
+            // `bind`: a path connect resolves a filesystem node and may block
+            // on contended filesystem locks, so it must not run inside the
+            // preemption exclusion held by the SpinLock guard.
+            *guard = Some(remote_addr.clone());
+        }
+        let accept_poll = match with_slot(&remote_addr, |slot| {
+            self.transport.connect(slot, &local_addr)
+        }) {
+            Ok(accept_poll) => accept_poll,
+            Err(error) => {
+                *self.remote_addr.lock() = None;
+                return Err(error);
+            }
         };
         self.transport.finish_connect(accept_poll);
         Ok(ConnectStatus::Connected)
