@@ -221,7 +221,11 @@ impl RootfsExtraction<'_> {
 
         let listing = String::from_utf8_lossy(&output.stdout);
         let mut entry_names = Vec::new();
-        for line in listing.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        for line in listing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
             if let Some(name) = top_level_entry_name(line)? {
                 entry_names.push(name);
             }
@@ -859,9 +863,8 @@ mod tests {
             let marker = root.path().join("debugfs-runs");
             write_executable(
                 &debugfs,
-                "#!/bin/sh\ncase \"${2:-}\" in\n*ls*-p*) printf '%s\\n' \
-                 '/2/100755/0/0/debugfs//' ;;\n*) printf 'ran\\n' >> \
-                 \"$AXBUILD_TEST_EXTRACTION_MARKER\" ;;\nesac\n",
+                "#!/bin/sh\ncase \"${2:-}\" in\n*ls*-p*) printf '%s\\n' '/2/100755/0/0/debugfs//' \
+                 ;;\n*) printf 'ran\\n' >> \"$AXBUILD_TEST_EXTRACTION_MARKER\" ;;\nesac\n",
             );
             write_executable(
                 &fakeroot,
@@ -993,7 +996,11 @@ mod tests {
             Some(".ash_history")
         );
         assert!(top_level_entry_name("/2/040755/0/0/.//").unwrap().is_none());
-        assert!(top_level_entry_name("/2/040755/0/0/..//").unwrap().is_none());
+        assert!(
+            top_level_entry_name("/2/040755/0/0/..//")
+                .unwrap()
+                .is_none()
+        );
         assert!(top_level_entry_name("/2/040755").is_err());
     }
 
