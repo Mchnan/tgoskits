@@ -1,7 +1,7 @@
 # SOP：编译并运行 StarryOS denial 桌面 QEMU 产物（macOS arm64 宿主）
 
 状态：2026-09-09 端到端实测通过（LP_NUM_THREADS=1 下锁屏约 t50s 出画）。
-适用：本仓库快照分支 `fix/starry-arm64-desktop-snapshot-20260908` 的产物。
+适用：本仓库快照分支 `fix/card0-vblank-clock` 的产物。
 环境：macOS arm64（HVF）+ Homebrew QEMU ≥ 11。
 
 ## 0. 最重要的三条（血泪）

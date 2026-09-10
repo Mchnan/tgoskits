@@ -299,7 +299,7 @@ export default function DenialFpsRootCause(): JSX.Element {
       <Stack gap={4}>
         <H1>StarryOS denial 桌面帧率根因：0.5Hz vsync 门控</H1>
         <Text>
-          2026-09-10 · M4（HVF）+ QEMU 11.0.3 · 分支 fix/starry-arm64-desktop-snapshot-20260908 ·
+          2026-09-10 · M4（HVF）+ QEMU 11.0.3 · 分支 fix/card0-vblank-clock ·
           LP_NUM_THREADS=1 · 结论同日沉淀至 AGENTS.md 第 3 节
         </Text>
       </Stack>
