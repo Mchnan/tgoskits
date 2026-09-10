@@ -69,7 +69,7 @@ AArch64 宿主替换中，把不可变固件计划中的每个 GICR 区域和步
 
 - Starry 使用原裸机目标，以 `build-std=core,alloc` 构建 `no_std`、`no_main` 位置无关可执行文件；对称多处理是构建能力，运行时处理器上限另行配置。最终文件必须为 `ET_DYN`，且没有 `PT_TLS`、`.tdata` 或 `.tbss`。
 - Axvisor 保持标准库与 musl 位置无关可执行文件，并从 axruntime、axhal、`cpu-local`、axvm、axplat-dyn、somehal 到 someboot 显式选择完整线程局部存储链。AxVM 在每次客户机转换前后保存宿主内核线程局部存储值，并验证精确处理器区域。
-- ArceOS 默认保留线程局部存储。用户空间构建使用同一体系结构寄存器保存 Linux 当前上下文，因此 `uspace + tls` 是配置错误。
+- ArceOS 默认保留线程局部存储。用户空间构建使用同一体系结构寄存器保存 Linux 当前上下文，因此 `uspace + tls` 按 `uspace` 处理，`build.rs` 不输出 `kernel_tls` cfg，链接脚本也不启用内核 TLS。
 - someboot 分别生成线程局部存储与无线程局部存储链接布局。可重定位直接映像应在多个加载偏移检查最终文件，只接受体系结构支持的相对重定位类型。
 
 ## AArch64 Axvisor 异常级 2 检查
@@ -156,6 +156,7 @@ cargo xtask starry board \
 
 ## LoongArch 经验
 
+- `cargo xtask starry perf --arch loongarch64` 必须消费用例的 `uefi` 和 `to_bin` 契约。当前动态内核是 UEFI PE 镜像，不能绕过 OVMF 直接传给 `-kernel`。`perf::qemu::prepare_boot_args` 使用共享 OVMF 缓存、独立 VARS 副本及 `EFI/BOOT/BOOTLOONGARCH64.EFI`；未进入内核且没有样本时先检查这条启动链路，再检查插件 ABI。x86_64 复用同一 ESP 准备逻辑，使用 `BOOTX64.EFI`。
 - LS2K1000 在块硬件上下文激活后重复输出 `failed to lock LS2K1000 LIOINTC when claiming LIOINTC IRQ`，表示硬中断与控制器锁次序反转，不是无害伪中断。按 AArch64 GIC 模式拆分：`rdif_intc` 控制器和配置寄存器归任务，独立 LIOINTC 处理器接口只含中断状态、域、父线路和原子启用状态。硬中断查找或锁住控制器会在被中断任务释放设备保护前因电平中断不断重入。
 - U-Boot FIT 启动中，生产与交接契约保持一致：使用规范体系结构名 `loongarch`；U-Boot 以符合设备树规范的 8 字节对齐地址传递设备树；FIT 提供的设备树通过 UHI 约定传给 someboot，即 `a0 = -2`、`a1 = fdt`。检查 `legacy_hdr_os` 的厂商 `CONFIG_LOONGSON_BOOT_FIXUP` 不能作用于 FIT 映像。
 - 地址转换缓存填充入口和普通异常入口使用不同寄存器，可能需要不同地址形式。需要物理填充向量时，不能复用高地址虚拟符号。

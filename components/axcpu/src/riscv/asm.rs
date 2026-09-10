@@ -6,7 +6,7 @@ use riscv::{
     register::{satp, sstatus, stvec},
 };
 
-#[cfg(feature = "tls")]
+#[cfg(kernel_tls)]
 use crate::KernelTlsBase;
 #[cfg(feature = "uspace")]
 use crate::{InstalledAddressSpace, InstalledAddressSpaceMode};
@@ -65,6 +65,7 @@ fn flush_tlb_asid(asid: u16) {
 /// must remain alive for the complete activation lease.
 #[cfg(feature = "uspace")]
 pub unsafe fn install_user_address_space(address_space: InstalledAddressSpace) {
+    address_space.validate_architecture_support();
     // The allocator issues `Tagged` only after the BSP SATP write/readback
     // probe passes Linux's ASID-count threshold. RISC-V requires secondary
     // harts to expose a compatible SATP format.
@@ -111,6 +112,18 @@ pub fn irqs_enabled() -> bool {
 #[inline]
 pub fn wait_for_irqs() {
     riscv::asm::wfi()
+}
+
+/// Waits for an interrupt after the caller masks local IRQ delivery.
+///
+/// RISC-V `WFI` may resume for a locally enabled pending interrupt regardless
+/// of global `SIE`. Keeping `SIE` clear through `WFI` closes the scheduler
+/// wake-loss window. The function returns with local IRQs enabled.
+#[inline]
+pub fn wait_for_irqs_disabled() {
+    debug_assert!(!irqs_enabled());
+    riscv::asm::wfi();
+    enable_irqs();
 }
 
 /// Halt the current CPU.
@@ -230,7 +243,7 @@ pub unsafe fn write_trap_vector_base(stvec: usize) {
 /// The value is task-owned kernel TLS. CPU-local state is anchored by
 /// `sscratch` and must not be inferred from this register.
 #[inline]
-#[cfg(feature = "tls")]
+#[cfg(kernel_tls)]
 pub fn read_thread_pointer() -> KernelTlsBase {
     let tp;
     unsafe { core::arch::asm!("mv {}, tp", out(reg) tp) };
@@ -247,7 +260,7 @@ pub fn read_thread_pointer() -> KernelTlsBase {
 /// The caller must ensure that `tls_base` belongs to the execution context
 /// currently being installed and remains valid while that context can run.
 #[inline]
-#[cfg(feature = "tls")]
+#[cfg(kernel_tls)]
 pub unsafe fn write_thread_pointer(tls_base: KernelTlsBase) {
     unsafe { core::arch::asm!("mv tp, {}", in(reg) tls_base.as_usize()) }
 }

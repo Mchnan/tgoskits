@@ -7,15 +7,21 @@ keywords = ["os"]
 license = "MPL-2.0"
 name = "someboot"
 repository.workspace = true
-version = "0.4.2"
+version = "0.5.1"
 
 [features]
 efi = []
 hv = []
 mmu = []
 thead-mae = []
+# Request kernel TLS; `uspace` takes precedence and disables kernel TLS.
 tls = []
+# Enable userspace support without kernel TLS, including when `tls` is enabled.
+# User-space TLS remains available through the userspace context APIs.
 uspace = ["mmu"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(axtest_coverage)'] }
 
 [dependencies]
 acpi = "6.0.1"

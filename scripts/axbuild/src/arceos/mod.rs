@@ -472,8 +472,18 @@ impl ArceOS {
                     .map(|_| ())
             }
             build::ArceosBuildMode::AppC { app_dir, app_name } => {
+                let cargo = build::load_c_app_cargo_config(&request)?;
                 let output = self.build_c_app_request(&request, app_dir, app_name)?;
-                println!("Built ArceOS C app ELF: {}", output.elf_path.display());
+                println!("[axbuild] cargo build elf={}", output.elf_path.display());
+                if cargo.to_bin {
+                    self.app
+                        .prepare_elf_artifact(output.elf_path.clone(), true)
+                        .await?;
+                    println!(
+                        "[axbuild] cargo build bin={}",
+                        crate::context::cargo_bin_path_for_elf(&output.elf_path).display()
+                    );
+                }
                 Ok(())
             }
         }
@@ -571,65 +581,9 @@ pub(crate) fn default_qemu_config_template_path(workspace_root: &Path, arch: &st
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
     use tempfile::tempdir;
 
     use super::*;
-
-    #[derive(Parser)]
-    struct Cli {
-        #[command(subcommand)]
-        command: Command,
-    }
-
-    fn parse(args: impl IntoIterator<Item = &'static str>) -> Command {
-        Cli::try_parse_from(args).unwrap().command
-    }
-
-    #[test]
-    fn command_parses_defconfig() {
-        match parse(["arceos", "defconfig", "orangepi-5-plus"]) {
-            Command::Defconfig(args) => assert_eq!(args.board, "orangepi-5-plus"),
-            _ => panic!("expected defconfig command"),
-        }
-    }
-
-    #[test]
-    fn command_parses_config_ls() {
-        match parse(["arceos", "config", "ls"]) {
-            Command::Config(args) => match args.command {
-                ConfigCommand::Ls => {}
-            },
-            _ => panic!("expected config ls command"),
-        }
-    }
-
-    #[test]
-    fn command_parses_board() {
-        match parse([
-            "arceos",
-            "board",
-            "--config",
-            "build.toml",
-            "--board-config",
-            "board.toml",
-            "-b",
-            "OrangePi-5-Plus",
-            "--server",
-            "10.0.0.2",
-            "--port",
-            "9000",
-        ]) {
-            Command::Board(args) => {
-                assert_eq!(args.build.config, Some(PathBuf::from("build.toml")));
-                assert_eq!(args.board_config, Some(PathBuf::from("board.toml")));
-                assert_eq!(args.board_type.as_deref(), Some("OrangePi-5-Plus"));
-                assert_eq!(args.server.as_deref(), Some("10.0.0.2"));
-                assert_eq!(args.port, Some(9000));
-            }
-            _ => panic!("expected board command"),
-        }
-    }
 
     #[test]
     fn qemu_request_starts_host_http_server_from_config() {

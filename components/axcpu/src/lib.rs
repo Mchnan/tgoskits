@@ -3,8 +3,8 @@
 #![deny(missing_docs)]
 #![doc = include_str!("../README.md")]
 
-#[cfg(all(feature = "uspace", feature = "tls"))]
-compile_error!("ax-cpu userspace requires LinuxCurrent and cannot enable kernel TLS mode");
+#[cfg(all(feature = "host-test", not(target_os = "none")))]
+extern crate std;
 
 #[macro_use]
 extern crate log;
@@ -44,7 +44,7 @@ impl KernelTlsBase {
     }
 
     pub(crate) fn for_task_context(requested: Self) -> Self {
-        if cfg!(feature = "tls") {
+        if cfg!(kernel_tls) {
             requested
         } else {
             assert!(

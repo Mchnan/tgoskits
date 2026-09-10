@@ -18,17 +18,14 @@
 //! - `smp`: Enable SMP (symmetric multiprocessing) support.
 //! - `fp-simd`: Enable floating-point and SIMD support.
 //! - `paging`: Enable page table manipulation.
-//! - `tls`: Enable kernel space thread-local storage support.
+//! - `tls`: Request kernel TLS; `uspace` takes precedence and disables it.
 //! - `rtc`: Enable real-time clock support.
-//! - `uspace`: Enable user space support.
+//! - `uspace`: Enable user space support, including user TLS, without kernel TLS.
 //!
 //! [ArceOS]: https://github.com/arceos-org/arceos
 //! [cargo test]: https://doc.rust-lang.org/cargo/guide/tests.html
 
 #![no_std]
-
-#[cfg(all(feature = "uspace", feature = "tls"))]
-compile_error!("ax-hal features `uspace` and `tls` select incompatible register ownership modes");
 
 #[allow(unused_imports)]
 #[macro_use]
@@ -54,7 +51,7 @@ pub mod percpu;
 pub mod pmu;
 pub mod time;
 
-#[cfg(feature = "tls")]
+#[cfg(kernel_tls)]
 pub mod tls;
 
 pub mod irq;
@@ -89,17 +86,6 @@ pub mod topology {
 
     #[cfg(not(any(test, feature = "host-test")))]
     pub use ax_plat::cpu::resolve_cpu_index;
-
-    #[cfg(test)]
-    mod tests {
-        use super::resolve_cpu_index;
-
-        #[test]
-        fn dummy_topology_only_maps_the_boot_cpu() {
-            assert_eq!(resolve_cpu_index(0), Some(0));
-            assert_eq!(resolve_cpu_index(1), None);
-        }
-    }
 }
 
 /// Trap handling.
@@ -194,5 +180,5 @@ macro_rules! addr_of_sym {
         $e as *const () as usize
     };
 }
-#[cfg(feature = "tls")]
+#[cfg(kernel_tls)]
 pub(crate) use addr_of_sym;

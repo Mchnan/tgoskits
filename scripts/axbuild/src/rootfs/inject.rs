@@ -13,11 +13,13 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     thread,
 };
 
 use anyhow::{Context, bail, ensure};
+
+use crate::support::process::retry_text_file_busy;
 
 /// Reads a text file from a rootfs image with `debugfs`.
 ///
@@ -154,9 +156,18 @@ struct RootfsExtraction<'a> {
 
 impl RootfsExtraction<'_> {
     fn run(&self) -> anyhow::Result<()> {
+        self.run_with_output(Command::output)
+    }
+
+    fn run_with_output(
+        &self,
+        mut output: impl FnMut(&mut Command) -> io::Result<Output>,
+    ) -> anyhow::Result<()> {
         let mut command = self.command();
         let rendered_command = format!("{command:?}");
-        let output = command.output().with_context(|| {
+        // A freshly published helper can still have a transient writable
+        // reference. Retry only ETXTBSY before it starts, using the shared bound.
+        let output = retry_text_file_busy(|| output(&mut command)).with_context(|| {
             if let Some(fakeroot) = self.fakeroot_program {
                 format!(
                     "failed to spawn fakeroot `{}`; rootfs extraction without full host ownership \
@@ -194,7 +205,7 @@ impl RootfsExtraction<'_> {
     /// targets have not been relativized yet.
     fn validate_top_level_entries(&self) -> anyhow::Result<()> {
         let mut command = self.request_command("ls -p /");
-        let output = command.output().with_context(|| {
+        let output = retry_text_file_busy(|| command.output()).with_context(|| {
             format!(
                 "failed to list {} for extraction validation",
                 self.rootfs_img.display()
@@ -209,10 +220,21 @@ impl RootfsExtraction<'_> {
         }
 
         let listing = String::from_utf8_lossy(&output.stdout);
-        let missing: Vec<String> = listing
-            .lines()
-            .filter_map(top_level_entry_name)
-            .filter(|name| !self.output_dir.join(name).symlink_metadata().is_ok())
+        let mut entry_names = Vec::new();
+        for line in listing.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if let Some(name) = top_level_entry_name(line)? {
+                entry_names.push(name);
+            }
+        }
+        ensure!(
+            !entry_names.is_empty(),
+            "rootfs extraction into {} is invalid; debugfs listed no top-level entries",
+            self.output_dir.display()
+        );
+
+        let missing: Vec<String> = entry_names
+            .into_iter()
+            .filter(|name| self.output_dir.join(name).symlink_metadata().is_err())
             .collect();
         ensure!(
             missing.is_empty(),
@@ -272,13 +294,15 @@ fn current_process_requires_fakeroot() -> bool {
 /// `/<inode>/<mode>/<uid>/<gid>/<name>/` for directories and appends a final
 /// `/<size>/` segment for regular files, so the name is always the fifth
 /// field. `.` and `..` are skipped.
-fn top_level_entry_name(line: &str) -> Option<String> {
+fn top_level_entry_name(line: &str) -> anyhow::Result<Option<String>> {
     let fields: Vec<&str> = line.trim().split('/').filter(|f| !f.is_empty()).collect();
-    let name = fields.get(4)?;
+    let Some(name) = fields.get(4) else {
+        bail!("malformed debugfs ls -p entry: `{line}`");
+    };
     if name.is_empty() || *name == "." || *name == ".." {
-        return None;
+        return Ok(None);
     }
-    Some((*name).to_string())
+    Ok(Some((*name).to_string()))
 }
 
 #[cfg(target_os = "linux")]
@@ -805,13 +829,14 @@ mod tests {
             &debugfs,
             &format!(
                 "#!/bin/sh\ntest \"${{AXBUILD_TEST_FAKEROOT:-}}\" = \"1\" || exit 92\ncase \
-                 \"${{2:-}}\" in\nrdump*) touch '{}'\nexit 0\nesac\nexit 0\n",
+                 \"${{2:-}}\" in\nrdump*) touch '{}'\nexit 0 ;;\n*ls*-p*) printf '%s\\n' \
+                 '/2/040755/0/0/etc//'\nexit 0 ;;\n*) exit 0 ;;\nesac\n",
                 marker.display()
             ),
         );
 
         let output_dir = root.path().join("staging");
-        fs::create_dir(&output_dir).unwrap();
+        fs::create_dir_all(output_dir.join("etc")).unwrap();
         RootfsExtraction {
             rootfs_img: Path::new("rootfs.img"),
             output_dir: &output_dir,
@@ -822,6 +847,48 @@ mod tests {
         .unwrap();
 
         assert!(marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_retries_a_busy_executable_before_starting_debugfs() {
+        for use_fakeroot in [false, true] {
+            let root = executable_helper_tempdir();
+            let debugfs = root.path().join("debugfs");
+            let fakeroot = root.path().join("fakeroot");
+            let marker = root.path().join("debugfs-runs");
+            write_executable(
+                &debugfs,
+                "#!/bin/sh\ncase \"${2:-}\" in\n*ls*-p*) printf '%s\\n' \
+                 '/2/100755/0/0/debugfs//' ;;\n*) printf 'ran\\n' >> \
+                 \"$AXBUILD_TEST_EXTRACTION_MARKER\" ;;\nesac\n",
+            );
+            write_executable(
+                &fakeroot,
+                "#!/bin/sh\ntest \"$1\" = -- || exit 91\nshift\nexec \"$@\"\n",
+            );
+            let mut attempts = 0;
+            RootfsExtraction {
+                rootfs_img: Path::new("rootfs.img"),
+                output_dir: root.path(),
+                debugfs_program: &debugfs,
+                fakeroot_program: use_fakeroot.then_some(fakeroot.as_path()),
+            }
+            .run_with_output(|command| {
+                attempts += 1;
+                if attempts == 1 {
+                    // Inject the observed spawn errno at the command boundary;
+                    // an actual writer/exec race depends on the host launcher.
+                    return Err(io::Error::from_raw_os_error(libc::ETXTBSY));
+                }
+                command
+                    .env("AXBUILD_TEST_EXTRACTION_MARKER", &marker)
+                    .output()
+            })
+            .unwrap();
+            assert_eq!(attempts, 2);
+            assert_eq!(fs::read_to_string(marker).unwrap(), "ran\n");
+        }
     }
 
     #[cfg(unix)]
@@ -882,20 +949,52 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn empty_extraction_listing_fails_top_level_validation() {
+        let root = executable_helper_tempdir();
+        let debugfs = root.path().join("debugfs");
+        write_executable(
+            &debugfs,
+            "#!/bin/sh\ncase \"${2:-}\" in\nrdump*) exit 0 ;;\n*ls*-p*) exit 0 ;;\nesac\n",
+        );
+
+        let output_dir = root.path().join("staging");
+        fs::create_dir(&output_dir).unwrap();
+        let error = RootfsExtraction {
+            rootfs_img: Path::new("rootfs.img"),
+            output_dir: &output_dir,
+            debugfs_program: &debugfs,
+            fakeroot_program: None,
+        }
+        .run()
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("listed no top-level entries"),
+            "unexpected error: {error:#}"
+        );
+    }
+
     #[test]
     fn top_level_entry_parser_matches_debugfs_ls_p_shapes() {
         // Directories: `/inode/mode/uid/gid/name//`.
         assert_eq!(
-            top_level_entry_name("/11/040700/0/0/lost+found//").as_deref(),
+            top_level_entry_name("/11/040700/0/0/lost+found//")
+                .unwrap()
+                .as_deref(),
             Some("lost+found")
         );
         // Regular files: `/inode/mode/uid/gid/name/<size>/`.
         assert_eq!(
-            top_level_entry_name("/12/100600/0/0/.ash_history/532/").as_deref(),
+            top_level_entry_name("/12/100600/0/0/.ash_history/532/")
+                .unwrap()
+                .as_deref(),
             Some(".ash_history")
         );
-        assert!(top_level_entry_name("/2/040755/0/0/.//").is_none());
-        assert!(top_level_entry_name("/2/040755/0/0/..//").is_none());
+        assert!(top_level_entry_name("/2/040755/0/0/.//").unwrap().is_none());
+        assert!(top_level_entry_name("/2/040755/0/0/..//").unwrap().is_none());
+        assert!(top_level_entry_name("/2/040755").is_err());
     }
 
     #[cfg(target_os = "macos")]

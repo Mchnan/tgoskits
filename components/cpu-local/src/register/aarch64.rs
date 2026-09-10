@@ -5,6 +5,10 @@ pub(super) const CURRENT_MODEL: ArchitectureCurrentModel = ArchitectureCurrentMo
     unikernel_tls: CurrentContextSource::ArchitectureRegister,
 };
 
+pub(super) struct Backend;
+
+impl ArchitectureRegisterBackend for Backend {}
+
 fn current_el() -> Result<usize, CpuLocalError> {
     let current_el: usize;
     unsafe { core::arch::asm!("mrs {value}, CurrentEL", value = out(reg) current_el) };
@@ -49,14 +53,14 @@ pub(super) unsafe fn write_current_context(value: usize) {
     unsafe { core::arch::asm!("msr SP_EL0, {value}", value = in(reg) value) };
 }
 
-#[cfg(feature = "tls")]
+#[cfg(kernel_tls)]
 pub(super) unsafe fn read_kernel_tls() -> usize {
     let value: usize;
     unsafe { core::arch::asm!("mrs {value}, TPIDR_EL0", value = out(reg) value) };
     value
 }
 
-#[cfg(feature = "tls")]
+#[cfg(kernel_tls)]
 pub(super) unsafe fn write_kernel_tls(value: usize) {
     unsafe { core::arch::asm!("msr TPIDR_EL0, {value}", value = in(reg) value) };
 }
