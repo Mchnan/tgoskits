@@ -81,12 +81,11 @@ export LIBGL_ALWAYS_SOFTWARE=1 LIBSEAT_BACKEND=noop XDG_RUNTIME_DIR=/tmp \
 
 - 启动后先闪一下蓝屏 → 黑屏 + 白色光标条随鼠标移动（扫描输出链路活着的标志）
   → 等首帧。
-- **LP_NUM_THREADS=1：完整锁屏约 t50 秒**（2026-09-09 实测；时钟逐秒走动 +
-  壁纸 + 光标 + 右上角状态条）。
-- **默认 4 线程（不设 LP_NUM_THREADS）：约 t90–150 秒**——多线程 llvmpipe 在
-  当前调度器下反而更慢（重帧慢约 3 倍），这是已知问题：根因是旧调度器
-  唤醒/派生永远选本地 CPU、无负载均衡，任务全挤在一个 vCPU。上游
-  PR #1775（2026-09-08 调度器重建）已架构性修复，待 repatch 后更新本节。
+- **LP_NUM_THREADS=1：完整锁屏约 t50 秒**（2026-09-09 旧调度器快照实测）。
+  repatch 后（上游 #1775 调度器重建）新基线 <35 秒出画、空闲 CPU 1%。
+- **默认 4 线程（不设 LP_NUM_THREADS）**：旧调度器下约 t90–150 秒（唤醒/派发
+  永远本地 CPU、无负载均衡，多线程 llvmpipe 慢约 3 倍）；该根因已随 #1775
+  落地修复，新树待多次复核后更新本节。
 - 日志健康检查点（`grep -a` /tmp/dd.log）：
   `Using the Impeller rendering backend`、`started Rust Flutter embedder`、
   `synchronized Flutter desktop visibility visible=true`、
@@ -95,9 +94,25 @@ export LIBGL_ALWAYS_SOFTWARE=1 LIBSEAT_BACKEND=noop XDG_RUNTIME_DIR=/tmp \
 
 ## 5. 键鼠与取证
 
-- 键鼠直接在 cocoa 窗口操作（evdev 轮询修复已在本树内）。
-- 验证输入到内核：`timeout 6 dd if=/dev/input/event0 of=/tmp/x.bin bs=24 count=4`，
-  窗口里敲键后 dd 应秒收 96 字节。
+- 键鼠直接在 cocoa 窗口操作。输入路径是 IRQ 驱动的：virtio-input 的 PCI INTx
+  绑定（GPEX legacy 线 → GIC SPI）→ `EventDev::register_irq` → 上游
+  `evdev-irq-service` 线程。2026-09-10 修复：`ax-driver` 的 virtio input probe
+  曾用 `take_virtio_transport_masked` 把 PCI command 的 `INTERRUPT_DISABLE`
+  置位且无人清除，设备物理上发不出 INTx（轮询时代 #1228/#1450 的遗留假设），
+  已改回 `take_virtio_transport`（与 virtio-net 一致）。
+- 注意 probe 日志 `registered virtio input device irq=None` 打印的是
+  `irq_num()`（绑定的 legacy 原始编号视图；native/GIC domain 绑定时恒为
+  None），**与实际可用的中断绑定相反**；判断解析结果要看 EventDev 拿到的
+  `device.irq_id()` 或加临时探针。
+- 验证输入到内核（先启动阻塞读、再注入事件，能区分「事件没进队列」和
+  「唤醒链路断裂」两种故障）：
+
+```bash
+# guest 内（串口）：
+timeout 6 dd if=/dev/input/event0 of=/tmp/k.bin bs=24 count=6 &
+# 宿主注入（HMP）：sendkey a / mouse_move 40 20 / mouse_button 1
+# 键盘应得 144B（KEY down+up+SYN），dd 状态应为 Done 而非 Terminated。
+```
 - screendump / 注入（nc 连 HMP 不会自退，必须后台+定时杀）：
 
 ```bash
@@ -112,6 +127,7 @@ hmp "sendkey b"                   # 鼠标用 mouse_move / mouse_button
 | 坑 | 现象 | 对策 |
 | --- | --- | --- |
 | 漏 `--flutter-bundle` | 蓝闪→永远黑屏+光标，无任何报错 | 照抄 §3 命令；查 dd.log 的 `presentation=` |
+| masked transport 掩死 INTx | 桌面出画但光标不动、点击无反应；阻塞读 dd 永远 0 字节（预注入后再读却有数据） | input 驱动禁用 `take_virtio_transport_masked`；判别法见 §5 |
 | 硬杀 QEMU | ext4 文件名在内容全零 | guest 内 `sync; poweroff` 再关 |
 | 镜像双开 | Failed to get write lock | 启动前 `pgrep -x qemu-system-aarch64` |
 | 串口 >4KB 单次输出 | 控制台冻结 | 长输出 `| head` / 分块 |

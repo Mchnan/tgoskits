@@ -1,9 +1,14 @@
 import {
   Stack, H1, H2, H3, Text, Card, CardHeader, CardBody,
   Table, Pill, Stat, Callout, Code, Divider, CodeBlock, Grid, Row,
-  useHostTheme,
+  FileLink, useCanvasAction, useHostTheme,
   type TableColumnAlign, type TableRowTone,
 } from "cursor/canvas";
+
+function RepoFileLink({ path, label }: { path: string; label: string }) {
+  const dispatch = useCanvasAction();
+  return <FileLink path={path} label={label} dispatch={dispatch} />;
+}
 
 const probeHeaders = ["检查项", "期望", "实测", "结论"];
 const probeAlign: Array<TableColumnAlign | undefined> = ["left", "left", "left", "left"];
@@ -1343,6 +1348,67 @@ deniald: cargo build --release --features flutter   # aarch64 glibc 一次通过
                   <Code>.percpu.*</Code> section 名失败，属环境限制（上游 CI 在
                   Linux）。待办：键鼠 cocoa 实测（#2296 作废后由上游 IRQ 路径负责）、
                   恐慌修复回报上游 #1709、多次复核新基线。
+                </Text>
+              </Stack>
+            </CardBody>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <H3>9.13 cocoa 键鼠修复：masked transport 掩死 INTx，上游 issue #2352 / PR #2353（2026-09-10）</H3>
+            </CardHeader>
+            <CardBody>
+              <Stack gap={8}>
+                <Text>
+                  9.12 遗留的「键鼠 cocoa 实测」结论为输入整体丢失：桌面完整出画，
+                  但光标不动、点击无反应。判别手法（后续排障可复用）：guest 内先启动
+                  阻塞读 <Code>timeout 6 dd if=/dev/input/event0 of=/tmp/k.bin
+                  bs=24 count=6</Code>，再经 HMP 注入事件（sendkey / mouse_move）——
+                  0 字节 + Terminated = 阻塞读者等不到唤醒；先注入再读却有数据 =
+                  读路径能直接排空 virtqueue，仅中断/唤醒断裂。本例属后者：事件
+                  一直正常进入 virtqueue，缺的是中断。
+                </Text>
+                <Text>
+                  排查两次被表象带偏。① probe 日志
+                  <Code>registered virtio input device irq=None</Code>
+                  打印的是 <Code>irq_num()</Code>（绑定的 legacy 原始编号视图，
+                  native GIC domain 绑定恒为 None），据此先实现「无 IRQ 时轮询
+                  兜底」无效，在 <Code>EventDev::new</Code> 加 GUARD-DEBUG 探针
+                  （9.12 PI 恐慌同款手法）才看到
+                  <Code>irq=Some(domain 7, hwirq 35/38)</Code>：INTx 绑定解析成功、
+                  <Code>request_irq</Code> 成功、<Code>evdev-irq-service</Code>
+                  正常 park。② 真因是
+                  <Code>take_virtio_transport_masked</Code>（#1228 轮询时代遗留）
+                  在 probe 时置位 PCI command 的
+                  <Code>INTERRUPT_DISABLE</Code>，驱动 <Code>enable_irq()</Code>
+                  只翻软件标志，全树无人解除——设备物理上发不出 INTx。修复单行：
+                  input probe 改回与 virtio-net 一致的
+                  <Code>take_virtio_transport</Code>（
+                  <RepoFileLink
+                    path="../drivers/ax-driver/src/virtio/input.rs"
+                    label="drivers/ax-driver/src/virtio/input.rs"
+                  />
+                  ）。
+                </Text>
+                <Text>
+                  修复后回归：内核层阻塞读者秒唤醒（键盘/鼠标各 144B，dd Done）；
+                  桌面层 libinput 枚举 event0/event1（键盘带 XKB keymap），合成器
+                  光标可精确定位任意坐标、点击关闭面板、拖拽手势拉出 Dashboard
+                  面板（音量/蓝牙 UI）——Flutter 手势识别认可输入。HMP 合成事件
+                  只能验证到这里，锁屏解锁手势待真机连续鼠标确认。
+                </Text>
+                <Text>
+                  上游化：<Code>rcore-os/tgoskits#2352</Code>（issue，含判别法与
+                  原则性修复方向：mask 应与 MSI 租约绑定、驱动开关回写 PCI
+                  command、display.rs:32 同源隐患、修正 irq_num 日志）；<Code>#2353</Code>
+                  （PR，fork 分支 <Code>fix/virtio-input-pci-intx</Code>
+                  单提交 +1/-2，base dev，Fixes #2352）。长期项：QEMU virt 的
+                  GPEX interrupt-map 只覆盖根槽位 0-3，槽位 4-7 设备中断依赖补齐
+                  GICv2m 的 rdif_msi provider（FDT 已有 msi-map 与
+                  arm,gic-v2m-frame，NVMe 日志 "PCI MSI provider is not
+                  registered" 即指此）。排障记录已同步
+                  <RepoFileLink path="../docs/sop-run-starryos-denial-qemu.md" label="SOP §5" />
+                  与 <RepoFileLink path="../AGENTS.md" label="AGENTS.md" />。
                 </Text>
               </Stack>
             </CardBody>
