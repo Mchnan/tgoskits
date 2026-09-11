@@ -462,7 +462,8 @@ pub(crate) fn backend() -> Result<Arc<AxvmVgicBackend>, GicV3BackendError> {
     AxvmVgicBackend::new().map(Arc::new)
 }
 
-pub(crate) fn host_irq_config() -> Result<arm_vcpu::ArmHostIrqConfig, GicV3BackendError> {
+pub(crate) fn host_irq_config() -> Result<ax_cpu::virtualization::HostIrqConfig, GicV3BackendError>
+{
     cpu_interface::host_irq_config()
 }
 
@@ -541,7 +542,9 @@ pub(crate) fn dispatch_acknowledged_host_irq(token: usize) {
             return;
         }
     };
-    let outcome = ax_std::os::arceos::modules::ax_hal::irq::dispatch_irq(irq);
+    let outcome = ax_std::os::arceos::modules::ax_hal::irq::handle_acknowledged_irq(irq, || {
+        deactivate_host_irq(token);
+    });
     if !outcome.handled {
         if outcome.called == 0 {
             warn!("Unhandled acknowledged host IRQ {raw}");
@@ -549,7 +552,6 @@ pub(crate) fn dispatch_acknowledged_host_irq(token: usize) {
             debug!("Spurious acknowledged host IRQ {raw}");
         }
     }
-    deactivate_host_irq(token);
 }
 
 /// Routes an acknowledged host IRQ to its assigned VGIC or the host framework.

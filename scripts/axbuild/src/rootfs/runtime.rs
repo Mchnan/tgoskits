@@ -14,38 +14,21 @@ use std::{
 
 use anyhow::{Context, bail};
 
-use crate::context::cross_compile_spec_for_arch_checked;
+use crate::{
+    context::cross_compile_spec_for_arch_checked, support::process::find_host_binary_candidates,
+};
 
 const RUNTIME_LIBRARY_DIRS: &[&str] = &["lib", "usr/lib", "usr/local/lib"];
 
-/// Locates a `readelf` able to inspect guest ELFs. readelf is
-/// architecture-agnostic, so plain and LLVM names come first and the
-/// cross-toolchain prefixed binary covers hosts that only carry the cross
-/// binutils (e.g. macOS without binutils installed).
-pub(crate) fn find_readelf(arch: &str) -> anyhow::Result<PathBuf> {
-    let spec = cross_compile_spec_for_arch_checked(arch)?;
-    let candidates = [
-        "readelf".to_string(),
-        "llvm-readelf".to_string(),
-        format!("{}-readelf", spec.gnu_tool_prefix),
-    ];
-    candidates
-        .iter()
-        .find_map(|name| find_optional_host_binary(name))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "required host binary was not found in PATH; tried: {}",
-                candidates.join(", ")
-            )
-        })
-}
-
 /// Copies any needed runtime shared libraries into an overlay tree.
 pub(crate) fn sync_runtime_dependencies(
+    arch: &str,
     staging_root: &Path,
     overlay_dir: &Path,
-    readelf: &Path,
 ) -> anyhow::Result<()> {
+    let spec = cross_compile_spec_for_arch_checked(arch)?;
+    let cross_readelf = format!("{}-readelf", spec.gnu_tool_prefix);
+    let readelf = find_host_binary_candidates(&["readelf", "llvm-readelf", &cross_readelf])?;
     let mut pending = collect_regular_files(overlay_dir)?;
     let mut processed = std::collections::BTreeSet::new();
 
@@ -55,7 +38,7 @@ pub(crate) fn sync_runtime_dependencies(
         }
         processed.insert(path.clone());
 
-        let needed = read_needed_shared_libraries(readelf, &path)?;
+        let needed = read_needed_shared_libraries(&readelf, &path)?;
         for library in needed {
             let Some(source_path) = find_runtime_library_in_staging_root(staging_root, &library)?
             else {
@@ -175,12 +158,4 @@ fn find_runtime_library_in_staging_root(
         }
     }
     Ok(None)
-}
-
-fn find_optional_host_binary(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|path_var| {
-        std::env::split_paths(&path_var)
-            .map(|dir| dir.join(name))
-            .find(|candidate| candidate.is_file())
-    })
 }

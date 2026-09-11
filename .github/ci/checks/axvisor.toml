@@ -63,11 +63,8 @@ echo "==> axvisor riscv64 smoke"
 cargo xtask axvisor test qemu --arch riscv64 --test-case smoke
 echo "==> axvisor riscv64 IPI cross-test"
 cargo xtask cross-test --arch riscv64 \
-  --package riscv_vcpu --package axvm \
+  --package axvm \
   --features axvm/host-test --no-default-features --lib ipi
-echo "==> axvisor riscv64 VSEIP unbound-state cross-test"
-cargo xtask cross-test --arch riscv64 --package riscv_vcpu --lib \
-  controller_vseip_line_updates_saved_state_while_unbound
 echo "==> axvisor riscv64 backtrace panic"
 cargo xtask axvisor test qemu --arch riscv64 --test-case backtrace-panic
 echo "==> axvisor riscv64 no-backtrace panic"
@@ -196,6 +193,8 @@ timeout_minutes = 90
 command = '''
 echo "==> axvisor OrangePi 5 Plus Linux guest"
 cargo xtask axvisor test board --board orangepi-5-plus-linux
+echo "==> build the StarryOS guest from this checkout"
+cargo xtask starry build --config test-suit/starryos/board-orangepi-5-plus/build-aarch64-unknown-none-softfloat.toml --smp 1
 echo "==> axvisor OrangePi 5 Plus StarryOS guest"
 cargo xtask axvisor test board --board orangepi-5-plus-starry
 echo "==> axvisor OrangePi 5 Plus AXIVC Zephyr-Starry benchmark"
