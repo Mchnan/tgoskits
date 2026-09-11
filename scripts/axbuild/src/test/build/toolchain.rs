@@ -4,6 +4,14 @@ pub(crate) fn cross_compile_spec(arch: &str) -> anyhow::Result<CrossCompileSpec>
     crate::context::cross_compile_spec_for_arch_checked(arch)
 }
 
+/// Shares provider selection between wrapper generation and asset caching.
+pub(crate) fn find_cross_tool_qemu(
+    spec: CrossCompileSpec,
+    mut find: impl FnMut(&str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    spec.qemu_user_binaries.iter().find_map(|name| find(name))
+}
+
 /// Generates the same cross-tool names for emulated and host-native binutils.
 pub(crate) fn write_cross_bin_wrappers(
     layout: &case_assets::CaseAssetLayout,
@@ -21,7 +29,7 @@ fn write_cross_bin_wrappers_with_lookup(
     spec: CrossCompileSpec,
     mut find: impl FnMut(&str) -> Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let qemu_runner = spec.qemu_user_binaries.iter().find_map(|name| find(name));
+    let qemu_runner = find_cross_tool_qemu(spec, &mut find);
     fs::create_dir_all(&layout.cross_bin_dir)
         .with_context(|| format!("failed to create {}", layout.cross_bin_dir.display()))?;
     for tool in CROSS_BINUTILS {
