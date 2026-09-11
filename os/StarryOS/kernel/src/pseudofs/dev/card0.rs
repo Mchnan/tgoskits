@@ -41,7 +41,7 @@ use alloc::{
 };
 use core::{
     any::Any,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use ax_alloc::GlobalPage;
@@ -364,6 +364,12 @@ pub struct Card0 {
     /// `read()` (flip completion, `WAIT_VBLANK` events, and
     /// `CRTC_QUEUE_SEQUENCE` events).
     events: Mutex<VecDeque<EventSlot>>,
+    /// Live card0 file descriptors. DRM master semantics: when the count
+    /// reaches zero the KMS modeset state resets, mirroring Linux
+    /// `drm_release` → `drm_fb_release` where an exiting compositor's
+    /// framebuffers unbind and the CRTC goes inactive. Without this a
+    /// later client inherits the previous client's phantom active state.
+    open_count: AtomicUsize,
     /// Wakes up `poll`-waiters blocked on `read()` when a new event
     /// arrives.
     poll_rx: PollSet,
@@ -426,6 +432,7 @@ impl Card0 {
     pub fn new() -> Arc<Self> {
         let card = Arc::new(Self {
             events: Mutex::new(VecDeque::with_capacity(MAX_EVENTS)),
+            open_count: AtomicUsize::new(0),
             poll_rx: PollSet::new(),
             vblank: VblankScheduler::new(monotonic_time_nanos()),
             state: Mutex::new(ModesetState::default()),
@@ -607,6 +614,26 @@ fn current_mode() -> DrmModeModeInfo {
 }
 
 impl DeviceOps for Card0 {
+    fn open(&self, _exclusive: bool) -> VfsResult<()> {
+        self.open_count.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn close(&self, _exclusive: bool) {
+        // Last card0 fd closed: the client is gone, so its KMS state goes
+        // with it (Linux drm_release → drm_fb_release). A later client must
+        // not inherit the phantom active CRTC and stale framebuffer table.
+        if self
+            .open_count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok_and(|old| old == 1)
+        {
+            self.reset_kms_state();
+        }
+    }
+
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -1321,12 +1348,17 @@ impl Card0 {
         let ptr = arg as *const u32;
         let fb_id: u32 = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
         self.fbs.lock().remove(&fb_id);
-        // If the removed fb was the one bound by legacy SETCRTC, clear
-        // the binding so GETCRTC stops reporting a stale fb_id.
+        // Removing the scanned-out fb unbinds it wherever it presents: the
+        // legacy SETCRTC binding so GETCRTC stops reporting a stale fb_id,
+        // and the atomic plane binding so the CRTC stops reporting active.
         {
             let mut legacy = self.legacy_crtc.lock();
             if legacy.fb_id == fb_id {
                 *legacy = LegacyCrtcState::default();
+            }
+            let mut state = self.state.lock();
+            if state.plane_fb_id == fb_id {
+                state.plane_fb_id = 0;
             }
         }
         Ok(0)
@@ -1737,11 +1769,32 @@ impl Card0 {
         }
     }
 
+    /// Resets every client-visible KMS binding after the last card0 fd
+    /// closed. Mirrors Linux `drm_release`: framebuffer and dumb-buffer
+    /// tables are owned per-file there, so they die with the client;
+    /// the CRTC unbinds and scan-out stops.
+    fn reset_kms_state(&self) {
+        *self.state.lock() = ModesetState::default();
+        *self.legacy_crtc.lock() = LegacyCrtcState::default();
+        self.fbs.lock().clear();
+        self.events.lock().clear();
+    }
+
     /// Whether the CRTC is currently scanning out: true once a legacy
-    /// `SETCRTC` bound an fb or an atomic commit set `ACTIVE`. Mirrors
-    /// the `active` visibility `CRTC_GET_SEQUENCE` reports.
+    /// `SETCRTC` bound an fb or an atomic commit bound a live fb to the
+    /// primary plane. Mirrors the `active` visibility `CRTC_GET_SEQUENCE`
+    /// reports.
+    ///
+    /// The global [`ModesetState`] retains atomic property values across
+    /// clients (GETPLANE readback relies on that), so "state != default"
+    /// cannot decide scan-out: a later legacy-only client would see a
+    /// phantom active CRTC. Presenting requires a binding that still refers
+    /// to a live fb — legacy bindings are removed by RMFB, and stale atomic
+    /// plane bindings left by earlier clients stop counting once their fb
+    /// is gone.
     fn crtc_active(&self) -> bool {
-        *self.state.lock() != ModesetState::default()
+        let plane_fb = self.state.lock().plane_fb_id;
+        (plane_fb != 0 && self.fbs.lock().contains_key(&plane_fb))
             || self.legacy_crtc.lock().fb_id != 0
     }
 
