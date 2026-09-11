@@ -8,9 +8,10 @@ use rd_net::{
 };
 
 use super::{
-    COMMAND_QUARANTINE, COMMAND_STOP, COMMAND_WAIT, CPU_ROUND_BUDGET, PollGroupState, QUEUE_BUDGET,
-    STATE_MASK, STATE_MISSED, STATE_POLLING, STATE_SCHEDULED, STATUS_FAILED, STATUS_READY,
-    SpscConsumer, SpscProducer, TxQueueDiscipline,
+    COMMAND_PRUNE, COMMAND_QUARANTINE, COMMAND_RUN, COMMAND_STOP, COMMAND_WAIT, CPU_ROUND_BUDGET,
+    PollGroupState, QUEUE_BUDGET, QueueNotification, STATE_MASK, STATE_MISSED, STATE_POLLING,
+    STATE_SCHEDULED, STATUS_EMPTY, STATUS_FAILED, STATUS_PENDING, STATUS_READY, SpscConsumer,
+    SpscProducer, TxQueueDiscipline,
 };
 use crate::device::{
     ETH_ZLEN, EthernetFramePort, NetDeviceError, NetDeviceResult, ProtocolEthernetFrame,
@@ -316,6 +317,11 @@ impl EthernetFramePort for QueueFramePort {
 }
 
 impl QueueFramePort {
+    pub(super) fn retain_started_groups(&mut self) -> bool {
+        self.groups.retain(|group| !group.shared.startup_absent());
+        !self.groups.is_empty()
+    }
+
     fn try_transmit_with_options(
         &mut self,
         frame_len: usize,
@@ -413,6 +419,7 @@ const fn executor_wait(now_nanos: u64, deadline_nanos: Option<u64>) -> ExecutorW
 }
 
 pub(super) struct QueueGroupExecutor {
+    pub(super) wifi_startup_group: Option<Arc<PollGroupState>>,
     pub(super) group: PreparedNetPollGroup,
     pub(super) rx_ready: SpscProducer<RxCompletion>,
     pub(super) rx_recycle: SpscConsumer<DmaBuffer>,
@@ -430,6 +437,31 @@ pub(super) struct QueueGroupExecutor {
 }
 
 impl QueueGroupExecutor {
+    fn stop_if_wifi_absent(&mut self) -> Result<(), NetError> {
+        if self.shared.startup_absent()
+            || !self
+                .wifi_startup_group
+                .as_ref()
+                .is_some_and(|group| group.startup_absent())
+        {
+            return Ok(());
+        }
+        self.shared.disable();
+        self.group.irq_control.quiesce()?;
+        self.group.irq_control.shutdown()?;
+        self.shared.mark_startup_absent();
+        Ok(())
+    }
+
+    fn disable_after_error(&self, operation: &str, error: &NetError) {
+        log::error!(
+            "network poll group {} on CPU {} disabled during {operation}: {error}",
+            self.group.id.get(),
+            self.shared.owner_cpu,
+        );
+        self.shared.disable();
+    }
+
     fn take_rx_replacement(&mut self) -> Option<DmaBuffer> {
         if let Some(buffer) = self.rx_spares.pop() {
             return Some(buffer);
@@ -445,23 +477,31 @@ impl QueueGroupExecutor {
         Some(buffer)
     }
 
-    fn initialize(&mut self) -> Result<(), NetError> {
+    fn initialize<'waiter>(
+        &mut self,
+        waiter: impl Fn() -> &'waiter ax_task::sync::irq::IrqWorkerWaiter,
+    ) -> Result<(), NetError> {
         if let Some(mut startup) = self.group.owner_startup.take() {
             let mut progress = startup.start(ax_hal::time::monotonic_time_nanos());
             loop {
                 progress = match progress {
                     Ok(NetOwnerStartupProgress::Ready) => break,
                     Ok(NetOwnerStartupProgress::WaitForInterrupt) => {
-                        self.shared.wait_startup_irq();
+                        self.shared.wait_startup_irq(waiter());
                         startup.advance(ax_hal::time::monotonic_time_nanos())
                     }
                     Ok(NetOwnerStartupProgress::WaitForInterruptUntil { deadline_nanos }) => {
-                        self.shared.wait_startup_deadline(deadline_nanos);
+                        self.shared.wait_startup_deadline(waiter(), deadline_nanos);
                         startup.advance(ax_hal::time::monotonic_time_nanos())
                     }
                     Ok(NetOwnerStartupProgress::RetryAt { deadline_nanos }) => {
-                        self.shared.wait_startup_deadline(deadline_nanos);
+                        self.shared.wait_startup_deadline(waiter(), deadline_nanos);
                         startup.advance(ax_hal::time::monotonic_time_nanos())
+                    }
+                    Err(NetError::DeviceNotPresent) => {
+                        startup.cancel()?;
+                        self.shared.mark_startup_absent();
+                        return Ok(());
                     }
                     Err(error) => {
                         let _ = startup.cancel();
@@ -501,8 +541,8 @@ impl QueueGroupExecutor {
         if self.shared.is_disabled() {
             return GroupPollOutcome::Failed;
         }
-        if self.group.irq_control.quiesce().is_err() {
-            self.shared.disable();
+        if let Err(error) = self.group.irq_control.quiesce() {
+            self.disable_after_error("IRQ quiesce", &error);
             return GroupPollOutcome::Failed;
         }
 
@@ -553,9 +593,9 @@ impl QueueGroupExecutor {
                             buffer,
                             options: request.options,
                         });
-                        // RX completion slots may hold up a software-backed
-                        // device's shared owner. Preserve the TX request, but
-                        // still drain RX before rearming this poll group.
+                        // RX completion and refill may release resources
+                        // needed by a busy software-backed TX queue. Retain
+                        // this request, but service RX before rearming IRQs.
                         break;
                     }
                     if let Err(buffer) = self.tx_free.push(buffer) {
@@ -614,7 +654,7 @@ impl QueueGroupExecutor {
                             replacement,
                         });
                         if !matches!(reason, NetError::Retry) {
-                            self.shared.disable();
+                            self.disable_after_error("RX refill", &reason);
                             return GroupPollOutcome::Failed;
                         }
                         rx_refill_blocked = true;
@@ -695,7 +735,7 @@ impl QueueGroupExecutor {
             Ok(NetRearmResult::RetryAt { deadline_nanos }) => {
                 self.retry_at = Some(deadline_nanos);
             }
-            Err(_) => self.shared.disable(),
+            Err(error) => self.disable_after_error("IRQ rearm", &error),
         }
     }
 
@@ -716,16 +756,27 @@ pub(super) struct ExecutorControl {
     pub(super) command: AtomicU8,
     pub(super) affinity_status: AtomicU8,
     pub(super) startup_status: AtomicU8,
+    pub(super) prune_status: AtomicU8,
+    pub(super) publication_status: AtomicU8,
     pub(super) startup_error: SpinLock<Option<NetError>>,
-    pub(super) notify: Arc<ax_task::IrqNotify>,
+    pub(super) notify: Arc<QueueNotification>,
 }
 
 pub(super) struct ExecutorLease {
     pub(super) control: Arc<ExecutorControl>,
-    pub(super) task: ax_task::AxTaskRef,
+    pub(super) task: ax_task::thread::ThreadHandle,
 }
 
 impl ExecutorLease {
+    pub(super) fn join(self) {
+        if let Err(error) = self.task.join() {
+            log::error!(
+                "failed to join network queue executor for CPU {}: {error}",
+                self.control.owner_cpu
+            );
+        }
+    }
+
     pub(super) fn stop(&self, irq_synchronized: bool) {
         self.control.command.store(
             if irq_synchronized {
@@ -744,16 +795,9 @@ pub(super) fn queue_executor_main(
     mut wifi: Vec<WifiExecutorSlot>,
     control: Arc<ExecutorControl>,
 ) {
-    let affinity = ax_task::AxCpuMask::one_shot(control.owner_cpu);
-    if !ax_task::set_current_affinity(affinity) {
-        control
-            .affinity_status
-            .store(STATUS_FAILED, Ordering::Release);
-        control.notify.notify();
-        quarantine_executor_resources(groups, wifi);
-        return;
-    }
-    ax_task::yield_now();
+    let current = ax_task::thread::current::current_thread_handle()
+        .unwrap_or_else(|error| panic!("network queue executor has no scheduler thread: {error}"));
+    let waiter = ax_task::sync::irq::IrqWorkerWaiter::new(current.wake_handle());
     if ax_hal::percpu::this_cpu_id() != control.owner_cpu {
         control
             .affinity_status
@@ -768,7 +812,7 @@ pub(super) fn queue_executor_main(
     control.notify.notify();
 
     while control.command.load(Ordering::Acquire) == COMMAND_WAIT {
-        control.notify.wait();
+        control.notify.wait(&waiter);
     }
     if let Some(irq_synchronized) =
         requested_irq_synchronization(control.command.load(Ordering::Acquire))
@@ -779,7 +823,7 @@ pub(super) fn queue_executor_main(
 
     let initialization = groups
         .iter_mut()
-        .try_for_each(QueueGroupExecutor::initialize);
+        .try_for_each(|group| group.initialize(|| &waiter));
     if let Err(error) = initialization {
         *control.startup_error.lock_irqsave() = Some(error);
     }
@@ -793,9 +837,43 @@ pub(super) fn queue_executor_main(
     );
     control.notify.notify();
     if control.startup_error.lock_irqsave().is_some() {
-        let irq_synchronized = wait_for_cleanup_command(&control);
+        let irq_synchronized = wait_for_cleanup_command(&control, &waiter);
         release_executor_resources(groups, wifi, irq_synchronized);
         return;
+    }
+
+    loop {
+        let command = control.command.load(Ordering::Acquire);
+        if let Some(irq_synchronized) = requested_irq_synchronization(command) {
+            release_executor_resources(groups, wifi, irq_synchronized);
+            return;
+        }
+        if command == COMMAND_PRUNE
+            && control.prune_status.load(Ordering::Acquire) == STATUS_PENDING
+        {
+            let result = groups
+                .iter_mut()
+                .try_for_each(QueueGroupExecutor::stop_if_wifi_absent);
+            if let Err(error) = result {
+                *control.startup_error.lock_irqsave() = Some(error);
+                control.prune_status.store(STATUS_FAILED, Ordering::Release);
+                control.notify.notify();
+                let irq_synchronized = wait_for_cleanup_command(&control, &waiter);
+                release_executor_resources(groups, wifi, irq_synchronized);
+                return;
+            }
+            control.prune_status.store(STATUS_READY, Ordering::Release);
+            control.notify.notify();
+        }
+        if let Some(status) = retain_started_executor_groups(&mut groups, &mut wifi, command) {
+            control.publication_status.store(status, Ordering::Release);
+            control.notify.notify();
+            if status == STATUS_EMPTY {
+                return;
+            }
+            break;
+        }
+        control.notify.wait(&waiter);
     }
 
     loop {
@@ -833,7 +911,7 @@ pub(super) fn queue_executor_main(
             }
         }
         if runnable && cpu_work >= CPU_ROUND_BUDGET {
-            ax_task::yield_now();
+            crate::yield_network_thread();
             continue;
         }
         let now_nanos = ax_hal::time::monotonic_time_nanos();
@@ -852,9 +930,9 @@ pub(super) fn queue_executor_main(
                 .chain(groups.iter().filter_map(|group| group.retry_at))
                 .min();
             match executor_wait(ax_hal::time::monotonic_time_nanos(), deadline_nanos) {
-                ExecutorWait::Notification => control.notify.wait(),
+                ExecutorWait::Notification => control.notify.wait(&waiter),
                 ExecutorWait::Deadline(duration) => {
-                    let _ = control.notify.wait_timeout(duration);
+                    control.notify.wait_timeout(&waiter, duration);
                 }
                 ExecutorWait::Ready => {}
             }
@@ -862,14 +940,54 @@ pub(super) fn queue_executor_main(
     }
 }
 
-fn wait_for_cleanup_command(control: &ExecutorControl) -> bool {
+fn retain_started_executor_groups(
+    groups: &mut Vec<QueueGroupExecutor>,
+    wifi: &mut Vec<WifiExecutorSlot>,
+    command: u8,
+) -> Option<u8> {
+    if command != COMMAND_RUN {
+        return None;
+    }
+    let mut next_index = 0;
+    let group_indices = groups
+        .iter()
+        .map(|group| {
+            if group.shared.startup_absent() {
+                None
+            } else {
+                let index = next_index;
+                next_index += 1;
+                Some(index)
+            }
+        })
+        .collect::<Vec<_>>();
+    wifi.retain_mut(|slot| {
+        if let Some(index) = group_indices[slot.group_index] {
+            slot.group_index = index;
+            true
+        } else {
+            false
+        }
+    });
+    groups.retain(|group| !group.shared.startup_absent());
+    Some(if groups.is_empty() {
+        STATUS_EMPTY
+    } else {
+        STATUS_READY
+    })
+}
+
+fn wait_for_cleanup_command(
+    control: &ExecutorControl,
+    waiter: &ax_task::sync::irq::IrqWorkerWaiter,
+) -> bool {
     loop {
         if let Some(irq_synchronized) =
             requested_irq_synchronization(control.command.load(Ordering::Acquire))
         {
             return irq_synchronized;
         }
-        control.notify.wait();
+        control.notify.wait(waiter);
     }
 }
 
@@ -894,6 +1012,11 @@ fn shutdown_queue_groups(mut groups: Vec<QueueGroupExecutor>, irq_synchronized: 
     let mut dma_stopped = true;
     for group in &mut groups {
         group.shared.disable();
+        if group.shared.startup_absent() {
+            // Startup cancellation or shutdown completed before this marker was
+            // published, so no control endpoint owns live DMA to shut down.
+            continue;
+        }
         let _ = group.group.irq_control.quiesce();
         if group.group.irq_control.shutdown().is_err() {
             dma_stopped = false;

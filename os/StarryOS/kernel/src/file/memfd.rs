@@ -22,13 +22,8 @@
 //! Chromium/Firefox seal read-only shared-memory snapshots with
 //! `F_SEAL_FUTURE_WRITE` after populating them.
 
-use alloc::{
-    borrow::Cow, collections::BTreeMap, format, string::String, sync::Arc, vec::Vec,
-};
-use core::{
-    sync::atomic::{AtomicU32, Ordering},
-    task::Context,
-};
+use alloc::{borrow::Cow, collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use ax_fs_ng::vfs::FileFlags;
 use ax_io::{IoBuf, SeekFrom, prelude::*};
@@ -41,8 +36,8 @@ use super::{File, FileLike, IoDst, IoSrc, Kstat, get_file_like};
 use crate::{
     StarryError, StarryResult,
     mm::{
-        AddrSpace, AddressSpaceId, MappingOperation, SharedFileMappingLease,
-        SharedFileVmaRecord, is_address_space_live,
+        AddrSpace, AddressSpaceId, MappingOperation, SharedFileMappingLease, SharedFileVmaRecord,
+        is_address_space_live,
     },
     sync::Mutex,
 };
@@ -263,18 +258,15 @@ fn memfd_from_shared_writable_area(area: &SharedFileVmaRecord) -> Option<Arc<Mem
     memfd_from_shared_file(&area.file)
 }
 
-fn apply_shared_writable_count_delta(
-    memfd: &Memfd,
-    mm_id: AddressSpaceId,
-    delta: i32,
-) {
+fn apply_shared_writable_count_delta(memfd: &Memfd, mm_id: AddressSpaceId, delta: i32) {
     let mut mappings = memfd.shared_writable_mmaps.lock();
     if delta > 0 {
         let count = mappings.entry(mm_id).or_default();
         let add = delta as u32;
         let Some(next) = count.checked_add(add) else {
             warn!(
-                "memfd shared writable VMA count overflow for mm {} (cur={}, add={add}); retaining saturated busy state",
+                "memfd shared writable VMA count overflow for mm {} (cur={}, add={add}); \
+                 retaining saturated busy state",
                 mm_id.get(),
                 *count
             );
@@ -293,7 +285,8 @@ fn apply_shared_writable_count_delta(
         };
         if *count < sub {
             warn!(
-                "memfd shared writable VMA count underflow for mm {} (cur={}, sub={sub}); leaving count unchanged",
+                "memfd shared writable VMA count underflow for mm {} (cur={}, sub={sub}); leaving \
+                 count unchanged",
                 mm_id.get(),
                 *count
             );
@@ -323,9 +316,7 @@ pub(crate) fn apply_shared_writable_deltas(deltas: &[SharedWritableDelta]) {
     }
 }
 
-pub fn check_write_seal_for_shared_file_backend(
-    file: &SharedFileMappingLease,
-) -> StarryResult {
+pub fn check_write_seal_for_shared_file_backend(file: &SharedFileMappingLease) -> StarryResult {
     let Some(memfd) = memfd_from_shared_file(file) else {
         return Ok(());
     };
@@ -591,8 +582,13 @@ impl FileLike for Memfd {
         self.inner.file_mmap()
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> StarryResult<usize> {
-        self.inner.ioctl(cmd, arg)
+    fn ioctl(
+        &self,
+        current: &crate::task::UserTaskRef,
+        cmd: u32,
+        arg: usize,
+    ) -> crate::StarryResult<usize> {
+        self.inner.ioctl(current, cmd, arg)
     }
 
     fn open_flags(&self) -> u32 {
@@ -633,7 +629,19 @@ impl Pollable for Memfd {
         self.inner.poll()
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        self.inner.register(context, events);
+    unsafe fn register_shared(
+        &self,
+        sink: &mut dyn axpoll::SharedRegistrationSink,
+        events: IoEvents,
+    ) {
+        unsafe { self.inner.register_shared(sink, events) };
+    }
+
+    unsafe fn register_exclusive(
+        &self,
+        sink: &mut dyn axpoll::ExclusiveRegistrationSink,
+        events: IoEvents,
+    ) {
+        unsafe { self.inner.register_exclusive(sink, events) };
     }
 }
