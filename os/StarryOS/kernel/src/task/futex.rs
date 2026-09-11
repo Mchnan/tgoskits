@@ -541,10 +541,16 @@ impl WaitQueue {
     }
 
     fn push_wake(wakes: &mut WakeBatch, waiter: Waiter) {
-        assert!(
-            wakes.push(waiter.wake),
-            "one futex wait generation cannot enter two live wake batches"
-        );
+        // `mark_woken` selects each wait generation exactly once, but the
+        // selected thread may still be linked in an earlier undrained batch:
+        // it can observe a timeout or interrupt, finish that generation, and
+        // queue a new one before the first waker reaches `wake_all`. That
+        // earlier batch still performs the scheduler wake — wakes are scoped
+        // to the thread, not the generation — so the new park receives it as
+        // a spurious wakeup, which the futex recheck protocol tolerates.
+        // Coalesce duplicates exactly like Linux `wake_q` and the PI graph;
+        // treating "already linked" as a bug here panics desktop workloads.
+        let _selected = wakes.push(waiter.wake);
     }
 
     /// Wakes up at most `count` tasks whose bitset intersects with the given
@@ -1511,6 +1517,175 @@ fn park_notification_rechecks_condition_for_test() -> bool {
         && !park_disposition_requires_condition_recheck(CurrentParkDisposition::BlockedAndResumed)
 }
 
+/// Regression for the desktop-workload panic "one futex wait generation
+/// cannot enter two live wake batches".
+///
+/// The hazard needs a real parked [`UserTaskRef`], so the test assembles one
+/// through [`crate::task::prepare_user_thread`] and drives the interleaving
+/// from two kernel threads:
+///
+/// 1. The waiter parks in [`WaitQueue::wait_if`] with a short deadline.
+/// 2. The waker selects it into wake batch `first` (`mark_woken` transitions
+///    the wait generation to `WAIT_WOKEN`) and deliberately does **not**
+///    drain `first` — exactly the window between a domain unlock and
+///    `wake_all`.
+/// 3. The waker then waits for the waiter's *next* wait generation to appear
+///    (the current one can only return through its deadline while its
+///    selection is undrained) and selects the same thread again into
+///    `second`.
+///
+/// Under the previous `assert!`, step 3 panicked whenever `first` still held
+/// the link. With coalescing, the duplicate is dropped, `first` still
+/// performs the scheduler wake, and the futex recheck protocol observes the
+/// tolerated spurious wakeup. The waker counts coalesced selections so the
+/// test proves the racing path was exercised rather than merely survived.
+#[cfg(axtest)]
+fn requeued_waiter_coalesces_with_undrained_batch_for_test() -> bool {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use starry_signal::SignalSet;
+
+    use crate::task::{
+        PidReservation, PidReservationKind, ROOT_PID_NS, Tgid, Tid, new_test_process_data,
+    };
+
+    const MASK: u32 = 1;
+    const WAKE_ROUNDS: usize = 32;
+    const WAITER_MAX_WAITS: usize = 2 * WAKE_ROUNDS + 8;
+    const WAIT_MICROS: u64 = 200;
+    const MAX_SPINS: usize = 4_000_000;
+
+    // The waiter becomes a schedulable task, so its identity must be visible
+    // from the kernel-root namespace exactly like the init task assembled in
+    // `entry.rs`; a fresh test namespace would leave `Thread::new` without a
+    // root binding.
+    let reservation = PidReservation::reserve(&ROOT_PID_NS, PidReservationKind::ProcessLeader)
+        .expect("test PID reservation");
+    let identity = reservation.publish().expect("test PID publication");
+    let tgid = identity.acquire_role::<Tgid>().expect("test TGID role");
+    let proc_data = new_test_process_data(Arc::clone(&identity), tgid);
+    let tid = identity.acquire_role::<Tid>().expect("test TID role");
+    let thread = crate::task::Thread::new(
+        identity,
+        tid,
+        proc_data,
+        None,
+        SignalSet::default(),
+        scope_local::Scope::new(),
+    );
+
+    let queue = Arc::new(WaitQueue::new());
+    let failed = Arc::new(AtomicBool::new(false));
+    let waker_done = Arc::new(AtomicBool::new(false));
+    let waiter_done = Arc::new(AtomicBool::new(false));
+    let coalesced = Arc::new(AtomicUsize::new(0));
+
+    let waiter_queue = Arc::clone(&queue);
+    let waiter_waker_done = Arc::clone(&waker_done);
+    let waiter_done_for_waiter = Arc::clone(&waiter_done);
+    let waiter = move || {
+        let task = crate::task::current_user_task();
+        for _ in 0..WAITER_MAX_WAITS {
+            if waiter_waker_done.load(Ordering::Acquire) {
+                break;
+            }
+            // `ETIMEDOUT` and scheduler notifications are expected here — the
+            // independent deadline resume is precisely what re-queues a fresh
+            // generation while the waker still holds the undrained batch. Any
+            // error result just means "loop and queue again".
+            let _ = waiter_queue.wait_if(
+                &task,
+                MASK,
+                Some(core::time::Duration::from_micros(WAIT_MICROS)),
+                || true,
+            );
+            crate::task::yield_now();
+        }
+        crate::task::yield_now();
+        waiter_done_for_waiter.store(true, Ordering::Release);
+    };
+
+    let waker_queue = Arc::clone(&queue);
+    let waker_failed = Arc::clone(&failed);
+    let waker_coalesced = Arc::clone(&coalesced);
+    let waker_done_for_waker = Arc::clone(&waker_done);
+    let waker = move || {
+        let mut spins;
+        for _ in 0..WAKE_ROUNDS {
+            spins = 0;
+            while waker_queue.inner.lock().queue.is_empty() {
+                spins += 1;
+                if spins > MAX_SPINS || waker_failed.load(Ordering::Acquire) {
+                    waker_failed.store(true, Ordering::Release);
+                    return;
+                }
+                crate::task::yield_now();
+            }
+            let mut first = WakeBatch::new();
+            {
+                let mut inner = waker_queue.inner.lock();
+                WaitQueue::wake_locked(&mut inner.queue, 1, MASK, &mut first);
+            }
+            // Hold `first` undrained across the waiter's deadline re-queue.
+            spins = 0;
+            loop {
+                let queued = !waker_queue.inner.lock().queue.is_empty();
+                if queued {
+                    break;
+                }
+                spins += 1;
+                if spins > MAX_SPINS || waker_failed.load(Ordering::Acquire) {
+                    waker_failed.store(true, Ordering::Release);
+                    return;
+                }
+                crate::task::yield_now();
+            }
+            let mut second = WakeBatch::new();
+            {
+                let mut inner = waker_queue.inner.lock();
+                WaitQueue::wake_locked(&mut inner.queue, 1, MASK, &mut second);
+            }
+            if second.is_empty() {
+                waker_coalesced.fetch_add(1, Ordering::Release);
+            }
+            // Drain order mirrors a real unlock: the stale batch first, so
+            // the waiter sees the scheduler wake for its *previous* park.
+            first.wake_all();
+            second.wake_all();
+            crate::task::yield_now();
+        }
+        waker_done_for_waker.store(true, Ordering::Release);
+    };
+
+    let prepared = crate::task::prepare_user_thread(
+        waiter,
+        "futex-wakebatch-waiter".into(),
+        crate::config::KERNEL_STACK_SIZE,
+        thread,
+    )
+    .expect("failed to prepare waiter task");
+    let staged = prepared.stage().expect("failed to stage waiter task");
+    staged.with_task(|task| task.as_thread().attach_pid_task(task));
+    let _waiter_task = staged.activate();
+    let _waker_handle = crate::task::spawn_kernel_thread(
+        waker,
+        "futex-wakebatch-waker".into(),
+    );
+
+    // The kernel threads run to completion or hit a bounded spin; any panic
+    // inside `push_wake` aborts the kernel outright. Wait for both.
+    let mut polls = 0;
+    while !(waker_done.load(Ordering::Acquire) && waiter_done.load(Ordering::Acquire)) {
+        polls += 1;
+        if polls > MAX_SPINS || failed.load(Ordering::Acquire) {
+            return false;
+        }
+        crate::task::yield_now();
+    }
+    !failed.load(Ordering::Acquire) && coalesced.load(Ordering::Acquire) > 0
+}
+
 #[cfg(all(test, axtest))]
 mod axtests {
     use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
@@ -1547,6 +1722,11 @@ mod axtests {
     #[axtest::axtest]
     fn park_notification_rechecks_condition() {
         assert!(super::park_notification_rechecks_condition_for_test());
+    }
+
+    #[axtest::axtest]
+    fn requeued_waiter_coalesces_with_undrained_batch() {
+        assert!(super::requeued_waiter_coalesces_with_undrained_batch_for_test());
     }
     fn shared_offset(key: FutexKey) -> usize {
         match key {
