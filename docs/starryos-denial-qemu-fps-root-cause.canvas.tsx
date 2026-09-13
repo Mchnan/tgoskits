@@ -146,19 +146,29 @@ const stageRows: Array<{ tone: TableRowTone; cells: string[] }> = [
 // ---- budget bar chart ----
 
 function BudgetChart() {
+  const budgetLabels = ["raster p50", "raster p95", "deadline→ready p50", "ready→submit p95", "提交→呈现", "事件投递 p95", "60fps 预算"];
+  const budgetValues = [90.7, 127.6, 60, 5, 0.1, 1.9, 16.7];
   return (
-    <BarChart
-      title="动画期每帧分解 vs 60fps 预算（ms；raster 两根为 p50 与 p95 口径）"
-      series={[
-        { label: "llvmpipe raster p50", value: 90.7 },
-        { label: "llvmpipe raster p95", value: 127.6 },
-        { label: "deadline→ready 全段 p50", value: 60 },
-        { label: "ready→submit p95", value: 5 },
-        { label: "提交→呈现", value: 0.1 },
-        { label: "flip 事件投递 p95", value: 1.9 },
-        { label: "60fps 帧预算", value: 16.7 },
-      ]}
-    />
+    <Stack gap={8}>
+      <BarChart
+        title="动画期每帧分解 vs 60fps 预算（ms）"
+        labels={budgetLabels}
+        series={[
+          { label: "实测（ms）", data: budgetValues },
+        ]}
+      />
+      <Table
+        headers={["阶段", "ms", "口径"]}
+        rows={[
+          ["llvmpipe raster", "90.7 / 127.6", "p50 / p95"],
+          ["deadline→ready 全段", "60", "p50"],
+          ["ready→submit", "5", "p95"],
+          ["提交→呈现", "0.1", "均值"],
+          ["flip 事件投递", "1.9", "p95"],
+          ["60fps 帧预算", "16.7", "上限"],
+        ]}
+      />
+    </Stack>
   );
 }
 
