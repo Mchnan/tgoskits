@@ -44,7 +44,7 @@ const mileRows: Array<{ tone: TableRowTone }> = [
   { tone: "success" },
   { tone: "success" },
   { tone: "success" },
-  { tone: "warning" },
+  { tone: "success" },
 ];
 const mileRowsData: (string | JSX.Element)[][] = [
   [
@@ -80,7 +80,7 @@ const mileRowsData: (string | JSX.Element)[][] = [
   [
     "vulkaninfo 枚举 Apple M4",
     "PASS",
-    "GPU0: Virtio-GPU Venus (Apple M4)（vendorID 0x106b，DRIVER_ID_MESA_VENUS，mesa 26.2.2）；已知 teardown 挂死（DestroyRing 后 fence），summary 输出完整不受影响",
+    "GPU0: Virtio-GPU Venus (Apple M4)（vendorID 0x106b，DRIVER_ID_MESA_VENUS，mesa 26.2.2）；teardown 曾挂死（fence retire 缺口，已修复见下）",
   ],
   [
     "offscreen compute 渲染",
@@ -89,8 +89,8 @@ const mileRowsData: (string | JSX.Element)[][] = [
   ],
   [
     "ring-based fence retire",
-    "进行中",
-    "vkWaitForFences 5s 超时（work 已完成、读回已写好）；vulkaninfo teardown 挂死同根因：on_ring_seqno_update→sync queue→proxy retire_fence→QEMU→guest 通知链未通，Phase 2 前置修复",
+    "PASS",
+    "vkWaitForFences 从 5s 超时修复为 VK_SUCCESS（b056c0d1）：macOS 无 eventfd → virgl_renderer_init 剥离 THREAD_SYNC → client proxy 死配置；修复后 vulkaninfo teardown 也干净退出",
   ],
 ];
 
@@ -130,7 +130,7 @@ const patchRows: (string | JSX.Element)[][] = [
 
 const riskHeaders = ["问题", "影响", "现状 / 对策"];
 const riskRows: Array<{ tone: TableRowTone }> = [
-  { tone: "danger" },
+  { tone: "success" },
   { tone: "warning" },
   { tone: "warning" },
   { tone: "neutral" },
@@ -138,9 +138,9 @@ const riskRows: Array<{ tone: TableRowTone }> = [
 ];
 const riskRowsData: (string | JSX.Element)[][] = [
   [
-    "ring-based fence retire 链未通",
-    "vkWaitForFences 超时；vulkaninfo teardown 挂死",
-    "work 本身正常（读回已写好）；需排查 vkr on_ring_seqno_update → sync queue → proxy retire_fence → QEMU → guest 通知链在 render-server 多进程模式下的接线；Phase 2 前置修复",
+    "ring-based fence retire 链未通（已修复 b056c0d1）",
+    "vkWaitForFences 超时；vulkaninfo teardown 挂死 → 均已收敛",
+    "根因：macOS 无 eventfd，virgl_renderer_init 静默剥离 THREAD_SYNC，client proxy 落入「仅 ASYNC_FENCE_CB」上游死配置，sync 线程不建、shmem timeline 无人消费；修复：ASYNC_FENCE_CB 置位即建线程，无 eventfd 时 2ms 轮询 fence shmem，destroy 停线程不再依赖 eventfd；回归 WaitForFences=VK_SUCCESS + teardown 干净退出",
   ],
   [
     "HVF 下 1MB blob fallback 子区域非 16K 对齐",
@@ -215,7 +215,7 @@ const ghRows: (string | JSX.Element)[][] = [
   [
     "Mchnan/virglrenderer-darwin",
     <Code>darwin-venus</Code>,
-    "MAP_FIXED 失败回退 -EOPNOTSUPP（8107032）+ vkr ring 线程取证日志（vkr_ring_start/thread、DestroyRing、seqno 命令）",
+    "MAP_FIXED 失败回退 -EOPNOTSUPP（8107032）+ vkr ring 线程取证日志（c1f4e543）+ proxy 无 eventfd 时 fence retire 修复（b056c0d1）",
   ],
 ];
 
@@ -247,7 +247,7 @@ export default function VenusPhase1Status(): JSX.Element {
         </Card>
         <Card>
           <CardBody>
-            <Stat value="fence" label="retire 链待修（Phase 2 前置）" tone="warning" />
+            <Stat value="VK_SUCCESS" label="vkWaitForFences（fence retire 已修复）" tone="success" />
           </CardBody>
         </Card>
       </Grid>
@@ -344,10 +344,10 @@ export default function VenusPhase1Status(): JSX.Element {
         <CardHeader><H2>下一步</H2></CardHeader>
         <CardBody>
           <Stack gap={8}>
-            <Text>1. 修复 ring-based fence retire 通知链（Phase 2 前置）：定位 on_ring_seqno_update → sync queue → proxy retire_fence → QEMU 的断点；</Text>
+            <Text>1. ✅ fence retire 通知链已修复（virglrenderer b056c0d1）：macOS 无 eventfd → virgl_renderer_init 剥离 THREAD_SYNC → client proxy 死配置；ASYNC_FENCE_CB 置位即建 sync 线程 + 2ms shmem 轮询兜底；</Text>
             <Text>2. Phase 2 立项：StarryOS card0 增加 VIRTGPU_* 3D ioctl 族（GETPARAM/GET_CAPS/BLOB/MAP/CONTEXT_INIT/EXECBUFFER）+ hostmem BAR 用户态映射；</Text>
             <Text>3. deniald 集成（Phase 3）：Flutter/Impeller 检测 Vulkan ICD 后切 Impeller-Vulkan，用「动画 + 即取 dd.log 审计」对比 raster_avg_us；</Text>
-            <Text>4. 推送 qemu/virglrenderer darwin-venus 新提交到 GitHub fork 备份。</Text>
+            <Text>4. 上游化评估：proxy 无 eventfd 修复对 Linux 无行为变化，可考虑提交 freedesktop 上游。</Text>
           </Stack>
         </CardBody>
       </Card>

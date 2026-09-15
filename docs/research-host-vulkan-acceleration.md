@@ -1,6 +1,7 @@
 # 调研：macOS 宿主 Vulkan 渲染加速（denial 桌面帧率下一手）
 
-状态：2026-09-14 调研定稿；2026-09-15 Phase 1 端到端实测通过（见 §6）。
+状态：2026-09-14 调研定稿；2026-09-15 Phase 1 端到端实测通过（见 §6），
+同日修复 fence retire 缺口（§6.5），Phase 2 前置条件全部就绪。
 背景：`local/dev-desktop-0913` 验证栈已终锤帧率根因——动画期 Dart 帧审计 `raster_avg≈87–127ms`
 （guest 内 llvmpipe 软件光栅化，占帧生产 97%），内核全链 <10ms 无责。下一手是
 **宿主 GPU 加速**：把 guest 的 3D 渲染转发到宿主 GPU（M4 的 Metal），即 virtio-gpu 3D 加速
@@ -222,18 +223,36 @@ virtio-gpu-gl.c 无头降级、ui/console.c dpy_gl_* NULL 容忍）。
   （pull/ 目录）。
 - 探针/wget 挂前台时后续命令只是回显不执行：先发 `\x03`（SIGINT）解堵再注入。
 
-### 6.5 新缺口：ring-based fence retire 链未通
+### 6.5 新缺口：ring-based fence retire 链未通 → 已修复（2026-09-15）
 
 `vkWaitForFences` 5s 超时（探针实测），与 vulkaninfo teardown 挂死同族：ring 命令
-**执行**正常（读回数据已写好），但 fence 的 retire 通知（vkr 的
-`on_ring_seqno_update` → sync queue → proxy `retire_fence` → QEMU → guest IRQ 链）
-没有抵达 guest。影响：依赖 fence/同步语义的负载（deniald 的 per-frame fence）会挂。
-Phase 2 立项前需修：优先排查 vkr sync queue 的 fence retire 通知路径在
-render-server（多进程）模式下的接线（单进程 vtest 模式不受影响）。
+**执行**正常（读回数据已写好），但 fence 的 retire 通知没有抵达 guest。
+
+**根因（2026-09-15 定锤，两层叠加）**：
+
+1. **macOS 无 eventfd**：`virgl_util.c` 的 `create_eventfd` 在 `HAVE_EVENTFD_H`
+   未定义时恒返回 -1；`virgl_renderer_init` 又会因 `has_eventfd()==false`
+   **静默剥离 QEMU 传来的 `VIRGL_RENDERER_THREAD_SYNC`**（"a hint and can be
+   silently ignored"）。于是 client proxy 只剩 `ASYNC_FENCE_CB`——上游代码里
+   这是一个死配置：`proxy_context_init_fencing` 见无 THREAD_SYNC 直接 return，
+   sync 线程不创建，而同步 `retire_fences` 路径又被
+   `assert(!ASYNC_FENCE_CB)` + `virgl_context_foreach_retire_fences` 的
+   capset 守卫双重排除，**fence 在 client 侧永远无人退休**（render server
+   进程内 vkr sync 线程正常退休，但 proxy 协议的 shmem timeline 无人轮询）。
+2. **链路事实核查**（插桩 + QEMU trace 定位）：guest 内核确实发出
+   `CONTEXT_CREATE_FENCE`（fence_ctrl trace）、server 侧 vkr submit_fence/
+   queue_sync_retire 正常执行，断点精确落在「server `render_context_update_timeline`
+   写共享内存+eventfd → client 无人消费」一环。
+
+**修复**（virglrenderer `b056c0d1`，proxy_context.c）：`ASYNC_FENCE_CB` 置位即创建
+sync 线程；线程在 eventfd 存在时等 eventfd（Linux 行为不变），否则以 2ms 周期
+轮询 fence shmem timeline；context destroy 不再以 eventfd 存在为线程停止/_join
+的前提。回归：探针 `vkWaitForFences: VK_SUCCESS`、fence_ctrl/fence_resp 完整往返、
+vulkaninfo --summary 干净退出（teardown 不再挂死）、读回 4/4 不变。
 
 ### 6.6 结论
 
 Phase 1 核心目标达成：**guest mesa venus ICD → QEMU virtio-gpu-gl(venus) → 宿主
 virglrenderer render server → MoltenVK → Apple M4 Metal** 全链打通，compute 渲染
-+ host memory 回读可验证。Phase 2（StarryOS card0 增 VIRTGPU_* 3D ioctl 族 +
-hostmem BAR 映射）的前提条件全部就绪，外加一项前置修复（§6.5 fence retire）。
++ host memory 回读可验证，fence 同步语义已修复（§6.5）。Phase 2（StarryOS card0
+增 VIRTGPU_* 3D ioctl 族 + hostmem BAR 映射）的前提条件全部就绪。
