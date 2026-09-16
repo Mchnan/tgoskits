@@ -136,23 +136,23 @@ const verifyRows: (string | JSX.Element)[][] = [
 
 // ---- 遗留 ----
 const todoHeaders = ["方向", "说明"];
-const todoTones: Array<TableRowTone | undefined> = ["warning", "warning", "warning", "neutral"];
+const todoTones: Array<TableRowTone | undefined> = ["success", "warning", "warning", "neutral"];
 const todoRows: (string | JSX.Element)[][] = [
+  [
+    "SET_SCANOUT_BLOB 接 KMS present",
+    "Phase 3 已闭环（2026-09-16）：card0 present 按 fb backing 分流，blob fb 走 SET_SCANOUT_BLOB 零拷贝 scanout、dumb fb 保持 memcpy + 2D 重绑；E2E 探针 15 组 + 宿主 screendump 像素级校验双 PASS（研究文档 §8）",
+  ],
+  [
+    "deniald 集成（Phase 4）",
+    "rootfs 装 Alpine edge mesa-vulkan-virtio（venus ICD）；Flutter Impeller-Vulkan 走 /dev/dri/card0 的 VIRTGPU_* 面 + Phase 3 scanout 上屏；raster_avg 目标 87–127ms → <5ms",
+  ],
   [
     "fence 异步唤醒",
     "当前 single-flight 同步语义：fence 在 ioctl 返回时视为 signaled，vkWaitForFences 语义正确但 GPU 并行度未打开；下一步 async submit + 内核事件队列唤醒（poll 基建已在）",
   ],
   [
-    "SET_SCANOUT_BLOB 接 KMS present",
-    "venus-only 设备无 2D 面；denial 桌面上屏需要把 card0 的 present 路径接到 3D blob 资源（DMA-BUF 导出链）——Phase 3 核心",
-  ],
-  [
-    "deniald 集成",
-    "rootfs 装 Alpine edge mesa-vulkan-virtio（venus ICD）；Flutter Impeller-Vulkan 走 /dev/dri/card0 的 VIRTGPU_* 面；raster_avg 目标 87–127ms → <5ms",
-  ],
-  [
-    "GUEST blob / EVENTFD",
-    "GUEST/HOST3D_GUEST（guest backing attach）Phase 3 再说；SYNCOBJ_EVENTFD 保持 ENOSYS 是诚实语义（见 §6.5 fence 分析）",
+    "GUEST blob / EVENTFD / PRIME",
+    "GUEST/HOST3D_GUEST（guest backing attach）延后；SYNCOBJ_EVENTFD 保持 ENOSYS 是诚实语义（见 §6.5 fence 分析）；PRIME 导出 blob handle / DMA-BUF 链延后（compositor 直连 SET_SCANOUT_BLOB 不需要）",
   ],
 ];
 

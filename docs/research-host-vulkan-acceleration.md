@@ -342,3 +342,94 @@ aarch64 target 手工匹配参数）。
 - deniald 集成验证（Phase 3）：rootfs 需 Alpine edge 的
   `mesa-vulkan-virtio`（venus ICD），Flutter Impeller-Vulkan 走
   `/dev/dri/card0` 的 VIRTGPU_* 面。
+
+## 8. Phase 3 实测结果（2026-09-16，SET_SCANOUT_BLOB 接 KMS present 端到端 PASS）
+
+### 8.1 交付物（本仓库两个改动面）
+
+1. **新 crate `drivers/gpu/virtio-gpu`**：控制面补
+   `CMD_SET_SCANOUT_BLOB (0x010d)`（`SetScanoutBlob` wire 结构，96 字节
+   布局断言）+ `VIRTIO_GPU_FORMAT_*` 常量；`VirtioGpu3D` trait 新增
+   `set_scanout_blob` / `bind_2d_scanout` / `disable_scanout` 三个同步
+   命令（scanout 命令无 fence，同步往返安全）。
+2. **starry-kernel card0**：KMS present 路径按 fb backing 分流——
+   `Framebuffer` 增 `FbBacking::{Dumb, Blob}`，`ADDFB2` 的 GEM handle
+   先查 dumb 表、再查 vgpu blob 表（blob fb 记录 res_handle/几何/格式）；
+   `present_fb` 的 blob 分支发 `SET_SCANOUT_BLOB`（零拷贝：宿主 surface
+   直接引用 blob 内存，无 memcpy 无 flush），dumb 分支保持 memcpy + 若
+   blob scanout 曾活跃则先 `bind_2d_scanout` 重绑 2D 资源（混合 2D+3D
+   设备的表面恢复语义）；`reset_kms_state` 在资源拆除前先
+   `disable_scanout`。修 Phase 2 遗留 bug：blob mmap key 由 +1 递增改为
+   `PAGE_SIZE_4K` 步进（`sys_mmap` 硬性要求文件偏移页对齐，第二个及以后
+   的 blob 一律 EINVAL，Phase 2 只 map 一个 blob 所以没暴露）；线上
+   blob 尺寸向上取整到 16 KiB（`BAR_SLOT_ALIGN`，见 §8.3 第 3 条）。
+3. 探针 `tmp/vgpu-probe/vgprobe.c` 扩到 15 组（含 4 个负例：关柄
+   ADDFB2、小于几何 ADDFB2、伪造 handle、垃圾 EXECBUFFER），host 侧
+   校验 `tmp/vgpu-probe/scanout-check.py` 盯 console.log 的 MARKER 行、
+   HMP `screendump` 抓 QEMU console surface 并逐像素比对 guest 写入
+   blob 的图案。
+
+### 8.2 端到端验证（venus QEMU + StarryOS，HVF）
+
+- `=== VGPROBE PASS ===`（全步绿）：3D 面 21 步 + scanout 段——
+  RESOURCE_CREATE_BLOB(640×480×4) → MAP → mmap BAR 直写渐变图案 →
+  ADDFB2(blob handle) → SETCRTC → `CRTC_GET_SEQUENCE active=1` →
+  MARKER₁ → RESOURCE_CREATE_BLOB(B) → PAGE_FLIP(A→B) → MARKER₂ →
+  RMFB/GEM_CLEAN 双 blob → 垃圾 EXECBUFFER（文档化：vkr 对未知
+  venus opcode 报 CS error 并拆 context 连接，之后只允许 guest 本地
+  步骤）→ TIMELINE_WAIT 语义复查 → 收尾清理。
+- `=== SCANOUT-CHECK PASS ===`：宿主 `screendump` 像素级比对——
+  SETCRTC 后 console surface 呈现 guest 写入 blob A 的渐变（5 个探针
+  点逐一匹配 `(r,g,b)=(x·255/639, y·255/479, 0x40)`），PAGE_FLIP 后
+  呈现 blob B 的纯品红（4 点匹配）。guest 用户态 mmap BAR 写入 →
+  guest 物理内存 → EPT → 渲染器/surface 同一块宿主页，全程零拷贝
+  得到字节级证明。
+- 回归：grouped `qemu/system` 全绿（dumb 路径不变，blob fb 只在
+  VIRTGPU_* 面存在时可达）；clippy（virtio-gpu + starry-kernel 板卡
+  特性 aarch64）/fmt 全绿。
+
+### 8.3 本轮踩掉的四个坑（复现必读）
+
+1. **HVF EPT 陈旧（最深的一坑）**：virgl 的 `MAP_FIXED` 快路径在 QEMU
+   的 hostmem RAM 区块底下用 `mmap(MAP_FIXED)` 换页，hvf 内存监听器
+   无感知 → EPT 仍指向旧匿名页 → guest BAR 写进孤儿页、渲染器与
+   surface 读到全零（KVM 上游无此问题：mmu_notifier 兜底；Phase 1 端
+   到端能通是因为跑的 TCG 软 MMU）。修复：darwin fork 禁用 MAP_FIXED
+   快路径，恒走 `virgl_renderer_resource_map` + MR 子区域
+   （`add_subregion_overlap`），让内存监听器每次映射/解映射都更新
+   stage-2——与 Linux 上游 fallback 语义一致。
+2. **shm fd 被当 dmabuf**：proxy 架构下 `virgl_renderer_resource_get_info`
+   返回的 `info.fd` 对 venus blob 是 **shm fd（≥0）**，QEMU 把它存进
+   `res->base.dmabuf_fd`，导致「dmabuf_fd<0 才回退」的条件永不成立，
+   命令落进 darwin stub `update_dmabuf`（返回 0 假成功）→ console 一直是
+   "Display output is not active." 占位 surface。修复：非 GL console
+   无条件走 pixman 直显路径（map = MR ram_ptr），GL console 保持
+   Linux dmabuf 语义。
+3. **blob 尺寸 16 KiB 对齐**：宿主页 16K，`RESOURCE_MAP_BLOB` 的 MR
+   子区域尺寸 = blob 原始尺寸；`0x21000`（8.25×16K）这类 4K 对齐尺寸
+   会让 hvf 监听器切出的 subsection 不对齐而被
+   `accel/hvf` 的 skip-guard 跳过 → 该 gpa 段 EPT 缺失 → guest 首次
+   BAR 访问卡死。修复：驱动把线上 blob 尺寸与 BAR slot 统一向上取整
+   到 16 KiB（渲染器 shm 本就按宿主页向上取整，语义安全）。
+4. **验证工具链三坑**：(a) `debugfs rm` 后 `write` 复用 extent 会产出
+   截断镜像（必须 `kill_file`+`unlink`+`write` 且 dump 逐字节校验）；
+   (b) guest 运行中改 rootfs 镜像 = 无效注入 + unmount 时缓存写回覆盖，
+   必须「关机→注入→校验→开机」；(c) holder 的 ctl 处理线程与 reader
+   线程竞争同一串口 socket，探针前 7s 输出（含 MARKER₁）被 ctl 响应
+   窗口吃掉——校验器必须盯 QEMU chardev `logfile`（console.log）而非
+   holder 的 live.log，且 marker 匹配必须带日志偏移量基线（否则历史
+   轮次的 marker 秒匹配造成假证据）。
+
+### 8.4 遗留与下一步
+
+- **deniald venus ICD 集成（Phase 4）**：rootfs 装 Alpine edge
+  `mesa-vulkan-virtio`，Flutter Impeller-Vulkan 走 card0 的
+  VIRTGPU_* 面 + 本 Phase 的 blob scanout 上屏；链路两端已各自闭环。
+- fence 异步唤醒（GPU 并行度）与 GUEST/HOST3D_GUEST blob 仍是
+  Phase 2 遗留（§7.4），优先级让位于 Phase 4。
+- PRIME 导出 blob handle / DMA-BUF 导出链未做：SET_SCANOUT_BLOB 直接
+  吃 resource id，compositor 直连路径不需要 dma-buf；跨进程共享场景
+  未来再补。
+- 混合 2D+3D 设备的 blob↔dumb 表面切换已实现（`bind_2d_scanout` 重
+  绑），但仅在 3D-only 设备上验证过；2D 存在时的行为等价 Linux 的
+  set_scanout 语义，待有 2D+3D 组合的宿主环境再实测。
