@@ -27,7 +27,7 @@ use core::{
 };
 
 use bitflags::bitflags;
-use bytemuck::{Pod, bytes_of, try_from_bytes};
+use bytemuck::{Pod, Zeroable, bytes_of, try_from_bytes};
 use spinning_top::Spinlock;
 use virtio_drivers::{
     BufferDirection, Error as VirtIoError, Hal, PhysAddr,
@@ -35,7 +35,7 @@ use virtio_drivers::{
     transport::{InterruptStatus, Transport},
 };
 
-use crate::{BlobParams, VirtioGpu3D, protocol::*};
+use crate::{BlobParams, ScanoutBlobParams, VirtioGpu3D, protocol::*};
 
 /// Control virtqueue depth. Indirect descriptors let each command chain
 /// occupy a single slot, so this bounds the number of in-flight (fenced)
@@ -885,6 +885,59 @@ impl<H: Hal, T: Transport> VirtioGpu3D for VirtioGpuDevice<H, T> {
             inner.request_with_payload(&req, cmd)?;
         }
         Ok(())
+    }
+
+    fn set_scanout_blob(&self, params: ScanoutBlobParams) -> Result<(), Gpu3DError> {
+        let req = SetScanoutBlob {
+            header: CtrlHeader::with_type(CMD_SET_SCANOUT_BLOB),
+            rect: Rect {
+                x: params.x,
+                y: params.y,
+                width: params.scanout_width,
+                height: params.scanout_height,
+            },
+            scanout_id: params.scanout_id,
+            resource_id: params.res_id,
+            width: params.width,
+            height: params.height,
+            format: params.format,
+            padding: 0,
+            strides: [params.stride, 0, 0, 0],
+            offsets: [params.offset, 0, 0, 0],
+        };
+        let mut inner = self.inner.lock();
+        let rsp: CtrlHeader = inner.request(&req)?;
+        check_ok(&rsp)
+    }
+
+    fn bind_2d_scanout(&self) -> Result<(), Gpu3DError> {
+        let rect = { self.inner.lock().rect }.ok_or(Gpu3DError::NO_DEVICE)?;
+        let mut inner = self.inner.lock();
+        let rsp: CtrlHeader = inner.request(&SetScanout {
+            header: CtrlHeader::with_type(CMD_SET_SCANOUT),
+            rect,
+            scanout_id: SCANOUT_ID,
+            resource_id: RESOURCE_ID_FB,
+        })?;
+        check_ok(&rsp)
+    }
+
+    fn disable_scanout(&self, scanout_id: u32) -> Result<(), Gpu3DError> {
+        let req = SetScanoutBlob {
+            header: CtrlHeader::with_type(CMD_SET_SCANOUT_BLOB),
+            rect: Rect::zeroed(),
+            scanout_id,
+            resource_id: 0,
+            width: 0,
+            height: 0,
+            format: 0,
+            padding: 0,
+            strides: [0; 4],
+            offsets: [0; 4],
+        };
+        let mut inner = self.inner.lock();
+        let rsp: CtrlHeader = inner.request(&req)?;
+        check_ok(&rsp)
     }
 }
 

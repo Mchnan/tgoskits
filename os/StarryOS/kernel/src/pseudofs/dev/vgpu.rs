@@ -39,7 +39,9 @@ use ax_alloc::GlobalPage;
 use ax_memory_addr::PAGE_SIZE_4K;
 use bytemuck::{AnyBitPattern, NoUninit};
 
-use super::drm::{DRM_TYPE, iow, iowr};
+use super::drm::{
+    DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DRM_TYPE, iow, iowr,
+};
 use crate::{
     mm::{vm_load, vm_write_slice},
     sync::Mutex,
@@ -287,8 +289,21 @@ const MAX_RINGS: u32 = 64;
 
 /// mmap offset keys for host-visible blobs start here so they can never
 /// collide with the dumb-buffer offset keys (an 8 MiB stride counter
-/// would need ~131k live allocations to reach this range).
+/// would need ~131k live allocations to reach this range). Keys are
+/// handed out page-strided: the mmap file offset must be page-aligned
+/// (`sys_mmap` rejects unaligned offsets with EINVAL), and the key *is*
+/// the file offset for blob mappings.
 pub(crate) const BLOB_MMAP_KEY_BASE: u64 = 1 << 40;
+/// Stride between consecutive blob mmap keys (`sys_mmap` requires the
+/// file offset to be `PAGE_SIZE_4K`-aligned).
+const BLOB_MMAP_KEY_STRIDE: u64 = PAGE_SIZE_4K as u64;
+/// Guest-visible granularity of the hostmem BAR. Slots and the wire
+/// (host-side) blob size are aligned to this: the macOS host backs QEMU
+/// with 16 KiB pages, and a sub-16K-aligned hostmem subsection makes the
+/// hvf memory listener skip the EPT mapping (stalling the guest on the
+/// first BAR access). The tail between `size` and the rounded wire size
+/// is unused padding on the guest side.
+const BAR_SLOT_ALIGN: u64 = 0x4000;
 
 /// A blob resource's host-visible mapping.
 struct BlobMapping {
@@ -598,6 +613,10 @@ impl VgpuCard {
         };
 
         let res_id = self.next_res_id.fetch_add(1, Ordering::Relaxed);
+        // The wire size is rounded up to the BAR slot granularity so the
+        // host-side subregion (and every EPT subsection the hvf listener
+        // derives from it) stays 16 KiB-aligned; see [`BAR_SLOT_ALIGN`].
+        let wire_size = args.size.max(1).div_ceil(BAR_SLOT_ALIGN) * BAR_SLOT_ALIGN;
         dev.resource_create_blob(
             ax_driver::vgpu::BlobParams {
                 ctx_id: ctx.ctx_id,
@@ -605,7 +624,7 @@ impl VgpuCard {
                 blob_mem: args.blob_mem,
                 blob_flags: args.blob_flags,
                 blob_id: args.blob_id,
-                size: args.size,
+                size: wire_size,
             },
             &init_cmd,
         )
@@ -620,7 +639,7 @@ impl VgpuCard {
                 let _ = dev.resource_unref(res_id);
                 return Err(VfsError::InvalidInput);
             };
-            match self.reserve_bar_slot(hostmem.length, args.size) {
+            match self.reserve_bar_slot(hostmem.length, wire_size) {
                 Ok(bar_offset) => match dev.map_blob(res_id, bar_offset) {
                     Ok(map_info) => Some(BlobMapping {
                         phys: hostmem.phys_base + bar_offset,
@@ -645,7 +664,9 @@ impl VgpuCard {
 
         let bo_handle = self.next_bo_handle.fetch_add(1, Ordering::Relaxed);
         if let Some(m) = map.as_mut() {
-            m.mmap_key = self.next_mmap_key.fetch_add(1, Ordering::Relaxed);
+            m.mmap_key = self
+                .next_mmap_key
+                .fetch_add(BLOB_MMAP_KEY_STRIDE, Ordering::Relaxed);
         }
 
         self.resources.lock().insert(
@@ -831,6 +852,36 @@ impl VgpuCard {
                 .filter(|m| m.mmap_key == offset)
                 .map(|m| (m.phys, m.size, m.map_info))
         })
+    }
+
+    // ---- KMS present side (blob scanout) ----
+
+    /// Resolves a GEM handle to a 3D blob resource for the KMS side:
+    /// `(res_handle, blob_size)` when `bo_handle` names a blob, `None`
+    /// for dumb-buffer handles (card0 handles those directly).
+    pub(crate) fn lookup_blob(&self, bo_handle: u32) -> Option<(u32, u64)> {
+        let resources = self.resources.lock();
+        resources.get(&bo_handle).map(|res| (res.res_handle, res.size))
+    }
+
+    /// Displays a blob resource on the host scanout — the zero-copy KMS
+    /// present path. The host references the blob's backing memory in
+    /// place, so guest writes to the mapped resource are visible without
+    /// any transfer command.
+    pub(crate) fn set_scanout_blob(&self, params: ax_driver::vgpu::ScanoutBlobParams) -> VfsResult {
+        self.dev()?.set_scanout_blob(params).map_err(vfs_err)
+    }
+
+    /// Stops displaying the blob bound to the scanout (client released
+    /// the scanned-out fb / last card0 fd closed).
+    pub(crate) fn disable_scanout(&self) -> VfsResult {
+        self.dev()?.disable_scanout(0).map_err(vfs_err)
+    }
+
+    /// Restores the 2D scanout surface after a blob scanout replaced it,
+    /// so a dumb-buffer present is visible again on mixed 2D+3D devices.
+    pub(crate) fn bind_2d_scanout(&self) -> VfsResult {
+        self.dev()?.bind_2d_scanout().map_err(vfs_err)
     }
 
     // ---- syncobj family ----
@@ -1043,8 +1094,7 @@ impl VgpuCard {
     /// address space on churn but keeps the lifecycle trivially correct
     /// (hostmem regions are sized generously for exactly this reason).
     fn reserve_bar_slot(&self, region_len: u64, size: u64) -> VfsResult<u64> {
-        const ALIGN: u64 = 0x4000;
-        let size = size.max(1).div_ceil(ALIGN) * ALIGN;
+        let size = size.max(1).div_ceil(BAR_SLOT_ALIGN) * BAR_SLOT_ALIGN;
         loop {
             let cur = self.next_bar_offset.load(Ordering::Acquire);
             let next = cur.checked_add(size).ok_or(VfsError::InvalidInput)?;
@@ -1063,6 +1113,19 @@ impl VgpuCard {
 }
 
 // ---- small helpers ----
+
+/// Maps a DRM fourcc onto the `VIRTIO_GPU_FORMAT_*` value the
+/// `SET_SCANOUT_BLOB` command carries; `None` for formats the 3D scanout
+/// path cannot display. The B8G8R8* values are the memory-order matches
+/// for DRM's little-endian fourccs (same table as the Linux virtio-gpu
+/// driver); the X8R8G8B8/A8R8G8B8 spellings have the opposite byte order.
+pub(crate) fn virtio_format_of(drm: u32) -> Option<u32> {
+    match drm {
+        DRM_FORMAT_XRGB8888 => Some(ax_driver::vgpu::FORMAT_B8G8R8X8_UNORM),
+        DRM_FORMAT_ARGB8888 => Some(ax_driver::vgpu::FORMAT_B8G8R8A8_UNORM),
+        _ => None,
+    }
+}
 
 fn process_key(current: &UserTaskRef) -> u64 {
     current.as_thread().proc_data.identity().id().get()

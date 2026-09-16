@@ -34,9 +34,10 @@ use alloc::sync::Arc;
 pub use device::{Gpu3DError, Gpu3DInfo, HostMemRegion, VirtioGpuDevice};
 pub use protocol::{
     BLOB_FLAG_USE_CROSS_DEVICE, BLOB_FLAG_USE_MAPPABLE, BLOB_FLAG_USE_SHAREABLE, BLOB_MEM_GUEST,
-    BLOB_MEM_HOST3D, BLOB_MEM_HOST3D_GUEST, CAPSET_VENUS, MAP_CACHE_CACHED, MAP_CACHE_MASK,
-    PARAM_3D_FEATURES, PARAM_BLOB_ALIGNMENT, PARAM_CAPSET_QUERY_FIX, PARAM_CONTEXT_INIT,
-    PARAM_CROSS_DEVICE, PARAM_HOST_VISIBLE, PARAM_SUPPORTED_CAPSET_IDS,
+    BLOB_MEM_HOST3D, BLOB_MEM_HOST3D_GUEST, CAPSET_VENUS, FORMAT_B8G8R8A8_UNORM,
+    FORMAT_B8G8R8X8_UNORM, MAP_CACHE_CACHED, MAP_CACHE_MASK, PARAM_3D_FEATURES,
+    PARAM_BLOB_ALIGNMENT, PARAM_CAPSET_QUERY_FIX, PARAM_CONTEXT_INIT, PARAM_CROSS_DEVICE,
+    PARAM_HOST_VISIBLE, PARAM_SUPPORTED_CAPSET_IDS,
 };
 
 /// Kernel-facing 3D operations of a virtio-gpu device.
@@ -96,6 +97,47 @@ pub trait VirtioGpu3D: Send + Sync {
         ring_idx: Option<u8>,
         fence: bool,
     ) -> Result<(), Gpu3DError>;
+
+    /// `SET_SCANOUT_BLOB` — display a blob resource on a scanout. The
+    /// host references the blob's backing memory in place (zero copy).
+    /// `format` is a `VIRTIO_GPU_FORMAT_*` value, `stride`/`offset`
+    /// describe plane 0 of the blob, and `width`/`height` the full
+    /// framebuffer geometry (`x`/`y`/`scanout_width`/`scanout_height`
+    /// carry the visible sub-rect). `res_id == 0` disables the scanout.
+    fn set_scanout_blob(&self, params: ScanoutBlobParams) -> Result<(), Gpu3DError>;
+
+    /// Rebinds the fixed 2D scanout resource to scanout 0 at its live
+    /// geometry, restoring the surface a blob scanout replaced. Only
+    /// meaningful after a successful 2D surface setup; fails with
+    /// [`Gpu3DError::NO_DEVICE`] otherwise.
+    fn bind_2d_scanout(&self) -> Result<(), Gpu3DError>;
+
+    /// Stops displaying whatever resource is bound to `scanout_id`
+    /// (`SET_SCANOUT_BLOB` with resource 0, mirroring SET_SCANOUT's
+    /// disable idiom). Used when a client releases the scanned-out
+    /// framebuffer.
+    fn disable_scanout(&self, scanout_id: u32) -> Result<(), Gpu3DError>;
+}
+
+/// Wire parameters of a `SET_SCANOUT_BLOB` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanoutBlobParams {
+    pub res_id: u32,
+    pub scanout_id: u32,
+    /// Visible sub-rect within the framebuffer.
+    pub x: u32,
+    pub y: u32,
+    pub scanout_width: u32,
+    pub scanout_height: u32,
+    /// Full framebuffer geometry.
+    pub width: u32,
+    pub height: u32,
+    /// `VIRTIO_GPU_FORMAT_*` of plane 0.
+    pub format: u32,
+    /// Plane-0 byte stride.
+    pub stride: u32,
+    /// Plane-0 byte offset into the blob.
+    pub offset: u32,
 }
 
 /// Wire parameters of a `RESOURCE_CREATE_BLOB` request.

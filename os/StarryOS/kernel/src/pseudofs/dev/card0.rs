@@ -14,10 +14,11 @@
 //!     monotonic offset key; `Card0::mmap(offset, length)` resolves that key
 //!     back to the buffer's per-allocation physical range. On
 //!     `SETCRTC` / `PAGE_FLIP` / non-`TEST_ONLY` atomic commit,
-//!     `present_fb` memcpies the committed buffer into the axdisplay
-//!     scanout framebuffer and kicks `framebuffer_flush`. PRIME export
-//!     and virtio-gpu zero-copy resource plumbing land in follow-on
-//!     PRs.
+//!     `present_fb` routes by backing type: dumb buffers are memcopied
+//!     into the axdisplay scanout and flushed, while 3D blob resources
+//!     (GEM handles minted by the `VIRTGPU_*` face) are displayed by the
+//!     host directly via `SET_SCANOUT_BLOB` — zero kernel-side copy.
+//!     PRIME export stays dumb-buffer-only for now.
 //!   - Property validation is permissive: value ranges aren't rigorously
 //!     enforced (tests drive sensible values). Atomic rejects only
 //!     unknown `(obj, prop)` pairs and obviously-bad object/blob refs.
@@ -41,7 +42,7 @@ use alloc::{
 };
 use core::{
     any::Any,
-    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use ax_alloc::GlobalPage;
@@ -257,22 +258,35 @@ struct DumbBuffer {
     pages: Arc<GlobalPage>,
 }
 
-/// Per-framebuffer state retained until `RMFB`. Holds the dumb
-/// buffer's backing directly so a `DESTROY_DUMB` on the source
-/// handle does not invalidate the fb — Linux's GEM contract says a
-/// framebuffer keeps the buffer alive for as long as the fb_id is
-/// live.
+/// Where a framebuffer's content lives. A dumb buffer keeps guest-side
+/// pages card0 memcpys into the axdisplay scanout on present; a 3D blob
+/// resource names a host allocation the host displays directly via
+/// `SET_SCANOUT_BLOB` — guest writes to the mapped resource become
+/// visible with no kernel-side copy.
+#[derive(Clone)]
+enum FbBacking {
+    Dumb(Arc<GlobalPage>),
+    Blob { res_handle: u32 },
+}
+
+/// Per-framebuffer state retained until `RMFB`. For dumb buffers the
+/// backing is shared with the dumb entry so a `DESTROY_DUMB` on the
+/// source handle does not invalidate the fb — Linux's GEM contract says
+/// a framebuffer keeps the buffer alive for as long as the fb_id is
+/// live. For blob resources the host owns the backing; card0 only
+/// remembers which resource to scan out.
 struct Framebuffer {
-    /// Total backing size in bytes.
+    /// Total backing size in bytes (dumb allocation or blob size).
     size: u64,
+    /// Framebuffer width in pixels — from ADDFB2.width.
+    width: u32,
     /// Row stride (pitch) in bytes — from ADDFB2.pitches[0].
     stride: u32,
     /// Framebuffer height in pixels — from ADDFB2.height.
     height: u32,
-    /// Backing pages. Shared with the (now possibly removed) dumb
-    /// buffer; refcount keeps them alive until both this fb and any
-    /// user mappings have been dropped.
-    pages: Arc<GlobalPage>,
+    /// DRM fourcc — from ADDFB2.pixel_format.
+    format: u32,
+    backing: FbBacking,
 }
 
 /// StarryOS kernel-side dma-buf GEM object for DRM card0.
@@ -442,6 +456,10 @@ pub struct Card0 {
     /// The `VIRTGPU_*` 3D face (contexts, blobs, execbuffer, syncobjs).
     /// Inert until the virtio-gpu driver publishes a 3D-capable device.
     vgpu: super::vgpu::VgpuCard,
+    /// Whether the host console currently scans out a blob resource
+    /// (set by [`Self::present_fb`]'s blob branch, cleared by the dumb
+    /// branch's 2D rebind and by [`Self::reset_kms_state`]).
+    blob_scanout_active: AtomicBool,
 }
 
 impl Card0 {
@@ -469,6 +487,7 @@ impl Card0 {
             system_blobs_init: Mutex::new(()),
             irq_handle: ax_lazyinit::OnceLock::new(),
             vgpu: super::vgpu::VgpuCard::new(),
+            blob_scanout_active: AtomicBool::new(false),
         });
         card.register_irq();
         card
@@ -832,24 +851,54 @@ impl Pollable for Card0 {
 }
 
 impl Card0 {
-    /// Look up the dumb buffer behind a given `fb_id` and copy its
-    /// contents into the axdisplay scanout, then trigger
-    /// `framebuffer_flush`. Used by `SETCRTC`, `PAGE_FLIP`, and atomic
-    /// commits — every path that userspace uses to "show this buffer
-    /// now" routes through here. A follow-on PR will swap the memcpy
-    /// for virtio-gpu zero-copy via `set_scanout` / `transfer_to_host`.
+    /// Look up the backing behind a given `fb_id` and present it — the
+    /// single point every "show this buffer now" path routes through
+    /// (`SETCRTC`, `PAGE_FLIP`, atomic commits, `DIRTYFB`).
+    ///
+    /// Dumb buffers are memcopied into the axdisplay scanout followed by
+    /// `framebuffer_flush`. Blob resources are handed to the host with
+    /// `SET_SCANOUT_BLOB`: the host references the blob's memory in
+    /// place, so there is no kernel-side copy and no flush.
     fn present_fb(&self, fb_id: u32) {
-        // Snapshot the backing pages out of the fb registry, then drop
-        // the lock so `framebuffer_flush` doesn't run with the
-        // map locked. Pages survive a concurrent DESTROY_DUMB because
-        // the fb owns its own Arc<GlobalPage> clone.
-        let (pages, src_stride, rows, size) = match self.fbs.lock().get(&fb_id) {
-            Some(fb) => (fb.pages.clone(), fb.stride, fb.height as usize, fb.size),
-            None => return,
+        // Snapshot the backing out of the fb registry, then drop the
+        // lock — the present paths below may block or take other locks.
+        // Backings survive a concurrent RMFB/DESTROY_DUMB because the
+        // snapshot holds its own Arc/reference.
+        let Some((size, width, stride, height, format, backing)) =
+            self.fbs.lock().get(&fb_id).map(|fb| {
+                (
+                    fb.size,
+                    fb.width,
+                    fb.stride,
+                    fb.height,
+                    fb.format,
+                    fb.backing.clone(),
+                )
+            })
+        else {
+            return;
         };
+        match backing {
+            FbBacking::Dumb(pages) => self.present_dumb(&pages, stride, height as usize, size),
+            FbBacking::Blob { res_handle } => {
+                self.present_blob(res_handle, width, height, stride, format);
+            }
+        }
+    }
+
+    /// memcpy present path for dumb buffers.
+    fn present_dumb(&self, pages: &Arc<GlobalPage>, src_stride: u32, rows: usize, size: u64) {
         if !ax_display::has_display() {
             return;
         };
+        if self.blob_scanout_active.swap(false, Ordering::AcqRel) {
+            // The host console is currently scanning out a blob surface;
+            // rebind the 2D resource so the flushed dumb content is
+            // visible again (mixed 2D+3D devices only).
+            if let Err(err) = self.vgpu.bind_2d_scanout() {
+                warn!("card0: 2D scanout rebind after blob scanout failed: {err:?}");
+            }
+        }
         let info = ax_display::framebuffer_info();
         let src = pages.start_vaddr().as_usize() as *const u8;
         let dst = info.fb_base_vaddr as *mut u8;
@@ -876,6 +925,36 @@ impl Card0 {
             }
         }
         let _ = ax_display::framebuffer_flush();
+    }
+
+    /// Zero-copy present path for 3D blob resources: `SET_SCANOUT_BLOB`
+    /// makes the host display the resource's backing memory directly.
+    fn present_blob(&self, res_handle: u32, width: u32, height: u32, stride: u32, format: u32) {
+        let Some(virtio_format) = super::vgpu::virtio_format_of(format) else {
+            warn!("card0: fb format {format:#x} has no virtio equivalent for scanout");
+            return;
+        };
+        let params = ax_driver::vgpu::ScanoutBlobParams {
+            res_id: res_handle,
+            scanout_id: 0,
+            x: 0,
+            y: 0,
+            scanout_width: width,
+            scanout_height: height,
+            width,
+            height,
+            format: virtio_format,
+            stride,
+            offset: 0,
+        };
+        match self.vgpu.set_scanout_blob(params) {
+            Ok(()) => {
+                self.blob_scanout_active.store(true, Ordering::Release);
+            }
+            Err(err) => {
+                warn!("card0: SET_SCANOUT_BLOB failed for resource {res_handle}: {err:?}");
+            }
+        }
     }
 
     fn handle_create_dumb(
@@ -1334,15 +1413,22 @@ impl Card0 {
         let ptr = arg as *mut DrmModeFbCmd2;
         let mut f: DrmModeFbCmd2 = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
         let handle = f.handles[0];
-        // Resolve and clone-retain the dumb's backing under the dumbs
-        // lock so a concurrent DESTROY_DUMB can't race the fb's
-        // initial Arc bump.
-        let (pages, size) = {
+        // Resolve the backing under the dumbs lock so a concurrent
+        // DESTROY_DUMB can't race the fb's initial Arc bump; unknown
+        // handles fall through to the 3D face (blob-backed fbs).
+        let (backing, size) = {
             let dumbs = self.dumbs.lock();
-            let Some(b) = dumbs.get(&handle) else {
-                return Err(VfsError::InvalidInput);
-            };
-            (b.pages.clone(), b.size)
+            match dumbs.get(&handle) {
+                Some(b) => (FbBacking::Dumb(b.pages.clone()), b.size),
+                None => {
+                    drop(dumbs);
+                    let (res_handle, blob_size) = self
+                        .vgpu
+                        .lookup_blob(handle)
+                        .ok_or(VfsError::InvalidInput)?;
+                    (FbBacking::Blob { res_handle }, blob_size)
+                }
+            }
         };
         // Use the plane stride from the ADDFB2 request (f.pitches[0])
         // rather than the dumb buffer's pitch.  PRIME/import buffers may
@@ -1392,9 +1478,11 @@ impl Card0 {
             fb_id,
             Framebuffer {
                 size,
+                width: fb_width,
                 stride: fb_stride,
                 height: fb_height,
-                pages,
+                format: fb_pixel_format,
+                backing,
             },
         );
         f.fb_id = fb_id;
@@ -1836,6 +1924,14 @@ impl Card0 {
         *self.legacy_crtc.lock() = LegacyCrtcState::default();
         self.fbs.lock().clear();
         self.events.lock().clear();
+        // If the host console scans out one of this client's blob
+        // resources, stop before the resources are torn down (Linux
+        // unbinds the CRTC on release; the scanout then shows nothing).
+        if self.blob_scanout_active.swap(false, Ordering::AcqRel)
+            && let Err(err) = self.vgpu.disable_scanout()
+        {
+            warn!("card0: scanout disable on release failed: {err:?}");
+        }
         // The 3D face's contexts/blobs/syncobjs belong to the closing
         // client just as much as the KMS state does.
         self.vgpu.reset();

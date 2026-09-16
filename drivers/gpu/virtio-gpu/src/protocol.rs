@@ -21,6 +21,7 @@ pub const CMD_GET_CAPSET_INFO: u32 = 0x0108;
 pub const CMD_GET_CAPSET: u32 = 0x0109;
 pub const CMD_GET_EDID: u32 = 0x010a;
 pub const CMD_RESOURCE_CREATE_BLOB: u32 = 0x010c;
+pub const CMD_SET_SCANOUT_BLOB: u32 = 0x010d;
 pub const CMD_CTX_CREATE: u32 = 0x0200;
 pub const CMD_CTX_DESTROY: u32 = 0x0201;
 pub const CMD_SUBMIT_3D: u32 = 0x0207;
@@ -82,6 +83,10 @@ impl CtrlHeader {
 // ---- 2D scanout surface ----
 
 pub const FORMAT_B8G8R8A8_UNORM: u32 = 1;
+/// DRM `XRGB8888` equivalent — memory bytes `[b, g, r, x]`, matching the
+/// Linux virtio-gpu driver's `virtio_gpu_translate_format` table (the
+/// `X8R8G8B8` enum value has the opposite byte order).
+pub const FORMAT_B8G8R8X8_UNORM: u32 = 2;
 
 /// `virtio_gpu_rect` — the scanout/flush rectangle (x/y/w/h packed as
 /// four u32s; the header's `depth`..`flags` tail is unused padding).
@@ -120,6 +125,27 @@ pub struct SetScanout {
     pub scanout_id: u32,
     pub resource_id: u32,
 }
+
+/// `virtio_gpu_set_scanout_blob` — bind a blob resource to a scanout
+/// (`resource_id == 0` disables the scanout, like SET_SCANOUT). The host
+/// displays the blob's backing memory in place, so guest writes to a
+/// mapped HOST3D blob become visible without any transfer command.
+#[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+pub struct SetScanoutBlob {
+    pub header: CtrlHeader,
+    pub rect: Rect,
+    pub scanout_id: u32,
+    pub resource_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub padding: u32,
+    pub strides: [u32; 4],
+    pub offsets: [u32; 4],
+}
+
+const _: () = assert!(core::mem::size_of::<SetScanoutBlob>() == 96);
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
