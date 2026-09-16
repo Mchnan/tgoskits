@@ -906,6 +906,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tock-registers 0.10.1",
  "virtio-drivers",
+ "virtio-gpu",
  "x86",
  "zerocopy",
 ]
@@ -9309,6 +9310,17 @@ dependencies = [
  "safe-mmio",
  "thiserror 2.0.20",
  "zerocopy",
+]
+
+[[package]]
+name = "virtio-gpu"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytemuck",
+ "log",
+ "spinning_top 0.3.0",
+ "virtio-drivers",
 ]
 
 [[package]]

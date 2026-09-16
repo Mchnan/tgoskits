@@ -103,6 +103,11 @@ pub mod usb;
 #[cfg(virtio_dev)]
 pub mod virtio;
 
+/// Re-export of the merged 2D+3D virtio-gpu driver so kernel-side DRM
+/// layers can reach the 3D face through this platform driver crate.
+#[cfg(feature = "virtio-gpu")]
+pub use virtio_gpu as vgpu;
+
 /// RK3588 CPU DVFS ondemand governor, exposed as a stable, arch-neutral entry
 /// the kernel can drive from a periodic task without knowing the SoC specifics.
 ///

@@ -45,7 +45,7 @@ use core::{
 };
 
 use ax_alloc::GlobalPage;
-use ax_memory_addr::{PAGE_SIZE_4K, PhysAddrRange};
+use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr, PhysAddrRange};
 use ax_runtime::hal::{mem::virt_to_phys, time::monotonic_time_nanos};
 use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
 use axpoll::{IoEvents, Pollable};
@@ -86,6 +86,19 @@ use super::drm::{
     DrmModeObjGetProperties, DrmModePropertyEnum, DrmPrimeHandle, DrmSetClientCap,
     DrmSetVersion, DrmUnique, DrmVersion, DrmWaitVblank,
 };
+use super::vgpu::{
+    BLOB_MMAP_KEY_BASE, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_SYNCOBJ_CREATE, DRM_IOCTL_SYNCOBJ_DESTROY,
+    DRM_IOCTL_SYNCOBJ_QUERY, DRM_IOCTL_SYNCOBJ_RESET, DRM_IOCTL_SYNCOBJ_SIGNAL,
+    DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+    DRM_IOCTL_VIRTGPU_CONTEXT_INIT, DRM_IOCTL_VIRTGPU_EXECBUFFER, DRM_IOCTL_VIRTGPU_GET_CAPS,
+    DRM_IOCTL_VIRTGPU_GETPARAM, DRM_IOCTL_VIRTGPU_MAP, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB,
+    DRM_IOCTL_VIRTGPU_RESOURCE_INFO, VIRTGPU_MAP_CACHE_CACHED,
+};
+
+/// Local alias so the mmap hook reads declaratively.
+fn vgpu_cached() -> u32 {
+    VIRTGPU_MAP_CACHE_CACHED
+}
 use super::vblank::{
     PendingVblankEvent, QueuedVblankEvent, VblankScheduler, vblank_passed, widen_32_to_64,
 };
@@ -426,6 +439,9 @@ pub struct Card0 {
     system_blobs_init: Mutex<()>,
     /// Registered virtio-gpu IRQ action, when the display backend advertises one.
     irq_handle: ax_lazyinit::OnceLock<ax_runtime::hal::irq::IrqHandle>,
+    /// The `VIRTGPU_*` 3D face (contexts, blobs, execbuffer, syncobjs).
+    /// Inert until the virtio-gpu driver publishes a 3D-capable device.
+    vgpu: super::vgpu::VgpuCard,
 }
 
 impl Card0 {
@@ -452,6 +468,7 @@ impl Card0 {
             in_formats_blob: AtomicU32::new(0),
             system_blobs_init: Mutex::new(()),
             irq_handle: ax_lazyinit::OnceLock::new(),
+            vgpu: super::vgpu::VgpuCard::new(),
         });
         card.register_irq();
         card
@@ -704,6 +721,27 @@ impl DeviceOps for Card0 {
             DRM_IOCTL_PRIME_HANDLE_TO_FD => self.handle_prime_handle_to_fd(current, arg),
             DRM_IOCTL_PRIME_FD_TO_HANDLE => self.handle_prime_fd_to_handle(current, arg),
 
+            DRM_IOCTL_VIRTGPU_GETPARAM => self.vgpu.handle_getparam(current, arg),
+            DRM_IOCTL_VIRTGPU_GET_CAPS => self.vgpu.handle_get_caps(current, arg),
+            DRM_IOCTL_VIRTGPU_CONTEXT_INIT => self.vgpu.handle_context_init(current, arg),
+            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => {
+                self.vgpu.handle_resource_create_blob(current, arg)
+            }
+            DRM_IOCTL_VIRTGPU_RESOURCE_INFO => self.vgpu.handle_resource_info(current, arg),
+            DRM_IOCTL_VIRTGPU_MAP => self.vgpu.handle_map(current, arg),
+            DRM_IOCTL_VIRTGPU_EXECBUFFER => self.vgpu.handle_execbuffer(current, arg),
+            DRM_IOCTL_GEM_CLOSE => self.vgpu.handle_gem_close(current, arg),
+
+            DRM_IOCTL_SYNCOBJ_CREATE => self.vgpu.handle_syncobj_create(current, arg),
+            DRM_IOCTL_SYNCOBJ_DESTROY => self.vgpu.handle_syncobj_destroy(current, arg),
+            DRM_IOCTL_SYNCOBJ_QUERY => self.vgpu.handle_syncobj_query(current, arg),
+            DRM_IOCTL_SYNCOBJ_RESET => self.vgpu.handle_syncobj_reset(current, arg),
+            DRM_IOCTL_SYNCOBJ_SIGNAL => self.vgpu.handle_syncobj_signal(current, arg),
+            DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT => self.vgpu.handle_syncobj_timeline_wait(current, arg),
+            DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL => {
+                self.vgpu.handle_syncobj_timeline_signal(current, arg)
+            }
+
             _ => Err(VfsError::OperationNotSupported),
         }
     }
@@ -715,6 +753,26 @@ impl DeviceOps for Card0 {
         // backing pages back through the retainer slot. The resulting
         // VMA keeps those pages alive across DESTROY_DUMB, matching
         // Linux GEM refcount semantics.
+        if offset >= BLOB_MMAP_KEY_BASE {
+            // Host-visible blob resource: cacheable mapping of the
+            // hostmem BAR slice the MAP_BLOB command pinned.
+            return match self.vgpu.blob_physical_range(offset) {
+                Some((phys, size, map_info)) => {
+                    let range = PhysAddrRange::from_start_size(
+                        PhysAddr::from(phys as usize),
+                        length.min(size) as usize,
+                    );
+                    // The host's cache hint decides the mapping
+                    // attribute; venus hostmem is host RAM (cached).
+                    if map_info == vgpu_cached() {
+                        DeviceMmap::PhysicalCached(range, None)
+                    } else {
+                        DeviceMmap::Physical(range, None)
+                    }
+                }
+                None => DeviceMmap::None,
+            };
+        }
         let dumbs = self.dumbs.lock();
         let Some(b) = dumbs.values().find(|b| b.offset == offset) else {
             return DeviceMmap::None;
@@ -1778,6 +1836,9 @@ impl Card0 {
         *self.legacy_crtc.lock() = LegacyCrtcState::default();
         self.fbs.lock().clear();
         self.events.lock().clear();
+        // The 3D face's contexts/blobs/syncobjs belong to the closing
+        // client just as much as the KMS state does.
+        self.vgpu.reset();
     }
 
     /// Whether the CRTC is currently scanning out: true once a legacy

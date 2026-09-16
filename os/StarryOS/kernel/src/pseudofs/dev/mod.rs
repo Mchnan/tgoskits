@@ -10,6 +10,7 @@ mod card1;
 mod dmaheap;
 mod drm;
 mod vblank;
+mod vgpu;
 #[cfg(feature = "input")]
 pub mod event;
 mod fb;

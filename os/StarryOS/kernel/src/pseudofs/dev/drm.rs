@@ -19,14 +19,14 @@ use bytemuck::{AnyBitPattern, NoUninit};
 //
 // DRM uses type 'd' (0x64) for all its commands.
 
-const IOC_READ: u32 = 2;
-const IOC_WRITE: u32 = 1;
+pub(crate) const IOC_READ: u32 = 2;
+pub(crate) const IOC_WRITE: u32 = 1;
 
-const fn ioc(dir: u32, ty: u8, nr: u8, size: u16) -> u32 {
+pub(crate) const fn ioc(dir: u32, ty: u8, nr: u8, size: u16) -> u32 {
     (dir << 30) | ((size as u32) << 16) | ((ty as u32) << 8) | (nr as u32)
 }
 #[inline]
-const fn iowr<T>(ty: u8, nr: u8) -> u32 {
+pub(crate) const fn iowr<T>(ty: u8, nr: u8) -> u32 {
     ioc(
         IOC_READ | IOC_WRITE,
         ty,
@@ -35,7 +35,11 @@ const fn iowr<T>(ty: u8, nr: u8) -> u32 {
     )
 }
 #[inline]
-const fn io(ty: u8, nr: u8) -> u32 {
+pub(crate) const fn iow<T>(ty: u8, nr: u8) -> u32 {
+    ioc(IOC_WRITE, ty, nr, core::mem::size_of::<T>() as u16)
+}
+#[inline]
+pub(crate) const fn io(ty: u8, nr: u8) -> u32 {
     ioc(0, ty, nr, 0)
 }
 

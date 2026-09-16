@@ -256,3 +256,89 @@ Phase 1 核心目标达成：**guest mesa venus ICD → QEMU virtio-gpu-gl(venus
 virglrenderer render server → MoltenVK → Apple M4 Metal** 全链打通，compute 渲染
 + host memory 回读可验证，fence 同步语义已修复（§6.5）。Phase 2（StarryOS card0
 增 VIRTGPU_* 3D ioctl 族 + hostmem BAR 映射）的前提条件全部就绪。
+
+## 7. Phase 2 实测结果（2026-09-16，StarryOS 内核 3D 面端到端 PASS）
+
+### 7.1 交付物（本仓库三个改动面）
+
+1. **新 crate `drivers/gpu/virtio-gpu`**（0.1.0，no_std）：2D+3D 合并 virtio-gpu
+   驱动。单 transport、单控制队列、进程级全局 3D 注册表
+   （`global_3d()`）。2D 面是 `virtio-drivers` `VirtIOGpu` 的忠实移植
+   （去 cursor）；3D 面实现 venus 所需的控制面子集
+   （capset_info/capset、ctx_create/destroy、resource_create_blob、
+   map/unmap_blob、submit_3d）。关键设计：
+   - **fenced SUBMIT_3D 必须 fire-and-forget**：宿主把 fenced 命令的
+     响应推迟到 fence retire（任意晚），同步等待会卡死 guest。驱动内
+     用 pending FIFO（owned DMA 头+载荷）+ 严格按序 drain 的完成队列
+     解决 2D 同步命令与 3D 异步提交共用一条 virtqueue 的乱序问题。
+   - **命令头一律拷入驱动自有缓冲**再提交：曾出现 guest 栈内存 DMA
+     地址在设备读取时失效（type=0 未知命令），owned copy 后消失。
+2. **ax-driver**：PCI `SHARED_MEMORY_CFG` vendor cap 解析（`cap64`
+   扩展、BAR 物理地址重建）→ hostmem region 传给驱动；GPU probe 改走
+   `take_virtio_transport_masked_with_shm`；`pub use virtio_gpu as vgpu`
+   re-export。**2D 不可用时降级 3D-only**：darwin venus-only renderer
+   没有 vrend，guest 2D 资源必然失败（SET_SCANOUT 报 0x1203），display
+   设备不注册（axdisplay 适配器要求有效 framebuffer，否则内核 panic），
+   但 3D 面照常发布。
+3. **starry-kernel `pseudofs/dev/vgpu.rs`**：card0 增 VIRTGPU_* ioctl 族
+   （GETPARAM/GET_CAPS/CONTEXT_INIT/RESOURCE_CREATE_BLOB/
+   RESOURCE_INFO/MAP/EXECBUFFER/GEM_CLOSE）+ 通用 syncobj 族
+   （CREATE/DESTROY/QUERY/RESET/SIGNAL/TIMELINE_WAIT/
+   TIMELINE_SIGNAL）。状态按进程 identity 键控（device ops 无 per-fd
+   钩子，venus 每进程一 fd，行为等价）。mmap：MAP_DUMB offset key 空间
+   与 blob key（1<<40 起）隔离；blob 走 `DeviceMmap::PhysicalCached`
+   （hostmem 是宿主 RAM），BAR slot 按 **16 KiB** 对齐（HVF/macOS 宿主
+   页粒度）。卡级 state 挂进 card0 既有 `reset_kms_state()`（最后一个
+   fd 关闭时清空，延续 #2393 语义）。
+
+### 7.2 端到端验证（venus QEMU + StarryOS，raw ioctl 探针）
+
+探针 `tmp/vgpu-probe/vgprobe.c`（musl 静态编译，debugfs 注入 rootfs
+APFS clone 副本，串口 holder 注入），21 步全绿（`=== VGPROBE PASS ===`）：
+
+GETPARAM（3d/blob/host_visible/ctx_init/capset_fix 全 1，capset_mask=0x10
+→ venus 位）→ GET_CAPS(venus, 160B) → CONTEXT_INIT（第二次 EEXIST 语义
+正确）→ RESOURCE_CREATE_BLOB（HOST3D+MAPPABLE，132 KiB）→
+RESOURCE_INFO → MAP（offset=0x1_0000_0000_0000）→ **mmap 直写 hostmem
+BAR 且回读一致**（0xc0de0000-3）→ SYNC Timeline signal/query →
+EXECBUFFER（unfenced 提交成功）→ TIMELINE_WAIT 未来点 → EINVAL（语义
+正确）→ GEM_CLOSE → SYNC DESTROY。
+
+2D 回归：grouped `qemu/system` 1/1（drm-modeset 75/75 含
+drm-atomic→modeset 跨进程顺序）不受影响；clippy/fmt 全绿（bare-metal
+aarch64 target 手工匹配参数）。
+
+### 7.3 排障路上踩掉的三个坑（复现必读）
+
+1. **QEMU `VIRGL_VERSION_MAJOR` 宏改名**（本轮最隐蔽）：virglrenderer
+   1.3+ 把版本宏改成 `VIRGL_MAJOR_VERSION`（virgl-version.h），QEMU
+   `virtio-gpu-virgl.c` 仍用旧名——未定义标识符在 `#if` 里求值 0，
+   **RESOURCE_CREATE_BLOB/MAP_BLOB/SET_SCANOUT_BLOB/fence-info 整段
+   case 被静默裁掉**（0x111 命令落 default → 0x1200）。Phase 1 的
+   QEMU 是 brew 头还在时构建的所以能跑；后来 brew 头被删、patch 触发
+   重编才暴露。修复 = 源文件头部桥接宏名
+   （`VIRGL_VERSION_MAJOR → VIRGL_MAJOR_VERSION`），已落 darwin fork。
+2. **wire 命令号手抄错误**：`RESOURCE_CREATE_BLOB=0x10c`（非 0x111）、
+   `SUBMIT_3D=0x207`、`MAP_BLOB=0x208`、`UNMAP_BLOB=0x209`。用 QEMU
+   枚举/`process_cmd` trace 打点定位（default-hit 诊断）。
+3. **vkr shm blob 语义**：blob_id=0 走宿主 shm 分配要求
+   `blob_flags == 精确的 MAPPABLE`（多一个 SHAREABLE 就不匹配）；
+   CONTEXT_CREATE 空 debug_name 会被 renderer 拒绝（Linux 总发 task
+   comm）→ 内核补默认名。SYNC 语义 v1 定案：全 timeline watermark
+   （binary 用 0/1 塌缩），EXECBUFFER 的 out_syncobj 在同步返回时
+   signal。
+
+### 7.4 遗留与下一步
+
+- 同步 single-flight 模型下 fence 在 ioctl 返回时视为 signaled——
+  `vkWaitForFences` 语义正确但 GPU 并行度未打开；async submit +
+  fence-event 唤醒（内核事件队列已有 poll 基建）是下一手。
+- GUEST/HOST3D_GUEST blob（guest backing attach）与
+  `SYNCOBJ_EVENTFD`/sync_file 导入导出未实现（前者 Phase 3 再说，
+  后者保持 ENOSYS 是诚实语义，见 §6.5 的 fence 分析）。
+- 2D/3D 共存：venus-only 设备无 2D 面，denial 桌面要跑起来需要把
+  card0 的 KMS present 路径接到 3D blob 资源（SET_SCANOUT_BLOB +
+  DMA-BUF 导出链），这是 Phase 3 的核心工作。
+- deniald 集成验证（Phase 3）：rootfs 需 Alpine edge 的
+  `mesa-vulkan-virtio`（venus ICD），Flutter Impeller-Vulkan 走
+  `/dev/dri/card0` 的 VIRTGPU_* 面。

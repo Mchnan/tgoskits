@@ -1,0 +1,24 @@
+[package]
+authors.workspace = true
+categories = ["embedded", "hardware-support", "no-std"]
+description = "VirtIO GPU driver: 2D scanout surface plus the 3D face (blob resources, contexts, command submission) that the card0 VIRTGPU_* DRM ioctls drive"
+edition.workspace = true
+keywords = ["virtio", "gpu", "venus"]
+license.workspace = true
+name = "virtio-gpu"
+repository.workspace = true
+version = "0.1.0"
+
+[dependencies]
+bitflags.workspace = true
+bytemuck = { version = "1.24", default-features = false, features = [
+    "derive",
+    "min_const_generics",
+] }
+log.workspace = true
+spinning_top = "0.3"
+virtio-drivers.workspace = true
+
+[features]
+default = ["alloc"]
+alloc = ["virtio-drivers/alloc"]

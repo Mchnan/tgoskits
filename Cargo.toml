@@ -229,6 +229,7 @@ rdif-vsock = { version = "0.2", path = "drivers/interface/rdif-vsock" }
 rk3588-pci = { version = "0.2", path = "drivers/pci/rk3588-pci" }
 rockchip-npu = { version = "0.3", path = "drivers/npu/rockchip-npu" }
 rockchip-rga = { version = "0.2", path = "drivers/gpu/rockchip-rga" }
+virtio-gpu = { version = "0.1.0", path = "drivers/gpu/virtio-gpu" }
 rockchip-jpeg = { version = "0.1", path = "drivers/vpu/rockchip-jpeg" }
 rockchip-pwm = { version = "0.1", path = "drivers/pwm/rockchip-pwm" }
 k230-kpu = { version = "0.1", path = "drivers/npu/k230-kpu" }
