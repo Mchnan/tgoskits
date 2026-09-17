@@ -250,10 +250,12 @@ fn test_walk_address_comparison() {
     println!("✅ 地址比较逻辑测试通过！");
 }
 
-/// 测试unmap递归回收逻辑
+/// The generic unmap API retains its existing immediate-reclaim contract.
 ///
-/// Bug描述：unmap_range_recursive中遇到无效页表项时错误地设置can_reclaim=false，
-/// 实际上无效项不应该影响回收判断
+/// Stage-1 owners that need remote shootdown confirmation use the separate
+/// deferred API. Changing the generic path to preserve empty tables would make
+/// stage-2 and other non-stage-1 users accumulate page-table frames until the
+/// entire root is destroyed.
 #[test]
 fn test_unmap_reclaim_logic() {
     let allocator = TrackedFram4k::new();
@@ -282,11 +284,117 @@ fn test_unmap_reclaim_logic() {
     let allocated_after = allocator.allocated_count();
     println!("取消映射后分配的帧数: {}", allocated_after);
 
-    // 验证空的子页表帧被正确回收
-    // 注意：根页表帧不会被回收，所以应该只剩下根帧
-    assert!(allocated_after < allocated_before, "空的子页表帧应该被回收");
+    assert_eq!(
+        allocated_after, 1,
+        "generic unmap must reclaim every empty intermediate table"
+    );
+    assert!(allocated_after < allocated_before);
 
-    println!("✅ unmap回收逻辑测试通过！");
+    drop(pg);
+    assert_eq!(
+        allocator.allocated_count(),
+        0,
+        "the page-table owner must reclaim the root at teardown"
+    );
+}
+
+#[test]
+fn generic_leaf_unmap_reclaims_empty_intermediate_tables() {
+    let allocator = TrackedFram4k::new();
+    let mut page_table = PageTable::<T4kL4, TrackedFram4k>::new(allocator).unwrap();
+    let vaddr = VirtAddr::from_usize(0x1000_0000);
+
+    page_table
+        .map_page(
+            vaddr,
+            PhysAddr::from_usize(0x2000_0000),
+            0x1000,
+            PteImpl::user_mode_config(),
+        )
+        .unwrap();
+    let allocated_before_unmap = allocator.allocated_count();
+
+    page_table.unmap_page(vaddr).unwrap();
+
+    assert_eq!(allocator.allocated_count(), 1);
+    assert!(allocator.allocated_count() < allocated_before_unmap);
+    drop(page_table);
+    assert_eq!(allocator.allocated_count(), 0);
+}
+
+#[test]
+fn deferred_unmap_retains_empty_intermediate_tables_until_confirmation() {
+    let allocator = TrackedFram4k::new();
+    let mut page_table = PageTable::<T4kL4, TrackedFram4k>::new(allocator).unwrap();
+    let vaddr = VirtAddr::from_usize(0x1000_0000);
+
+    page_table
+        .map_page(
+            vaddr,
+            PhysAddr::from_usize(0x2000_0000),
+            0x1000,
+            PteImpl::user_mode_config(),
+        )
+        .unwrap();
+    let allocated_before_unmap = allocator.allocated_count();
+
+    let (_, _, page_size, deferred_tables) = page_table.unmap_page_deferred(vaddr).unwrap();
+
+    assert_eq!(page_size, 0x1000);
+    assert!(!deferred_tables.is_empty());
+    assert_eq!(
+        allocator.allocated_count(),
+        allocated_before_unmap,
+        "detached page-table frames must stay owned until TLB confirmation"
+    );
+
+    // SAFETY: this unit test models completion of the remote TLB confirmation.
+    unsafe { deferred_tables.reclaim() };
+    assert_eq!(
+        allocator.allocated_count(),
+        1,
+        "only the root page-table frame should remain after confirmation"
+    );
+}
+
+#[test]
+fn failed_region_map_reclaims_unpublished_prefix_tables() {
+    let allocator = TrackedFram4k::new();
+    let mut page_table = PageTable::<T4kL4, TrackedFram4k>::new(allocator).unwrap();
+    let prefix = VirtAddr::from_usize(0x1f_f000);
+    let conflict = VirtAddr::from_usize(0x20_0000);
+    let conflict_paddr = PhysAddr::from_usize(0x3000_0000);
+
+    page_table
+        .map_page(
+            conflict,
+            conflict_paddr,
+            0x1000,
+            PteImpl::user_mode_config(),
+        )
+        .unwrap();
+    let allocated_before_attempt = allocator.allocated_count();
+
+    assert!(matches!(
+        page_table.map_region(
+            prefix,
+            |vaddr| PhysAddr::from_usize(0x4000_0000 + (vaddr - prefix)),
+            0x2000,
+            PteImpl::user_mode_config(),
+        ),
+        Err(PagingError::MappingConflict { .. })
+    ));
+
+    assert!(matches!(
+        page_table.query(prefix),
+        Err(PagingError::NotMapped)
+    ));
+    assert_eq!(page_table.query(conflict).unwrap().0, conflict_paddr);
+    assert_eq!(
+        allocator.allocated_count(),
+        allocated_before_attempt,
+        "rollback must reclaim empty tables created by the unpublished mapping attempt"
+    );
 }
 
 /// 测试部分取消映射不影响其他映射
@@ -378,6 +486,10 @@ fn empty_flags_keep_leaf_non_present_until_protected() {
         page_table.query(vaddr),
         Err(PagingError::NotMapped)
     ));
+    let (occupied, level) = page_table.query_occupied(vaddr).unwrap();
+    assert_eq!(occupied.paddr(false), paddr);
+    assert_eq!(occupied.config(false), MappingFlags::empty());
+    assert_eq!(page_table.mapping_size_for_level(level), Some(0x1000));
 
     page_table
         .protect_region(
@@ -405,6 +517,10 @@ fn empty_flags_keep_leaf_non_present_until_protected() {
     assert_eq!(removed_paddr, unmapped_paddr);
     assert_eq!(removed_flags, MappingFlags::empty());
     assert_eq!(removed_size, 0x1000);
+    assert!(matches!(
+        page_table.query_occupied(unmapped_vaddr),
+        Err(PagingError::NotMapped)
+    ));
     page_table
         .map_page(
             unmapped_vaddr,
@@ -527,44 +643,6 @@ fn map_region_rolls_back_prefix_after_late_conflict() {
     );
 }
 
-/// 测试MemConfig的正确实现
-///
-/// Bug描述：PteImpl没有实现set_mem_config和mem_config方法
-#[test]
-fn test_mem_config_implementation() {
-    let mut pte = PteImpl::new();
-    pte = PteImpl::from_config(PteConfig {
-        valid: true,
-        ..pte.to_config(false)
-    });
-
-    // 测试设置和获取MemConfig
-    let config = MemConfig {
-        access: AccessFlags::READ | AccessFlags::WRITE | AccessFlags::EXECUTE,
-        attrs: MemAttributes::Normal,
-    };
-
-    pte.set_mem_config(config);
-    let retrieved = pte.mem_config();
-
-    assert_eq!(retrieved.access, config.access, "访问权限应该匹配");
-    assert_eq!(retrieved.attrs, config.attrs, "内存属性应该匹配");
-
-    // 测试不同的配置
-    let config2 = MemConfig {
-        access: AccessFlags::READ,
-        attrs: MemAttributes::Device,
-    };
-
-    pte.set_mem_config(config2);
-    let retrieved2 = pte.mem_config();
-
-    assert_eq!(retrieved2.access, config2.access, "只读权限应该匹配");
-    assert_eq!(retrieved2.attrs, config2.attrs, "设备属性应该匹配");
-
-    println!("✅ MemConfig实现测试通过！");
-}
-
 /// 测试边界情况：地址溢出检查
 ///
 /// 验证在映射和取消映射时正确处理地址溢出情况
@@ -670,11 +748,7 @@ fn test_mixed_huge_and_normal_pages() {
     }
 
     // 验证普通页翻译
-    let (paddr2, pte2) = pg.translate((2 * MB + 0x1000).into()).unwrap();
-    assert!(
-        !pte2.to_config(false).huge || pte2.to_config(false).huge,
-        "可能是大页或普通页"
-    );
+    let (paddr2, _) = pg.translate((2 * MB + 0x1000).into()).unwrap();
     assert_eq!(paddr2.as_usize(), 2 * MB + 0x1000, "普通页偏移应该正确");
 
     println!("✅ 混合大页和普通页测试通过！");

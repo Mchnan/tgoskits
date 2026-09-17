@@ -43,6 +43,7 @@ impl PosixError {
     pub const EOPNOTSUPP: Self = Self::Errno(Errno::EOPNOTSUPP);
     pub const EPERM: Self = Self::Errno(Errno::EPERM);
     pub const ERANGE: Self = Self::Errno(Errno::ERANGE);
+    pub const ESRCH: Self = Self::Errno(Errno::ESRCH);
 
     /// Returns the Linux errno exposed at the C ABI boundary.
     pub fn errno(self) -> Errno {
@@ -146,6 +147,7 @@ fn vfs_error_to_errno(error: VfsError) -> Errno {
         VfsError::ReadOnlyFilesystem => Errno::EROFS,
         VfsError::ResourceBusy => Errno::EBUSY,
         VfsError::StorageFull => Errno::ENOSPC,
+        VfsError::TextFileBusy => Errno::ETXTBSY,
         VfsError::TimedOut => Errno::ETIMEDOUT,
         VfsError::TooManyLinks => Errno::EMLINK,
         VfsError::Unsupported => Errno::ENOSYS,

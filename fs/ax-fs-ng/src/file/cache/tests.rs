@@ -2,15 +2,14 @@ use alloc::{sync::Arc, vec, vec::Vec};
 use core::{
     any::Any,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    task::Context,
     time::Duration,
 };
 use std::sync::Mutex as StdMutex;
 
 use axfs_ng_vfs::{
-    DeviceId, DirEntry, FileNodeOps, FileRangeOperation, Filesystem, FilesystemOps, FsIoEvents,
-    FsPollable, Metadata, MetadataUpdate, Mountpoint, NodeFlags, NodeOps, NodePermission, NodeType,
-    PreallocationMode, Reference, StatFs,
+    DeviceId, DirEntry, FileNodeOps, FileRangeOperation, Filesystem, FilesystemOps, Metadata,
+    MetadataUpdate, Mountpoint, NodeFlags, NodeOps, NodePermission, NodeType, PreallocationMode,
+    Reference, StatFs,
 };
 
 use super::*;
@@ -177,12 +176,17 @@ impl NodeOps for CacheTestFile {
     }
 }
 
-impl FsPollable for CacheTestFile {
-    fn poll(&self) -> FsIoEvents {
-        FsIoEvents::IN | FsIoEvents::OUT
+impl axpoll::Pollable for CacheTestFile {
+    fn poll(&self) -> axpoll::IoEvents {
+        axpoll::IoEvents::IN | axpoll::IoEvents::OUT
     }
 
-    fn register(&self, _context: &mut Context<'_>, _events: FsIoEvents) {}
+    unsafe fn register_shared(
+        &self,
+        _sink: &mut dyn axpoll::SharedRegistrationSink,
+        _events: axpoll::IoEvents,
+    ) {
+    }
 }
 
 impl FileNodeOps for CacheTestFile {
@@ -300,6 +304,36 @@ fn tmpfs_and_ramfs_use_unbounded_page_cache() {
     assert!(filesystem_uses_unbounded_page_cache("tmpfs"));
     assert!(filesystem_uses_unbounded_page_cache("ramfs"));
     assert!(!filesystem_uses_unbounded_page_cache("ext4"));
+}
+
+#[cfg(feature = "vfs")]
+#[test]
+fn filesystem_sync_does_not_visit_another_filesystems_busy_mapping() {
+    with_test_page_provider(true, |_| {
+        let cached = reopen_cached_file(Arc::new(CacheTestFile::new(vec![0; PAGE_SIZE])));
+        cached.write_at(&b"dirty"[..], 0).unwrap();
+        let visits = Arc::new(AtomicUsize::new(0));
+        let observed = visits.clone();
+        let endpoint = install_shared_test_endpoint(&cached.shared, move |event| {
+            if matches!(event, CacheMappingEvent::WritebackProtect(_)) {
+                observed.fetch_add(1, Ordering::AcqRel);
+                CacheMappingResult::Busy
+            } else {
+                CacheMappingResult::Protected
+            }
+        });
+        let unrelated = sync_filesystem_cached_files(&TMPFS_CACHE_TEST_FILESYSTEM);
+        let unrelated_visits = visits.load(Ordering::Acquire);
+        let own = sync_filesystem_cached_files(&CACHE_TEST_FILESYSTEM);
+        let own_visits = visits.load(Ordering::Acquire);
+        drop(endpoint);
+        cached.sync(false).unwrap();
+
+        assert_eq!(unrelated, Ok(()));
+        assert_eq!(unrelated_visits, 0);
+        assert_eq!(own, Err(VfsError::ResourceBusy));
+        assert!(own_visits > 0);
+    });
 }
 
 #[test]

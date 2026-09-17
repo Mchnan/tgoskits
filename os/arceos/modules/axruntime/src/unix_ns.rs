@@ -38,9 +38,11 @@ impl ax_net::unix::UnixNamespace for AxFsUnixNamespace {
     }
 
     fn unbind(&self, path: &str) -> ax_net::NetResult<()> {
+        use axfs_ng_vfs::MutationCredentials;
+
         ax_fs_ng::vfs::current_fs_context()
             .lock()
-            .remove_file(path)
+            .remove_file(path, &MutationCredentials::root())
             .map_err(namespace_vfs_error)
     }
 }
@@ -65,7 +67,7 @@ fn namespace_vfs_error(error: axfs_ng_vfs::VfsError) -> ax_net::NetError {
         VfsError::FileTooLarge => NetError::FileTooLarge,
         VfsError::InvalidData => NetError::InvalidData,
         VfsError::InvalidInput => NetError::InvalidInput,
-        VfsError::Interrupted => ax_task::future::Interrupted.into(),
+        VfsError::Interrupted => NetError::Interrupted,
         VfsError::Io => NetError::BackendIo,
         VfsError::IsADirectory => NetError::IsADirectory,
         VfsError::NameTooLong => NetError::NameTooLong,
@@ -82,6 +84,7 @@ fn namespace_vfs_error(error: axfs_ng_vfs::VfsError) -> ax_net::NetError {
         VfsError::ReadOnlyFilesystem => NetError::ReadOnlyFilesystem,
         VfsError::ResourceBusy => NetError::ResourceBusy,
         VfsError::StorageFull => NetError::StorageFull,
+        VfsError::TextFileBusy => NetError::ResourceBusy,
         VfsError::TimedOut => NetError::TimedOut,
         VfsError::TooManyLinks => NetError::OperationNotSupported,
         VfsError::Unsupported => NetError::Unsupported,

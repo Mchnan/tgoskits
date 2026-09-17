@@ -3,11 +3,11 @@ use core::{
     future::poll_fn,
     ops::Range,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    task::{Poll, Waker},
+    task::Poll,
 };
 
-use ax_task::future::block_on;
-use axpoll::{IoEvents, PollSet};
+use axpoll::{ExclusiveConsumer, IoEvents, PollRegistrar};
+use axpoll_set::PollSet;
 use linux_raw_sys::general::{
     ECHOCTL, ECHOK, ICRNL, IGNCR, ISIG, ONLCR, OPOST, VEOF, VERASE, VKILL, VMIN, VTIME,
 };
@@ -21,7 +21,7 @@ use super::{Terminal, termios::Termios2};
 use crate::{
     StarryError, StarryResult,
     sync::{IrqMutex, Mutex},
-    task::send_signal_to_process_group,
+    task::{future::block_on, send_signal_to_process_group},
 };
 
 const BUF_SIZE: usize = 4096;
@@ -446,7 +446,6 @@ enum Processor<R, W> {
 pub struct LineDiscipline<R, W> {
     terminal: Arc<Terminal>,
     buf_rx: CachingCons<ReadBuf>,
-    injected_input: VecDeque<u8>,
     input_ready: Arc<PollSet>,
     worker_source: Arc<PollSet>,
     eof_ready: Arc<AtomicBool>,
@@ -475,25 +474,28 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         input_ready: Arc<PollSet>,
         worker_source: Arc<PollSet>,
     ) {
-        ax_task::spawn_with_name(
-            move || {
+        crate::task::kernel_thread_builder("tty-reader".into())
+            .spawn(move || {
+                let mut registrar = None::<PollRegistrar<ExclusiveConsumer>>;
                 block_on(poll_fn(|cx| {
-                    Self::drive_input(&reader, input_ready.as_ref());
-                    // The reader task registers from ordinary task context.
-                    unsafe { input_source.register(cx.waker(), IoEvents::IN) };
-                    if let Some(output_source) = output_source.as_ref() {
-                        unsafe { output_source.register(cx.waker(), IoEvents::OUT) };
+                    if let Some(registrar) = registrar.as_mut() {
+                        registrar.reset(cx.waker());
                     }
-                    unsafe { worker_source.register(cx.waker(), IoEvents::OUT) };
+                    Self::drive_input(&reader, input_ready.as_ref());
+                    let registrar = registrar.get_or_insert_with(|| PollRegistrar::new(cx.waker()));
+                    unsafe { registrar.register_exclusive(&input_source, IoEvents::IN) };
+                    if let Some(output_source) = output_source.as_ref() {
+                        unsafe { registrar.register_exclusive(output_source, IoEvents::OUT) };
+                    }
+                    unsafe { registrar.register_exclusive(&worker_source, IoEvents::OUT) };
 
                     // Close the check/register race. block_on's stable AxWaker
                     // remembers a concurrent source wake before it parks.
                     Self::drive_input(&reader, input_ready.as_ref());
                     Poll::<()>::Pending
                 }))
-            },
-            "tty-reader".into(),
-        );
+            })
+            .expect("failed to spawn kernel thread");
     }
 
     pub fn new(terminal: Arc<Terminal>, config: TtyConfig<R, W>) -> Self {
@@ -545,7 +547,6 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         Self {
             terminal,
             buf_rx,
-            injected_input: VecDeque::new(),
             input_ready,
             worker_source,
             eof_ready,
@@ -565,7 +566,6 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                 self.buf_rx.clear();
             }
         }
-        self.injected_input.clear();
         self.eof_ready.store(false, Ordering::Release);
         Ok(())
     }
@@ -579,12 +579,6 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         writer.discard_output()
     }
 
-    pub fn inject_input(&mut self, input: &[u8]) {
-        self.injected_input.extend(input);
-        // Injected bytes are visible before waking readers.
-        unsafe { self.input_ready.wake(IoEvents::IN) };
-    }
-
     pub fn poll_read(&mut self) -> bool {
         // Peer writer fully closed (Passive mode) → report readable so poll()
         // wakes and the caller's read() observes EOF / POLLHUP instead of
@@ -596,7 +590,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         if let Processor::Passive(reader, _) = &mut self.processor {
             reader.poll();
         }
-        if writer_closed || !self.injected_input.is_empty() {
+        if writer_closed {
             return true;
         }
         let term = self.terminal.termios.lock().clone();
@@ -611,34 +605,16 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         !self.buf_rx.is_empty() && (vmin == 0 || self.buf_rx.occupied_len() >= vmin)
     }
 
-    pub fn register_rx_waker(&self, waker: &Waker) {
+    pub fn rx_poll_source(&self) -> Arc<PollSet> {
         match &self.processor {
-            Processor::InterruptDriven(_) => {
-                // Registration happens from tty read poll context.
-                unsafe { self.input_ready.register(waker, IoEvents::IN) };
-            }
-            Processor::Passive(_, set) => {
-                // Registration happens from tty read poll context.
-                unsafe { set.register(waker, IoEvents::IN) };
-            }
+            Processor::InterruptDriven(_) => Arc::clone(&self.input_ready),
+            Processor::Passive(_, set) => Arc::clone(set),
         }
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> StarryResult<usize> {
         if buf.is_empty() {
             return Ok(0);
-        }
-        if !self.injected_input.is_empty() {
-            let mut read = 0;
-            for slot in buf.iter_mut() {
-                if let Some(byte) = self.injected_input.pop_front() {
-                    *slot = byte;
-                    read += 1;
-                } else {
-                    break;
-                }
-            }
-            return Ok(read);
         }
         if let Processor::Passive(reader, _) = &mut self.processor {
             reader.poll();
@@ -697,7 +673,7 @@ mod tests {
     use alloc::{sync::Arc, vec, vec::Vec};
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use axpoll::PollSet;
+    use axpoll_set::PollSet;
     use ringbuf::traits::{Observer, Split};
 
     use super::{
@@ -1072,26 +1048,6 @@ mod tests {
         assert_eq!(bytes.load(Ordering::Relaxed), 6);
         assert!(echo.queue.lock().is_empty());
         assert!(calls.load(Ordering::Relaxed) >= 2);
-    }
-
-    #[test]
-    fn injected_input_is_readable_immediately() {
-        let mut ldisc = LineDiscipline::new(
-            Arc::new(Terminal::default()),
-            TtyConfig {
-                reader: MockReader::new(Vec::new()),
-                writer: MockWriter,
-                process_mode: ProcessMode::Passive(Arc::new(PollSet::new())),
-            },
-        );
-
-        ldisc.inject_input(b"\x1b[1;1R");
-
-        assert!(ldisc.poll_read(), "injected bytes must make tty readable");
-
-        let mut buf = [0; 6];
-        assert_eq!(ldisc.read(&mut buf).unwrap(), 6);
-        assert_eq!(&buf, b"\x1b[1;1R");
     }
 
     #[test]

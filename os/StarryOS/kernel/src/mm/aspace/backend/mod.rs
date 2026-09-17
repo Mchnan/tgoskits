@@ -25,12 +25,17 @@ mod shared;
 
 pub use self::shared::SharedMemoryObject;
 pub use super::accounting::RssKind;
-use super::{AddressSpaceId, vma::{MappingId, VmaDescriptor}};
+use super::{
+    AddressSpaceId,
+    vma::{MappingId, VmaDescriptor},
+};
 
 fn mincore_file_visible(location: &axfs_ng_vfs::Location, cred: &crate::task::Cred) -> bool {
     use axfs_ng_vfs::NodePermission;
 
-    let Ok(metadata) = location.metadata() else { return false; };
+    let Ok(metadata) = location.metadata() else {
+        return false;
+    };
     cred.fsuid == metadata.uid
         || cred.has_cap_fowner()
         || cred.has_cap_dac_override()
@@ -140,9 +145,7 @@ fn occupied_leaf_ranges(
         {
             return Err(StarryError::OperationNotSupported);
         }
-        leaves
-            .try_reserve(1)
-            .map_err(|_| StarryError::NoMemory)?;
+        leaves.try_reserve(1).map_err(|_| StarryError::NoMemory)?;
         leaves.push((entry.vaddr, leaf_size));
     }
     Ok(leaves)
@@ -154,11 +157,8 @@ fn validate_occupied_leaf_range(
     pt: &PageTable,
 ) -> bool {
     occupied_leaf_ranges(range, pt).is_ok_and(|leaves| {
-        expected_leaf_size.is_none_or(|expected| {
-            leaves
-                .iter()
-                .all(|(_, leaf_size)| *leaf_size == expected)
-        })
+        expected_leaf_size
+            .is_none_or(|expected| leaves.iter().all(|(_, leaf_size)| *leaf_size == expected))
     })
 }
 
@@ -396,16 +396,8 @@ impl FaultMaterialization {
 }
 
 impl PopulateRequest {
-    pub(super) fn area(
-        range: VirtAddrRange,
-        preferred_leaf_size: usize,
-    ) -> StarryResult<Self> {
-        Self::new(
-            range,
-            preferred_leaf_size,
-            None,
-            FaultFallback::Forbidden,
-        )
+    pub(super) fn area(range: VirtAddrRange, preferred_leaf_size: usize) -> StarryResult<Self> {
+        Self::new(range, preferred_leaf_size, None, FaultFallback::Forbidden)
     }
 
     pub(super) fn fault(
@@ -462,23 +454,13 @@ impl PopulateRequest {
     /// fault. Keeping this transition on the typed request prevents callers
     /// from accidentally retaining the original 2 MiB publication range.
     pub(super) fn into_base_page_fallback(self) -> Option<Self> {
-        if self.fallback != FaultFallback::BasePage
-            || self.preferred_leaf_size <= PAGE_SIZE_4K
-        {
+        if self.fallback != FaultFallback::BasePage || self.preferred_leaf_size <= PAGE_SIZE_4K {
             return None;
         }
         let fault_address = self.fault_address?;
-        let range = VirtAddrRange::try_from_start_size(
-            fault_address.align_down_4k(),
-            PAGE_SIZE_4K,
-        )?;
-        Self::fault(
-            range,
-            PAGE_SIZE_4K,
-            fault_address,
-            FaultFallback::Forbidden,
-        )
-        .ok()
+        let range =
+            VirtAddrRange::try_from_start_size(fault_address.align_down_4k(), PAGE_SIZE_4K)?;
+        Self::fault(range, PAGE_SIZE_4K, fault_address, FaultFallback::Forbidden).ok()
     }
 }
 
@@ -536,7 +518,6 @@ impl PteMaterialization {
         self.owners.append(&mut other.owners);
         Ok(())
     }
-
 }
 
 pub(super) trait MappingExecution {
@@ -572,11 +553,7 @@ pub(super) trait MappingExecution {
     }
 
     /// Unmap a memory region.
-    fn unmap(
-        &self,
-        range: VirtAddrRange,
-        pt: &mut PageTable,
-    ) -> StarryResult;
+    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTable) -> StarryResult;
 
     /// Read-only unmap preflight. `NotMapped` is valid for lazy mappings;
     /// malformed page-table walks are rejected before any leaf is detached.
@@ -673,6 +650,14 @@ pub(super) trait MappingExecution {
 #[derive(Clone)]
 pub struct MappingOperation {
     kind: MappingOperationKind,
+    /// A mapping keeps its writable open description busy after close(fd).
+    write_access: Option<Arc<MappingWriteAccess>>,
+}
+
+// VMA fragments and rollback snapshots within one MM share this token. Fork
+// creates a separate token so retiring one MM cannot release another's lease.
+struct MappingWriteAccess {
+    lease: crate::sync::Mutex<Option<Arc<ax_fs_ng::file::WriteAccess>>>,
 }
 
 #[derive(Clone)]
@@ -786,27 +771,50 @@ pub(crate) struct ResidentLeafRestore<'a> {
 }
 
 impl MappingOperation {
+    /// Retains the source open's exclusion lease across every VMA fragment.
+    pub(crate) fn with_write_access(
+        mut self,
+        access: Option<Arc<ax_fs_ng::file::WriteAccess>>,
+    ) -> Self {
+        self.write_access = access.map(|lease| {
+            Arc::new(MappingWriteAccess {
+                lease: crate::sync::Mutex::new(Some(lease)),
+            })
+        });
+        self
+    }
+
+    /// Detaches this MM's VMA lease; duplicate fragments return `None`.
+    /// The caller must drop the returned inode lease outside MM metadata locks.
+    pub(super) fn take_write_access(&self) -> Option<Arc<ax_fs_ng::file::WriteAccess>> {
+        self.write_access.as_ref()?.lease.lock().take()
+    }
+
     fn from_linear(backend: linear::LinearBackend) -> Self {
         Self {
             kind: MappingOperationKind::Linear(backend),
+            write_access: None,
         }
     }
 
     fn from_cow(backend: cow::CowBackend) -> Self {
         Self {
             kind: MappingOperationKind::Cow(backend),
+            write_access: None,
         }
     }
 
     fn from_shared(backend: shared::SharedBackend) -> Self {
         Self {
             kind: MappingOperationKind::Shared(backend),
+            write_access: None,
         }
     }
 
     fn from_file(backend: file::FileBackend) -> Self {
         Self {
             kind: MappingOperationKind::File(backend),
+            write_access: None,
         }
     }
 
@@ -865,10 +873,7 @@ impl MappingOperation {
         source: VirtAddrRange,
         fragment: VirtAddrRange,
     ) -> StarryResult<Self> {
-        if fragment.is_empty()
-            || fragment.start < source.start
-            || fragment.end > source.end
-        {
+        if fragment.is_empty() || fragment.start < source.start || fragment.end > source.end {
             return Err(StarryError::InvalidInput);
         }
         let mut operation = self.clone();
@@ -877,8 +882,8 @@ impl MappingOperation {
                 .start
                 .checked_sub_addr(source.start)
                 .ok_or(StarryError::InvalidInput)?;
-            operation = MappingExecution::split(&mut operation, offset)
-                .ok_or(StarryError::BadState)?;
+            operation =
+                MappingExecution::split(&mut operation, offset).ok_or(StarryError::BadState)?;
         }
         if fragment.end < source.end {
             let shrink = source
@@ -937,20 +942,16 @@ impl MappingOperation {
     /// Derive the Linux `VM_MAY*`-equivalent permission envelope from the
     /// executable mapping capability rather than exposing its concrete kind.
     pub(crate) fn maximum_mapping_flags(&self, current: MappingFlags) -> MappingFlags {
-        let permission_bits = MappingFlags::READ
-            | MappingFlags::WRITE
-            | MappingFlags::EXECUTE
-            | MappingFlags::USER;
+        let permission_bits =
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE | MappingFlags::USER;
         let attributes = current - permission_bits;
         match &self.kind {
             MappingOperationKind::Cow(_) | MappingOperationKind::Shared(_) => {
                 attributes | permission_bits
             }
             MappingOperationKind::File(file) => {
-                let mut maximum = attributes
-                    | MappingFlags::READ
-                    | MappingFlags::EXECUTE
-                    | MappingFlags::USER;
+                let mut maximum =
+                    attributes | MappingFlags::READ | MappingFlags::EXECUTE | MappingFlags::USER;
                 if file.check_flags(MappingFlags::WRITE).is_ok() {
                     maximum |= MappingFlags::WRITE;
                 }
@@ -970,8 +971,9 @@ impl MappingOperation {
     pub(crate) fn validate_discard_fragment(&self, range: VirtAddrRange) -> StarryResult {
         match &self.kind {
             MappingOperationKind::Linear(_) => Err(StarryError::InvalidInput),
-            MappingOperationKind::Shared(_) if !range.start.is_aligned(self.page_size())
-                || !range.end.is_aligned(self.page_size()) =>
+            MappingOperationKind::Shared(_)
+                if !range.start.is_aligned(self.page_size())
+                    || !range.end.is_aligned(self.page_size()) =>
             {
                 Err(StarryError::OperationNotSupported)
             }
@@ -1013,14 +1015,7 @@ impl MappingOperation {
         access_flags: MappingFlags,
         preimage: FaultPteSnapshot,
     ) -> StarryResult<FaultMaterialization> {
-        MappingExecution::prepare_fault(
-            self,
-            space_id,
-            request,
-            flags,
-            access_flags,
-            preimage,
-        )
+        MappingExecution::prepare_fault(self, space_id, request, flags, access_flags, preimage)
     }
 
     pub(super) fn clone_map(
@@ -1037,20 +1032,13 @@ impl MappingOperation {
         MappingExecution::validate_unmap(self, range, pt)
     }
 
-    pub(crate) fn unmap_range(
-        &self,
-        range: VirtAddrRange,
-        pt: &mut PageTable,
-    ) -> StarryResult {
+    pub(crate) fn unmap_range(&self, range: VirtAddrRange, pt: &mut PageTable) -> StarryResult {
         MappingExecution::unmap(self, range, pt)
     }
 
     /// Resolve a process-shared futex against its backing object rather than
     /// against the current VMA fragment.
-    pub(crate) fn shared_futex_identity(
-        &self,
-        address: VirtAddr,
-    ) -> Option<SharedFutexIdentity> {
+    pub(crate) fn shared_futex_identity(&self, address: VirtAddr) -> Option<SharedFutexIdentity> {
         match &self.kind {
             MappingOperationKind::Shared(shared) => shared.shared_futex_identity(address),
             MappingOperationKind::File(file) => file.shared_futex_identity(address),
@@ -1101,9 +1089,7 @@ impl MappingOperation {
         }
         match &self.kind {
             MappingOperationKind::Cow(cow) => cow.cancel_page_publication(&owner.page),
-            MappingOperationKind::File(file) => {
-                file.cancel_page_publication(owner.va, &owner.page)
-            }
+            MappingOperationKind::File(file) => file.cancel_page_publication(owner.va, &owner.page),
             MappingOperationKind::Linear(_) | MappingOperationKind::Shared(_) => Ok(()),
         }
     }
@@ -1159,7 +1145,8 @@ impl MappingOperation {
     pub(crate) fn mincore_resident(&self, va: VirtAddr, cred: &crate::task::Cred) -> bool {
         match &self.kind {
             MappingOperationKind::Cow(cow) => {
-                cow.mincore_location().is_some_and(|location| !mincore_file_visible(location, cred))
+                cow.mincore_location()
+                    .is_some_and(|location| !mincore_file_visible(location, cred))
                     || cow.page_cache_resident(va)
             }
             MappingOperationKind::File(file) => {
@@ -1202,22 +1189,20 @@ impl MappingOperation {
     /// Clone with a different base address (for mremap moves).
     /// `src_offset` is the distance from the original VMA start to the
     /// mremap source address, used to adjust file/page offsets.
-    pub fn relocated(
-        &self,
-        new_start: VirtAddr,
-        src_offset: usize,
-    ) -> StarryResult<Self> {
+    pub fn relocated(&self, new_start: VirtAddr, src_offset: usize) -> StarryResult<Self> {
         let adjusted = new_start
             .as_usize()
             .checked_sub(src_offset)
             .map(VirtAddr::from)
             .ok_or(StarryError::InvalidInput)?;
-        Ok(match &self.kind {
+        let mut operation = match &self.kind {
             MappingOperationKind::Cow(cb) => Self::from_cow(cb.with_start(adjusted)),
             MappingOperationKind::Shared(sb) => Self::from_shared(sb.with_start(adjusted)),
             MappingOperationKind::Linear(_) => return Err(StarryError::OperationNotSupported),
             MappingOperationKind::File(fb) => Self::from_file(fb.with_start(adjusted)?),
-        })
+        };
+        operation.write_access = self.write_access.clone();
+        Ok(operation)
     }
 
     /// Adjusts the logical extent for an `mremap` destination.  The operation
@@ -1228,12 +1213,14 @@ impl MappingOperation {
         if size == 0 {
             return Err(StarryError::InvalidInput);
         }
-        Ok(match &self.kind {
+        let mut operation = match &self.kind {
             MappingOperationKind::Cow(cow) => Self::from_cow(cow.for_extent(size)?),
             MappingOperationKind::Shared(shared) => Self::from_shared(shared.with_size(size)?),
             MappingOperationKind::Linear(_) => return Err(StarryError::OperationNotSupported),
             MappingOperationKind::File(file) => Self::from_file(file.clone()),
-        })
+        };
+        operation.write_access = self.write_access.clone();
+        Ok(operation)
     }
 }
 
@@ -1274,15 +1261,11 @@ impl MappingExecution for MappingOperation {
             MappingOperationKind::Linear(backend) => {
                 MappingExecution::map(backend, range, flags, pt)
             }
-            MappingOperationKind::Cow(backend) => {
-                MappingExecution::map(backend, range, flags, pt)
-            }
+            MappingOperationKind::Cow(backend) => MappingExecution::map(backend, range, flags, pt),
             MappingOperationKind::Shared(backend) => {
                 MappingExecution::map(backend, range, flags, pt)
             }
-            MappingOperationKind::File(backend) => {
-                MappingExecution::map(backend, range, flags, pt)
-            }
+            MappingOperationKind::File(backend) => MappingExecution::map(backend, range, flags, pt),
         }
     }
 
@@ -1305,18 +1288,10 @@ impl MappingExecution for MappingOperation {
 
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTable) -> StarryResult {
         match &self.kind {
-            MappingOperationKind::Linear(backend) => {
-                MappingExecution::unmap(backend, range, pt)
-            }
-            MappingOperationKind::Cow(backend) => {
-                MappingExecution::unmap(backend, range, pt)
-            }
-            MappingOperationKind::Shared(backend) => {
-                MappingExecution::unmap(backend, range, pt)
-            }
-            MappingOperationKind::File(backend) => {
-                MappingExecution::unmap(backend, range, pt)
-            }
+            MappingOperationKind::Linear(backend) => MappingExecution::unmap(backend, range, pt),
+            MappingOperationKind::Cow(backend) => MappingExecution::unmap(backend, range, pt),
+            MappingOperationKind::Shared(backend) => MappingExecution::unmap(backend, range, pt),
+            MappingOperationKind::File(backend) => MappingExecution::unmap(backend, range, pt),
         }
     }
 
@@ -1451,7 +1426,7 @@ impl MappingExecution for MappingOperation {
         old_pt: &mut PageTable,
         new_pt: &mut PageTable,
     ) -> StarryResult<(MappingOperation, PteMaterialization)> {
-        match &self.kind {
+        let (operation, materialization) = match &self.kind {
             MappingOperationKind::Linear(backend) => {
                 MappingExecution::clone_map(backend, range, flags, old_pt, new_pt)
             }
@@ -1464,16 +1439,23 @@ impl MappingExecution for MappingOperation {
             MappingOperationKind::File(backend) => {
                 MappingExecution::clone_map(backend, range, flags, old_pt, new_pt)
             }
-        }
+        }?;
+        let write_access = self
+            .write_access
+            .as_ref()
+            .and_then(|access| access.lease.lock().clone());
+        Ok((operation.with_write_access(write_access), materialization))
     }
 
     fn split(&mut self, align_diff: usize) -> Option<MappingOperation> {
-        match &mut self.kind {
+        let mut operation = match &mut self.kind {
             MappingOperationKind::Linear(backend) => MappingExecution::split(backend, align_diff),
             MappingOperationKind::Cow(backend) => MappingExecution::split(backend, align_diff),
             MappingOperationKind::Shared(backend) => MappingExecution::split(backend, align_diff),
             MappingOperationKind::File(backend) => MappingExecution::split(backend, align_diff),
-        }
+        }?;
+        operation.write_access = self.write_access.clone();
+        Some(operation)
     }
 
     fn shrink_left(&mut self, shrink_size: usize) -> bool {
@@ -1514,9 +1496,17 @@ impl MappingExecution for MappingOperation {
 impl MappingBackend for MappingOperation {
     type Addr = VirtAddr;
     type Flags = MappingFlags;
+    type MutationContext = ();
     type PageTable = PageTable;
 
-    fn map(&self, start: VirtAddr, size: usize, flags: MappingFlags, pt: &mut PageTable) -> bool {
+    fn map(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+        _context: &mut (),
+        pt: &mut PageTable,
+    ) -> bool {
         let range = VirtAddrRange::from_start_size(start, size);
         if let Err(err) = MappingExecution::map(self, range, flags, pt) {
             warn!("Failed to map area: {:?}", err);
@@ -1539,7 +1529,7 @@ impl MappingBackend for MappingOperation {
         MappingExecution::validate_map(self, range, pt)
     }
 
-    fn unmap(&self, start: VirtAddr, size: usize, pt: &mut PageTable) -> bool {
+    fn unmap(&self, start: VirtAddr, size: usize, _context: &mut (), pt: &mut PageTable) -> bool {
         let range = VirtAddrRange::from_start_size(start, size);
         if let Err(err) = MappingExecution::unmap(self, range, pt) {
             warn!("Failed to unmap area: {:?}", err);
@@ -1561,6 +1551,7 @@ impl MappingBackend for MappingOperation {
         start: Self::Addr,
         size: usize,
         new_flags: Self::Flags,
+        _context: &mut (),
         pt: &mut Self::PageTable,
     ) -> bool {
         let range = VirtAddrRange::from_start_size(start, size);

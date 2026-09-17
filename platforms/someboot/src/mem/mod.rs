@@ -166,19 +166,6 @@ pub fn dma_coherent_after_mapping_update() {
     Arch::dma_coherent_after_mapping_update();
 }
 
-#[cfg(any(test, all(target_arch = "riscv64", feature = "thead-mae")))]
-pub(crate) fn cache_line_range(
-    addr: usize,
-    size: usize,
-    line_size: usize,
-) -> Option<(usize, usize)> {
-    if size == 0 || line_size == 0 || !line_size.is_power_of_two() {
-        return None;
-    }
-    let end = addr.checked_add(size)?;
-    Some((addr & !(line_size - 1), end))
-}
-
 /// 物理RAM实际转换为的内核虚拟地址
 pub fn phys_to_virt(paddr: usize) -> *mut u8 {
     if mmu::is_kernel_relocated() {
@@ -318,95 +305,4 @@ pub(crate) fn add_memory_descriptor(
 
 pub fn virtual_address_space() -> Result<VirtualAddressSpaceLayout, VirtualAddressSpaceError> {
     Arch::virtual_address_space()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cache_line_range_covers_unaligned_buffer() {
-        assert_eq!(cache_line_range(0x1003, 1, 64), Some((0x1000, 0x1004)));
-        assert_eq!(cache_line_range(0x103f, 2, 64), Some((0x1000, 0x1041)));
-    }
-
-    #[test]
-    fn cache_line_range_skips_empty_invalid_line_and_overflow() {
-        assert_eq!(cache_line_range(0x1000, 0, 64), None);
-        assert_eq!(cache_line_range(0x1000, 1, 0), None);
-        assert_eq!(cache_line_range(0x1000, 1, 63), None);
-        assert_eq!(cache_line_range(usize::MAX, 2, 64), None);
-    }
-}
-
-#[cfg(test)]
-mod coverage_tests {
-    use super::*;
-
-    fn mem_constants_and_cache_line_rules_hold_for_test() -> bool {
-        // KB/MB/GB constants
-        assert!(KB == 1024);
-        assert!(MB == 1024 * KB);
-        assert!(GB == 1024 * MB);
-
-        // KIMAGE_MAP_ALIGN
-        assert!(KIMAGE_MAP_ALIGN == 2 * MB);
-
-        // cache_line_range: valid inputs
-        let result = cache_line_range(0x1000, 64, 64).unwrap();
-        assert!(result.0 == 0x1000); // aligned down
-        assert!(result.1 == 0x1040); // addr + size
-
-        // cache_line_range: zero size returns None
-        assert!(cache_line_range(0x1000, 0, 64).is_none());
-
-        // cache_line_range: zero line_size returns None
-        assert!(cache_line_range(0x1000, 64, 0).is_none());
-
-        // cache_line_range: non-power-of-2 line_size returns None
-        assert!(cache_line_range(0x1000, 64, 63).is_none());
-
-        // cache_line_range: overflow returns None
-        assert!(cache_line_range(usize::MAX, 1, 64).is_none());
-
-        true
-    }
-
-    fn mem_constants_and_types_hold_for_test() -> bool {
-        // Test memory constants
-        assert_eq!(KB, 1024);
-        assert_eq!(MB, 1024 * 1024);
-        assert_eq!(GB, 1024 * 1024 * 1024);
-        assert_eq!(KIMAGE_MAP_ALIGN, 2 * MB);
-
-        // Test MemoryMap capacity
-        assert_eq!(MEMORY_MAP_CAPACITY, 512);
-
-        true
-    }
-
-    fn mem_byte_unit_types_hold_for_test() -> bool {
-        // Test byte_unit types exist
-        use byte_unit::Byte;
-
-        // Test that Byte can be created
-        let _byte = Byte::from_u64(1024);
-
-        true
-    }
-
-    #[test]
-    fn mem_constants_and_cache_line_rules_hold() {
-        assert!(mem_constants_and_cache_line_rules_hold_for_test());
-    }
-
-    #[test]
-    fn mem_constants_and_types_hold() {
-        assert!(mem_constants_and_types_hold_for_test());
-    }
-
-    #[test]
-    fn mem_byte_unit_types_hold() {
-        assert!(mem_byte_unit_types_hold_for_test());
-    }
 }

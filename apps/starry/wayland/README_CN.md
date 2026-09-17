@@ -56,7 +56,7 @@ APK 注入 rootfs overlay。客体内脚本是 [`wayland-test.sh`](wayland-test.
 
 ## 使用 VNC 手动复现
 
-手动流程刻意绕过 app 测试里的 `shell_init_cmd`，直接启动同一个内核和 Alpine
+手动流程刻意绕过 app 测试里的 `shell_cmd`，直接启动同一个内核和 Alpine
 rootfs。这样可以在 StarryOS shell 中手动输入命令，并通过 VNC 与 GTK 窗口交互。
 直接启动的 riscv64 和 x86_64 流程进入客体后的 Weston 和 GTK 命令完全相同，只有
 宿主机侧的 QEMU 启动命令不同。aarch64 请使用后文 aarch64 说明中的辅助脚本。
@@ -267,6 +267,11 @@ provision，之后复用已经 provision 好的镜像：
 ./apps/starry/wayland/run-hvf.sh --no-build --provision-only
 STARRY_VNC=9 ./apps/starry/wayland/run-hvf.sh --no-build --vnc-only
 ```
+
+[`prebuild.sh`](prebuild.sh) 通过 HTTPS 预取包及签名索引；安装前使用基础 rootfs 的
+`/etc/apk/keys` 验证全部索引和 APK，再从签名离线仓库安装，认证失败即停止。
+旧脚本已 provision 的镜像不会自动重新认证，升级后需使用
+`--reprovision --provision-only` 从可信基础镜像重建。
 
 使用 `--reprovision` 可以丢弃并重新创建
 `tmp/axbuild/rootfs/rootfs-aarch64-wayland.img`。如果默认 4096 MiB 的手动镜像

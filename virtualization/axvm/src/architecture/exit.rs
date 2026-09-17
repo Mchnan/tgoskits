@@ -3,18 +3,18 @@
 use axdevice_base::{BusKind, DeviceAccess, DeviceVcpuId};
 use axvm_types::VmArchVcpuOps;
 
-use super::{BoundVcpuExit, HypercallExit, MmioReadExit, MmioWriteExit, VcpuRunAction};
+use super::{HypercallExit, MmioReadExit, MmioWriteExit, VcpuExitAction, VcpuRunAction};
 use crate::{AxVmError, AxVmResult, StopReason};
 
-pub(crate) fn handle_mmio_read<V: VmArchVcpuOps, D>(
+pub(crate) fn handle_mmio_read<V: VmArchVcpuOps>(
     vm: &crate::AxVM,
     vcpu: &crate::vm::AxVCpuRef<V>,
     exit: MmioReadExit,
-) -> AxVmResult<BoundVcpuExit<D>> {
+) -> AxVmResult<VcpuExitAction> {
     if !try_handle_mmio_read(vm, vcpu, exit)? {
         return Err(missing_mmio_error("read", exit.addr, exit.width));
     }
-    Ok(BoundVcpuExit::Continue)
+    Ok(VcpuExitAction::Continue)
 }
 
 pub(crate) fn try_handle_mmio_read<V: VmArchVcpuOps>(
@@ -48,11 +48,6 @@ pub(crate) fn read_mmio_value<V: VmArchVcpuOps>(
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
-pub(crate) fn finish_external_interrupt(vector: usize) {
-    crate::host::arceos::dispatch_host_irq(vector);
-}
-
 pub(crate) fn try_read_mmio_value<V: VmArchVcpuOps>(
     vm: &crate::AxVM,
     vcpu: &crate::vm::AxVCpuRef<V>,
@@ -70,15 +65,15 @@ pub(crate) fn try_read_mmio_value<V: VmArchVcpuOps>(
         .map_err(|error| AxVmError::device("read guest MMIO", error))
 }
 
-pub(crate) fn handle_mmio_write<V: VmArchVcpuOps, D>(
+pub(crate) fn handle_mmio_write<V: VmArchVcpuOps>(
     vm: &crate::AxVMRef,
     vcpu: &crate::vm::AxVCpuRef<V>,
     exit: MmioWriteExit,
-) -> AxVmResult<BoundVcpuExit<D>> {
+) -> AxVmResult<VcpuExitAction> {
     if !try_handle_mmio_write(vm, vcpu, exit)? {
         return Err(missing_mmio_error("write", exit.addr, exit.width));
     }
-    Ok(BoundVcpuExit::Continue)
+    Ok(VcpuExitAction::Continue)
 }
 
 pub(crate) fn try_handle_mmio_write<V: VmArchVcpuOps>(
@@ -115,6 +110,7 @@ fn missing_mmio_error(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HyperCallExitAction {
     Return(usize),
+    Defer(crate::runtime::hvc::DeferredHyperCall),
     Complete(VcpuRunAction),
     CompleteWithReturn {
         return_value: usize,
@@ -151,6 +147,7 @@ pub(crate) fn hvc_outcome_action(
         crate::runtime::hvc::HyperCallOutcome::Return(ret_val) => {
             HyperCallExitAction::Return(ret_val)
         }
+        crate::runtime::hvc::HyperCallOutcome::Deferred(work) => HyperCallExitAction::Defer(work),
         crate::runtime::hvc::HyperCallOutcome::CpuSuspendStandby { return_value } => {
             HyperCallExitAction::CompleteWithReturn {
                 return_value,
@@ -189,12 +186,12 @@ pub(crate) fn hvc_outcome_action(
     }
 }
 
-pub(crate) fn handle_hypercall<V: VmArchVcpuOps, D>(
+pub(crate) fn handle_hypercall<V: VmArchVcpuOps>(
     vm: &crate::AxVMRef,
     vcpu: &crate::vm::AxVCpuRef<V>,
     exit: HypercallExit,
     abi: crate::runtime::hvc::HyperCallAbi,
-) -> AxVmResult<BoundVcpuExit<D>> {
+) -> AxVmResult<VcpuExitAction> {
     debug!("Hypercall [{:#x}] args {:x?}", exit.nr, exit.args);
     match crate::runtime::hvc::HyperCall::new(vm.clone(), exit.nr, exit.args, abi) {
         Ok(hypercall) => match hypercall.execute() {
@@ -202,15 +199,18 @@ pub(crate) fn handle_hypercall<V: VmArchVcpuOps, D>(
                 HyperCallExitAction::Return(ret_val) => {
                     vcpu.set_return_value(ret_val);
                 }
+                HyperCallExitAction::Defer(work) => {
+                    return Ok(VcpuExitAction::DeferHypercall(work));
+                }
                 HyperCallExitAction::CompleteWithReturn {
                     return_value,
                     action,
                 } => {
                     vcpu.set_return_value(return_value);
-                    return Ok(BoundVcpuExit::Complete(action));
+                    return Ok(VcpuExitAction::Complete(action));
                 }
                 HyperCallExitAction::Complete(action) => {
-                    return Ok(BoundVcpuExit::Complete(action));
+                    return Ok(VcpuExitAction::Complete(action));
                 }
             },
             Err(error) => {
@@ -225,7 +225,7 @@ pub(crate) fn handle_hypercall<V: VmArchVcpuOps, D>(
             complete_hypercall_decode_error(vcpu, exit.nr, abi);
         }
     }
-    Ok(BoundVcpuExit::Complete(VcpuRunAction {
+    Ok(VcpuExitAction::Complete(VcpuRunAction {
         waits_for_event: false,
         stop_reason: None,
         resets_vm: false,
@@ -339,6 +339,20 @@ mod tests {
                     exits_vcpu: false,
                 },
             }
+        );
+    }
+
+    #[test]
+    fn hvc_cpu_on_is_deferred_until_vcpu_ownership_is_released() {
+        let work = crate::runtime::hvc::DeferredHyperCall::PsciCpuOn {
+            target_vcpu_id: 1,
+            entry_point: axvm_types::GuestPhysAddr::from_usize(0x80_000),
+            context_id: 7,
+        };
+
+        assert_eq!(
+            hvc_outcome_action(HyperCallOutcome::Deferred(work)),
+            HyperCallExitAction::Defer(work)
         );
     }
 

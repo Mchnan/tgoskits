@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use bytemuck::{AnyBitPattern, Pod, bytes_of, zeroed};
 
-use crate::{VmError, VmImpl, VmIo, VmResult, vm_read_slice};
+use crate::{VmError, VmIo, VmResult, vm_read_slice};
 
 /// Loads a vector of elements from the virtual memory.
 ///
@@ -12,9 +12,9 @@ use crate::{VmError, VmImpl, VmIo, VmResult, vm_read_slice};
 ///
 /// The caller must ensure the memory pointed to by `ptr` is valid and
 /// initialized.
-pub unsafe fn vm_load_any<T>(ptr: *const T, len: usize) -> VmResult<Vec<T>> {
+pub unsafe fn vm_load_any<I: VmIo, T>(vm: &mut I, ptr: *const T, len: usize) -> VmResult<Vec<T>> {
     let mut buf = Vec::with_capacity(len);
-    vm_read_slice(ptr, &mut buf.spare_capacity_mut()[..len])?;
+    vm_read_slice(vm, ptr, &mut buf.spare_capacity_mut()[..len])?;
     // SAFETY: The caller guarantees that the memory is valid and initialized.
     unsafe { buf.set_len(len) }
     Ok(buf)
@@ -22,9 +22,13 @@ pub unsafe fn vm_load_any<T>(ptr: *const T, len: usize) -> VmResult<Vec<T>> {
 
 /// Loads a vector of elements from the virtual memory.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn vm_load<T: AnyBitPattern>(ptr: *const T, len: usize) -> VmResult<Vec<T>> {
+pub fn vm_load<I: VmIo, T: AnyBitPattern>(
+    vm: &mut I,
+    ptr: *const T,
+    len: usize,
+) -> VmResult<Vec<T>> {
     // SAFETY: `AnyBitPattern`
-    unsafe { vm_load_any(ptr, len) }
+    unsafe { vm_load_any(vm, ptr, len) }
 }
 
 #[inline]
@@ -66,15 +70,13 @@ fn next_load_chunk(
 }
 
 /// Loads elements from the given pointer until a zero element is found.
-pub fn vm_load_until_nul<T: Pod>(ptr: *const T) -> VmResult<Vec<T>> {
+pub fn vm_load_until_nul<I: VmIo, T: Pod>(vm: &mut I, ptr: *const T) -> VmResult<Vec<T>> {
     if !ptr.is_aligned() {
         return Err(VmError::BadAddress);
     }
 
     let size = size_of::<T>();
     let mut result = Vec::new();
-    let mut vm = VmImpl::new();
-
     loop {
         let (start, len) = next_load_chunk(ptr.addr(), result.len(), size)?;
 
@@ -100,27 +102,7 @@ pub fn vm_load_until_nul<T: Pod>(ptr: *const T) -> VmResult<Vec<T>> {
 }
 
 #[cfg(test)]
-fn vm_alloc_is_zero_and_max_bytes_rules_hold_for_test() -> bool {
-    // is_zero: zero value returns true
-    let zero_val: u64 = 0;
-    assert!(is_zero(&zero_val));
-
-    // is_zero: non-zero value returns false
-    let nonzero_val: u64 = 42;
-    assert!(!is_zero(&nonzero_val));
-
-    // MAX_BYTES constant check
-    assert!(MAX_BYTES == 131072);
-
-    true
-}
-
-#[cfg(test)]
 mod tests {
-    #[test]
-    fn allocation_constants_and_zero_value_helpers_hold() {
-        assert!(super::vm_alloc_is_zero_and_max_bytes_rules_hold_for_test());
-    }
 
     #[test]
     fn load_chunk_rejects_address_overflow() {

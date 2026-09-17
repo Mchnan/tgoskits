@@ -18,9 +18,11 @@ pub(crate) mod usbfs;
 
 use alloc::{boxed::Box, sync::Arc};
 
-use ax_fs_ng::vfs::FsContext;
+use ax_fs_ng::vfs::{FsContext, current_fs_context};
 use ax_lazyinit::LazyInit;
-use axfs_ng_vfs::{DirNodeOps, FileNodeOps, Filesystem, NodePermission, WeakDirEntry};
+use axfs_ng_vfs::{
+    DirNodeOps, FileNodeOps, Filesystem, MutationCredentials, NodePermission, WeakDirEntry,
+};
 pub use tmp::MemoryFs;
 
 pub use self::{device::*, dir::*, file::*, fs::*};
@@ -73,7 +75,7 @@ pub fn tmp_tmpfs() -> Option<Arc<tmp::MemoryFs>> {
 fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> StarryResult<()> {
     let initial_resolve = fs.resolve(path);
     if initial_resolve.is_err() {
-        fs.create_dir(path, DIR_PERMISSION, 0, 0)?;
+        fs.create_dir(path, DIR_PERMISSION, 0, 0, &MutationCredentials::root())?;
     }
     let loc = fs.resolve(path)?;
     loc.mount_with_source(&mount_fs, mount_fs.name())?;
@@ -85,7 +87,7 @@ fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> StarryResult<()
 pub fn mount_all() -> StarryResult<()> {
     info!("Initialize pseudofs...");
 
-    let fs_context = ax_fs_ng::vfs::current_fs_context();
+    let fs_context = current_fs_context();
     let fs = fs_context.lock();
     mount_at(&fs, "/dev", dev::new_devfs())?;
     let usbfs = usbfs::new_usbfs()?;

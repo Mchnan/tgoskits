@@ -1,17 +1,17 @@
+use alloc::sync::Arc;
 #[cfg(test)]
 use core::sync::atomic::AtomicUsize;
-use core::{
-    sync::atomic::{AtomicU8, Ordering},
-    task::Context,
-};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use ax_io::{SeekFrom, prelude::*};
 use axfs_ng_vfs::{
-    FileExtentMap, FileExtentTarget, FileRangeOperation, FsIoEvents, FsPollable, Location,
-    NodeFlags, PreallocationMode, VfsError, VfsResult, path::Path,
+    FileExtentMap, FileExtentTarget, FileRangeOperation, Location, NodeFlags, PreallocationMode,
+    VfsError, VfsResult, path::Path,
 };
+use axpoll::{IoEvents, Pollable};
 
 use super::{
+    access::WriteAccess,
     cache::CachedFile,
     open::{FileFlags, OpenOptions, OpenResult},
 };
@@ -220,6 +220,7 @@ impl FileBackend {
 
 /// Provides `std::fs::File`-like interface.
 pub struct File {
+    pub(super) write_access: Option<Arc<WriteAccess>>,
     inner: FileBackend,
     flags: AtomicU8,
     position: Option<Mutex<u64>>,
@@ -227,7 +228,10 @@ pub struct File {
 }
 
 impl File {
-    /// Creates a new [`File`] from a [`FileBackend`] and access flags.
+    /// Creates a low-level file without registering inode write access.
+    ///
+    /// Use [`OpenOptions`] for ordinary opens. Anonymous pseudo files such as
+    /// newly created memfds deliberately bypass executable/write exclusion.
     pub fn new(inner: FileBackend, flags: FileFlags) -> Self {
         // man 2 open: "The file offset is set to the beginning of the file"
         // — initial position is always 0, regardless of O_APPEND.
@@ -241,11 +245,18 @@ impl File {
             Some(Mutex::new(0))
         };
         Self {
+            write_access: None,
             inner,
             flags: AtomicU8::new(flags.bits()),
             position,
             access_flags: AtomicU8::new(0),
         }
+    }
+
+    /// Returns the writer lease retained by this open file description.
+    /// Clone it when a mapping outlives the descriptor that created it.
+    pub fn write_access(&self) -> Option<&Arc<WriteAccess>> {
+        self.write_access.as_ref()
     }
 
     /// Opens an existing file for reading.
@@ -466,13 +477,25 @@ impl Seek for &File {
     }
 }
 
-impl FsPollable for File {
-    fn poll(&self) -> FsIoEvents {
+impl Pollable for File {
+    fn poll(&self) -> IoEvents {
         self.inner.location().poll()
     }
 
-    fn register(&self, context: &mut Context<'_>, events: FsIoEvents) {
-        self.inner.location().register(context, events)
+    unsafe fn register_shared(
+        &self,
+        sink: &mut dyn axpoll::SharedRegistrationSink,
+        events: IoEvents,
+    ) {
+        unsafe { self.inner.location().register_shared(sink, events) }
+    }
+
+    unsafe fn register_exclusive(
+        &self,
+        sink: &mut dyn axpoll::ExclusiveRegistrationSink,
+        events: IoEvents,
+    ) {
+        unsafe { self.inner.location().register_exclusive(sink, events) }
     }
 }
 
@@ -509,15 +532,14 @@ mod tests {
     use core::{
         any::Any,
         sync::atomic::{AtomicUsize, Ordering},
-        task::Context,
         time::Duration,
     };
 
     use axfs_ng_vfs::{
-        DeviceId, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, FsIoEvents,
-        FsPollable, Metadata, MetadataUpdate, Mountpoint, NodeOps, NodePermission, NodeType,
-        Reference, StatFs,
+        DeviceId, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata,
+        MetadataUpdate, Mountpoint, NodeOps, NodePermission, NodeType, Reference, StatFs,
     };
+    use axpoll::{IoEvents, Pollable};
 
     use super::*;
 
@@ -619,12 +641,17 @@ mod tests {
         }
     }
 
-    impl FsPollable for MetadataTrackingTestFile {
-        fn poll(&self) -> FsIoEvents {
-            FsIoEvents::IN | FsIoEvents::OUT
+    impl Pollable for MetadataTrackingTestFile {
+        fn poll(&self) -> IoEvents {
+            IoEvents::IN | IoEvents::OUT
         }
 
-        fn register(&self, _context: &mut Context<'_>, _events: FsIoEvents) {}
+        unsafe fn register_shared(
+            &self,
+            _sink: &mut dyn axpoll::SharedRegistrationSink,
+            _events: IoEvents,
+        ) {
+        }
     }
 
     impl FileNodeOps for MetadataTrackingTestFile {

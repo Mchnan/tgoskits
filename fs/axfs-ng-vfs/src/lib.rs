@@ -1,5 +1,4 @@
 #![no_std]
-
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
@@ -8,13 +7,11 @@ mod fs;
 mod mount;
 mod node;
 pub mod path;
-mod poll;
 mod types;
 
 pub use fs::*;
 pub use mount::*;
 pub use node::*;
-pub use poll::*;
 pub use types::*;
 
 /// Errors owned by the virtual-filesystem domain.
@@ -78,6 +75,8 @@ pub enum VfsError {
     ResourceBusy,
     #[error("filesystem storage is full")]
     StorageFull,
+    #[error("executable file is busy")]
+    TextFileBusy,
     #[error("filesystem operation timed out")]
     TimedOut,
     #[error("filesystem object has too many links")]
