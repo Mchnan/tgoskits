@@ -202,14 +202,12 @@ pub type IoSrc<'a> = dyn ReadBuf + 'a;
 
 #[allow(dead_code)]
 pub trait FileLike: Pollable + DowncastSync {
-    /// Size in bytes reported for `lseek(SEEK_END)` on seekable pseudo-files
-    /// such as dma-buf fds. `None` keeps the historical `ESPIPE` behavior.
+    /// Seek a special file using its own offset rules.
     ///
-    /// Mesa/gbm probe a dma-buf's size with `lseek(fd, 0, SEEK_END)` before
-    /// importing it as an EGLImage; without this hook those imports fail
-    /// with `EGL_BAD_ALLOC`.
-    fn seekable_size(&self) -> Option<u64> {
-        None
+    /// Files without a seek operation return ESPIPE. Implementations own any
+    /// cursor state and must reject offsets or origins their file type forbids.
+    fn seek(&self, _pos: ax_io::SeekFrom) -> StarryResult<u64> {
+        Err(StarryError::from(crate::Errno::ESPIPE))
     }
 
     /// Whether this file supports epoll interest registration.

@@ -65,16 +65,14 @@ use super::drm::{
     DRM_IOCTL_SET_VERSION, DRM_IOCTL_VERSION, DRM_IOCTL_WAIT_VBLANK, DRM_MODE_ATOMIC_ALLOW_MODESET,
     DRM_MODE_ATOMIC_NONBLOCK, DRM_MODE_ATOMIC_TEST_ONLY, DRM_MODE_CONNECTED,
     DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_FB_MODIFIERS,
-    DRM_MODE_OBJECT_BLOB, DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_OBJECT_CRTC,
-    DRM_MODE_OBJECT_FB, DRM_MODE_OBJECT_PLANE,
+    DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_OBJECT_CRTC, DRM_MODE_OBJECT_FB, DRM_MODE_OBJECT_PLANE,
     DRM_MODE_PAGE_FLIP_EVENT, DRM_MODE_PROP_ATOMIC, DRM_MODE_PROP_BLOB, DRM_MODE_PROP_ENUM,
-    DRM_MODE_PROP_IMMUTABLE, DRM_MODE_PROP_OBJECT, DRM_MODE_PROP_RANGE,
-    DRM_MODE_PROP_SIGNED_RANGE, DRM_PLANE_TYPE_PRIMARY,
-    DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_IMPORT, DRM_PROP_NAME_LEN, DrmAuth, DrmEvent,
-    DrmEventVblank, DrmGetCap, DrmModeAtomic, DrmModeCardRes, DrmModeCreateBlob, DrmModeCreateDumb,
-    DrmModeCrtc, DrmModeCrtcPageFlip, DrmModeDestroyBlob, DrmModeDestroyDumb, DrmModeDirtyFB,
-    DrmModeFbCmd2, DrmModeGetBlob, DrmModeGetConnector, DrmModeGetEncoder, DrmModeGetPlane,
-    DrmModeGetPlaneRes, DrmModeGetProperty, DrmModeMapDumb, DrmModeModeInfo,
+    DRM_MODE_PROP_IMMUTABLE, DRM_MODE_PROP_OBJECT, DRM_MODE_PROP_RANGE, DRM_MODE_PROP_SIGNED_RANGE,
+    DRM_PLANE_TYPE_PRIMARY, DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_IMPORT, DRM_PROP_NAME_LEN, DrmAuth,
+    DrmEvent, DrmEventVblank, DrmGetCap, DrmModeAtomic, DrmModeCardRes, DrmModeCreateBlob,
+    DrmModeCreateDumb, DrmModeCrtc, DrmModeCrtcPageFlip, DrmModeDestroyBlob, DrmModeDestroyDumb,
+    DrmModeDirtyFB, DrmModeFbCmd2, DrmModeGetBlob, DrmModeGetConnector, DrmModeGetEncoder,
+    DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty, DrmModeMapDumb, DrmModeModeInfo,
     DrmModeObjGetProperties, DrmModePropertyEnum, DrmPrimeHandle, DrmSetClientCap, DrmSetVersion,
     DrmUnique, DrmVersion, DrmWaitVblank,
 };
@@ -131,11 +129,8 @@ const PROP_PLANE_CRTC_H: u32 = 0x10A;
 /// `IN_FORMATS` — immutable blob property advertising the (format,
 /// modifier) tuples this plane accepts.
 const PROP_PLANE_IN_FORMATS: u32 = 0x10B;
-/// `IN_FENCE_FD` — signed-range fence-fd property on every plane. The
-/// emulation presents synchronously, so the fence carries no timing
-/// information; advertising it keeps strict-fencing compositors (denial
-/// requires it on the primary plane) functional. Commits consume the fd
-/// like Linux so strict-fencing clients do not leak one fd per frame.
+/// Standard explicit-fence property. Only the no-fence sentinel is currently
+/// supported: Starry has no sync-file producer or fence-wait implementation.
 const PROP_PLANE_IN_FENCE_FD: u32 = 0x10C;
 
 const PROP_CRTC_ACTIVE: u32 = 0x200;
@@ -264,8 +259,13 @@ impl FileLike for DmaBufGem {
         "anon_inode:dmabuf".into()
     }
 
-    fn seekable_size(&self) -> Option<u64> {
-        Some(self.size)
+    fn seek(&self, pos: ax_io::SeekFrom) -> StarryResult<u64> {
+        // Linux dma_buf_llseek is a size probe, not a file cursor.
+        match pos {
+            ax_io::SeekFrom::Start(0) => Ok(0),
+            ax_io::SeekFrom::End(0) => Ok(self.size),
+            _ => Err(StarryError::InvalidInput),
+        }
     }
 
     fn device_mmap(&self, offset: u64, length: u64) -> StarryResult<DeviceMmap> {
@@ -633,7 +633,7 @@ impl DeviceOps for Card0 {
             DRM_IOCTL_MODE_DESTROY_DUMB => self.handle_destroy_dumb(current, arg),
 
             DRM_IOCTL_MODE_GETPLANERESOURCES => handle_get_plane_resources(current, arg),
-            DRM_IOCTL_MODE_GETPLANE => handle_get_plane(self, current, arg),
+            DRM_IOCTL_MODE_GETPLANE => self.handle_get_plane(current, arg),
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.handle_obj_get_properties(current, arg),
             DRM_IOCTL_MODE_GETPROPERTY => handle_get_property(current, arg),
             DRM_IOCTL_MODE_PAGE_FLIP => self.handle_page_flip(current, arg),
@@ -1312,35 +1312,28 @@ fn handle_get_plane_resources(current: &crate::task::UserTaskRef, arg: usize) ->
     Ok(0)
 }
 
-fn handle_get_plane(card: &Card0, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
-    let ptr = arg as *mut DrmModeGetPlane;
-    let mut p: DrmModeGetPlane = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
-    if p.plane_id != PLANE_ID {
-        return Err(VfsError::InvalidInput);
-    }
-    // Report the live atomic state: compositors (deniald) verify an atomic
-    // commit by reading GETPLANE back and checking the primary plane really
-    // is scanning out the committed framebuffer.
-    let state = *card.state.lock();
-    p.fb_id = state.plane_fb_id;
-    p.crtc_id = if state.plane_fb_id != 0 {
-        state.plane_crtc_id
-    } else {
-        0
-    };
-    p.possible_crtcs = 1;
-    p.gamma_size = 0;
-    p.count_format_types = report_user_array(
-        current,
-        p.format_type_ptr,
-        p.count_format_types,
-        SUPPORTED_FORMATS,
-    )?;
-    ptr.vm_write(current, p).map_err(|_| VfsError::BadAddress)?;
-    Ok(0)
-}
-
 impl Card0 {
+    fn handle_get_plane(&self, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
+        let ptr = arg as *mut DrmModeGetPlane;
+        let mut p: DrmModeGetPlane = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
+        if p.plane_id != PLANE_ID {
+            return Err(VfsError::InvalidInput);
+        }
+        let state = *self.state.lock();
+        p.crtc_id = state.plane_crtc_id;
+        p.fb_id = state.plane_fb_id;
+        p.possible_crtcs = 1;
+        p.gamma_size = 0;
+        p.count_format_types = report_user_array(
+            current,
+            p.format_type_ptr,
+            p.count_format_types,
+            SUPPORTED_FORMATS,
+        )?;
+        ptr.vm_write(current, p).map_err(|_| VfsError::BadAddress)?;
+        Ok(0)
+    }
+
     fn handle_obj_get_properties(
         &self,
         current: &crate::task::UserTaskRef,
@@ -1358,14 +1351,14 @@ impl Card0 {
             }
             (DRM_MODE_OBJECT_CRTC, CRTC_ID) => (CRTC_PROPS, crtc_prop_values(&state)),
             (DRM_MODE_OBJECT_CONNECTOR, CONNECTOR_ID) => (CONN_PROPS, conn_prop_values(&state)),
-            // smithay's atomic backend snapshots properties for framebuffers
-            // as well. Valid objects without properties report an empty list
-            // (count 0), not ENOENT, matching Linux.
             (DRM_MODE_OBJECT_FB, fb_id) => {
-                if !self.fbs.lock().contains_key(&fb_id) {
-                    return Err(VfsError::NotFound);
-                }
-                (&[], Vec::new())
+                // Linux rejects objects without a property container after
+                // lookup, distinguishing them from nonexistent object IDs.
+                return Err(if self.fbs.lock().contains_key(&fb_id) {
+                    VfsError::InvalidInput
+                } else {
+                    VfsError::NotFound
+                });
             }
             _ => return Err(VfsError::NotFound),
         };
@@ -1477,17 +1470,13 @@ fn handle_get_property(current: &crate::task::UserTaskRef, arg: usize) -> VfsRes
             g.count_values = report_user_array(current, g.values_ptr, g.count_values, &limits)?;
             g.count_enum_blobs = 0;
         }
-        // Linux returns values[0] == DRM_MODE_OBJECT_* for OBJECT
-        // properties and values[0] == DRM_MODE_OBJECT_BLOB for BLOB
-        // properties; drm-rs indexes values[0] unconditionally.
         PropKind::Object(object_type) => {
             let values = [object_type as u64];
             g.count_values = report_user_array(current, g.values_ptr, g.count_values, &values)?;
             g.count_enum_blobs = 0;
         }
         PropKind::Blob => {
-            let values = [DRM_MODE_OBJECT_BLOB as u64];
-            g.count_values = report_user_array(current, g.values_ptr, g.count_values, &values)?;
+            g.count_values = 0;
             g.count_enum_blobs = 0;
         }
     }
@@ -1603,18 +1592,6 @@ fn range_u32(name: &'static str, atomic: u32) -> PropMeta {
             max: u32::MAX as u64,
         },
     }
-}
-
-/// Per-commit side effects collected by `apply_prop`. Both fields are
-/// published only after the whole batch validates so a TEST_ONLY commit
-/// or a later property error leaves committed state untouched.
-#[derive(Default)]
-struct CommitEffects {
-    /// Outer Option: "the commit assigned MODE_ID at least once".
-    /// Inner Option: the resolved Arc (None means clearing MODE_ID to 0).
-    new_mode_blob: Option<Option<Arc<Vec<u8>>>>,
-    /// IN_FENCE_FD user fd to consume after a successful real commit.
-    pending_fence_close: Option<i32>,
 }
 
 impl Card0 {
@@ -1745,7 +1722,12 @@ impl Card0 {
 
         let mut state = self.state.lock();
         let mut proposed = *state;
-        let mut effects = CommitEffects::default();
+        // Outer Option: "the commit assigned MODE_ID at least once".
+        // Inner Option: the resolved Arc (None means clearing MODE_ID to 0).
+        // Only published into `mode_id_blob_ref` after the whole batch
+        // validates so a TEST_ONLY commit or a later property error
+        // leaves the committed mode blob ref untouched.
+        let mut new_mode_blob: Option<Option<Arc<Vec<u8>>>> = None;
         let mut idx = 0;
         for (obj_i, &obj_id) in objs.iter().enumerate() {
             let obj_type = object_type_of(obj_id).ok_or(VfsError::NotFound)?;
@@ -1753,33 +1735,19 @@ impl Card0 {
                 let prop_id = props[idx];
                 let value = values[idx];
                 idx += 1;
-                if !self.apply_prop(
-                    obj_type,
-                    obj_id,
-                    prop_id,
-                    value,
-                    &mut proposed,
-                    &mut effects,
-                )? {
+                if !self.apply_prop(obj_type, prop_id, value, &mut proposed, &mut new_mode_blob)? {
                     return Err(VfsError::InvalidInput);
                 }
             }
         }
 
         if a.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 {
-            // TEST_ONLY never consumes the fence fd.
             return Ok(0);
         }
-        if let Some(fd) = effects.pending_fence_close {
-            // Linux takes ownership of IN_FENCE_FD on a real commit; the
-            // emulation has no use for the fence, so just close it.
-            let _ = crate::file::close_file_like(fd);
-        }
-
         let current_fb = proposed.plane_fb_id;
         *state = proposed;
         drop(state);
-        if let Some(new_ref) = effects.new_mode_blob {
+        if let Some(new_ref) = new_mode_blob {
             *self.mode_id_blob_ref.lock() = new_ref;
         }
         if current_fb != 0 {
@@ -1797,11 +1765,10 @@ impl Card0 {
     fn apply_prop(
         &self,
         obj_type: u32,
-        _obj_id: u32,
         prop_id: u32,
         value: u64,
         s: &mut ModesetState,
-        effects: &mut CommitEffects,
+        new_mode_blob: &mut Option<Option<Arc<Vec<u8>>>>,
     ) -> VfsResult<bool> {
         match (obj_type, prop_id) {
             (DRM_MODE_OBJECT_PLANE, PROP_PLANE_TYPE) => {
@@ -1837,18 +1804,12 @@ impl Card0 {
             (DRM_MODE_OBJECT_PLANE, PROP_PLANE_CRTC_W) => s.plane_crtc_w = value,
             (DRM_MODE_OBJECT_PLANE, PROP_PLANE_CRTC_H) => s.plane_crtc_h = value,
             (DRM_MODE_OBJECT_PLANE, PROP_PLANE_IN_FENCE_FD) => {
-                // [-1, INT_MAX] signed range; -1 (u64::MAX) means "no
-                // fence". A real commit consumes the fd like Linux, but a
-                // TEST_ONLY commit or a failed batch must leave it intact,
-                // so the close is deferred to the commit path.
-                if value == u64::MAX {
-                    return Ok(true);
-                }
-                let fd = i64::try_from(value).map_err(|_| VfsError::InvalidInput)?;
-                if fd < 0 || fd > i32::MAX as i64 {
+                // Linux borrows a sync-file fence and never closes the user's
+                // fd, including on TEST_ONLY or failure. No Starry file type
+                // provides a sync-file yet, so every non-sentinel is invalid.
+                if value != u64::MAX {
                     return Err(VfsError::InvalidInput);
                 }
-                effects.pending_fence_close = Some(fd as i32);
             }
             (DRM_MODE_OBJECT_CRTC, PROP_CRTC_ACTIVE) => {
                 if value > 1 {
@@ -1878,7 +1839,7 @@ impl Card0 {
                     Some(arc.ok_or(VfsError::InvalidInput)?)
                 };
                 s.crtc_mode_id = blob;
-                effects.new_mode_blob = Some(arc);
+                *new_mode_blob = Some(arc);
             }
             (DRM_MODE_OBJECT_CONNECTOR, PROP_CONN_CRTC_ID) => {
                 let c = value as u32;

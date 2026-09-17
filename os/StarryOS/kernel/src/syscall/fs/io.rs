@@ -241,25 +241,7 @@ pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> StarryResu
         return Ok(new_pos as _);
     }
 
-    // Seekable pseudo-files (dma-buf fds): Mesa/gbm probes the buffer size
-    // with lseek(fd, 0, SEEK_END) before EGLImage import. These fds keep no
-    // cursor, so SEEK_CUR is anchored at 0 like SEEK_END is at the size.
-    if let Some(size) = any_file.clone().seekable_size() {
-        let new_pos: u64 = match pos {
-            SeekFrom::Start(o) => o,
-            SeekFrom::End(d) => {
-                let abs = size as i128 + d as i128;
-                if abs < 0 {
-                    return Err(StarryError::InvalidInput);
-                }
-                u64::try_from(abs).map_err(|_| StarryError::InvalidInput)?
-            }
-            SeekFrom::Current(d) => u64::try_from(d).map_err(|_| StarryError::InvalidInput)?,
-        };
-        return Ok(new_pos as _);
-    }
-
-    Err(StarryError::from(Errno::ESPIPE))
+    Ok(any_file.seek(pos)? as _)
 }
 
 pub fn sys_truncate(

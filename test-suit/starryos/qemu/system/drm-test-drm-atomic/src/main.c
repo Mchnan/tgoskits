@@ -21,6 +21,8 @@
 #include <poll.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 struct drm_mode_mode_info {
@@ -96,7 +98,6 @@ struct drm_event_vblank {
 
 #define DRM_MODE_OBJECT_CRTC        0xcccccccc
 #define DRM_MODE_OBJECT_FB          0xfbfbfbfb
-#define DRM_MODE_OBJECT_BLOB        0xbbbbbbbb
 #define DRM_MODE_OBJECT_CONNECTOR   0xc0c0c0c0
 #define DRM_MODE_OBJECT_PLANE       0xeeeeeeee
 #define DRM_MODE_ATOMIC_TEST_ONLY   0x0100
@@ -276,13 +277,13 @@ int main(void)
         gp.count_values = 2;
         CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &gp), 0,
                   "GETPROPERTY crtc.MODE_ID");
-        CHECK(gp.count_values == 1, "MODE_ID exposes exactly one value");
-        CHECK(vals[0] == DRM_MODE_OBJECT_BLOB,
-              "MODE_ID value type == DRM_MODE_OBJECT_BLOB");
+        CHECK(gp.count_values == 0, "BLOB metadata has no values");
+        CHECK(gp.count_enum_blobs == 0, "BLOB metadata has no enum payload");
+        CHECK(vals[0] == 0 && vals[1] == 0, "BLOB leaves value buffer untouched");
     }
 
-    /* smithay 的 atomic 后端会对 framebuffer 也快照属性。合法对象没有
-     * 属性时必须返回空列表（count_props==0），而不是 ENOENT。 */
+    /* Linux distinguishes an existing framebuffer without a property
+     * container (EINVAL) from an unknown framebuffer (ENOENT). */
     {
         uint32_t ids[8] = {0};
         uint64_t vals[8] = {0};
@@ -292,9 +293,11 @@ int main(void)
         q.count_props = 8;
         q.props_ptr = (uint64_t)(uintptr_t)ids;
         q.prop_values_ptr = (uint64_t)(uintptr_t)vals;
-        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &q), 0,
-                  "OBJ_GETPROPERTIES framebuffer");
-        CHECK(q.count_props == 0, "framebuffer has empty property list");
+        CHECK_ERR(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &q), EINVAL,
+                  "framebuffer without property container returns EINVAL");
+        q.obj_id = UINT32_MAX;
+        CHECK_ERR(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &q), ENOENT,
+                  "unknown framebuffer returns ENOENT");
     }
 
     /* PRIME 导出的 dma-buf 必须支持 lseek(SEEK_END) 返回缓冲大小。
@@ -307,8 +310,14 @@ int main(void)
         CHECK_RET(ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph), 0,
                   "PRIME_HANDLE_TO_FD");
         CHECK(ph.fd >= 0, "PRIME export returns an fd");
-        off_t sz = lseek(ph.fd, 0, SEEK_END);
+        off_t sz = syscall(SYS_lseek, ph.fd, 0, SEEK_END);
         CHECK(sz == (off_t)cd.size, "dmabuf lseek SEEK_END == buffer size");
+        CHECK_RET(syscall(SYS_lseek, ph.fd, 0, SEEK_SET), 0, "dmabuf SEEK_SET(0)");
+        CHECK_ERR(syscall(SYS_lseek, ph.fd, 0, SEEK_CUR), EINVAL, "dmabuf rejects SEEK_CUR");
+        CHECK_ERR(syscall(SYS_lseek, ph.fd, 1, SEEK_SET), EINVAL, "dmabuf rejects nonzero SET");
+        CHECK_ERR(syscall(SYS_lseek, ph.fd, -1L, SEEK_END), EINVAL, "dmabuf rejects nonzero END");
+        CHECK_RET(syscall(SYS_lseek, ph.fd, 0, SEEK_END), (long)cd.size,
+                  "rejected seeks preserve size probe");
         close(ph.fd);
     }
 
@@ -390,7 +399,7 @@ int main(void)
     {
         struct drm_mode_get_plane {
             uint32_t plane_id;
-            uint32_t fb_id; uint32_t crtc_id; uint32_t crtcs_possible;
+            uint32_t crtc_id; uint32_t fb_id; uint32_t crtcs_possible;
             uint32_t gamma_size; uint32_t count_format_types;
             uint64_t format_type_ptr;
         };
@@ -406,10 +415,8 @@ int main(void)
         CHECK(gp2.crtc_id == crtcs[0], "GETPLANE reports committed crtc_id");
     }
 
-    /* --- IN_FENCE_FD ---
-     * 严格 fence 的合成器（denial 要求 primary plane 必须广播）把它声明为
-     * 符号范围 [-1, INT_MAX]；真实提交要按 Linux 语义消费 fence fd，
-     * 否则逐帧 fence 的客户端会泄漏 fd。 */
+    /* IN_FENCE_FD borrows a sync-file; it never owns the caller's fd.
+     * Starry currently has no sync-file producer, so only -1 is valid. */
     uint32_t P_PLANE_IN_FENCE_FD = find_prop(fd, planes[0],
                                              DRM_MODE_OBJECT_PLANE,
                                              "IN_FENCE_FD");
@@ -432,53 +439,55 @@ int main(void)
               "IN_FENCE_FD idle value == -1");
     }
     {
-        uint32_t t_objs[1] = { planes[0] };
-        uint32_t t_counts[1] = { 1 };
-        uint32_t t_props[1] = { P_PLANE_IN_FENCE_FD };
-        uint64_t t_values[1] = { (uint64_t)-1 };
+        int probe = open("/dev/zero", O_RDONLY | O_CLOEXEC);
+        int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        int card = dup(fd);
+        int closed = dup(fd);
+        CHECK(probe >= 0 && sock >= 0 && card >= 0 && closed >= 0,
+              "create non-sync-file descriptors");
+        close(closed);
+        CHECK_ERR(syscall(SYS_lseek, sock, 0L, SEEK_SET), ESPIPE,
+                  "nonseekable socket retains ESPIPE");
+        uint32_t t_objs[] = { planes[0] };
+        uint32_t t_counts[] = { 2 };
+        uint32_t t_props[] = { P_PLANE_CRTC_X, P_PLANE_IN_FENCE_FD };
+        uint64_t old_x = obj_prop_value(fd, planes[0], DRM_MODE_OBJECT_PLANE, P_PLANE_CRTC_X);
+        uint64_t t_values[] = { old_x + 1, (uint64_t)-1 };
         struct drm_mode_atomic t = {
-            .flags = DRM_MODE_ATOMIC_TEST_ONLY,
             .count_objs = 1,
             .objs_ptr = (uint64_t)(uintptr_t)t_objs,
             .count_props_ptr = (uint64_t)(uintptr_t)t_counts,
             .props_ptr = (uint64_t)(uintptr_t)t_props,
             .prop_values_ptr = (uint64_t)(uintptr_t)t_values,
         };
-        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &t), 0,
-                  "TEST_ONLY IN_FENCE_FD=-1 accepted");
-        t_values[0] = (uint64_t)-2;
-        CHECK_ERR(ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &t), EINVAL,
-                  "IN_FENCE_FD=-2 rejected");
-        /* TEST_ONLY 不消费真实 fd。 */
-        int probe = open("/dev/zero", O_RDONLY | O_CLOEXEC);
-        CHECK(probe >= 0, "open fence probe fd");
-        t_values[0] = (uint64_t)probe;
-        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &t), 0,
-                  "TEST_ONLY with real fd accepted");
-        CHECK(fcntl(probe, F_GETFD) != -1,
-              "TEST_ONLY did not consume the fence fd");
+        const uint64_t invalid[] = { (uint64_t)-2, 2147483648ULL,
+                                    (uint64_t)closed, (uint64_t)probe,
+                                    (uint64_t)sock, (uint64_t)card };
+        for (unsigned test_only = 0; test_only < 2; test_only++) {
+            t.flags = test_only ? DRM_MODE_ATOMIC_TEST_ONLY : 0;
+            for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+                t_values[1] = invalid[i];
+                CHECK_ERR(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_ATOMIC, &t), EINVAL,
+                          "invalid fence rejected before atomic publication");
+                CHECK(obj_prop_value(fd, planes[0], DRM_MODE_OBJECT_PLANE, P_PLANE_CRTC_X) == old_x,
+                      "invalid fence leaves earlier properties unchanged");
+                CHECK(fcntl(probe, F_GETFD) >= 0 && fcntl(sock, F_GETFD) >= 0 &&
+                      fcntl(card, F_GETFD) >= 0, "invalid fence preserves caller descriptors");
+            }
+        }
+        t_values[1] = (uint64_t)-1;
+        CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_ATOMIC, &t), 0,
+                  "TEST_ONLY without fence accepted");
+        CHECK(obj_prop_value(fd, planes[0], DRM_MODE_OBJECT_PLANE, P_PLANE_CRTC_X) == old_x,
+              "TEST_ONLY without fence preserves state");
+        t.flags = 0;
+        CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_ATOMIC, &t), 0,
+                  "real commit without fence accepted");
+        CHECK(obj_prop_value(fd, planes[0], DRM_MODE_OBJECT_PLANE, P_PLANE_CRTC_X) == old_x + 1,
+              "real commit without fence publishes state");
         close(probe);
-    }
-    {
-        /* 真实提交消费 fence fd。 */
-        int fence = open("/dev/zero", O_RDONLY | O_CLOEXEC);
-        CHECK(fence >= 0, "open fence fd");
-        uint32_t r_objs[1] = { planes[0] };
-        uint32_t r_counts[1] = { 1 };
-        uint32_t r_props[1] = { P_PLANE_IN_FENCE_FD };
-        uint64_t r_values[1] = { (uint64_t)fence };
-        struct drm_mode_atomic r = {
-            .flags = 0,
-            .count_objs = 1,
-            .objs_ptr = (uint64_t)(uintptr_t)r_objs,
-            .count_props_ptr = (uint64_t)(uintptr_t)r_counts,
-            .props_ptr = (uint64_t)(uintptr_t)r_props,
-            .prop_values_ptr = (uint64_t)(uintptr_t)r_values,
-        };
-        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &r), 0,
-                  "commit with IN_FENCE_FD accepted");
-        CHECK(fcntl(fence, F_GETFD) == -1 && errno == EBADF,
-              "commit consumed the fence fd");
+        close(sock);
+        close(card);
     }
 
     /* page flip event 应可读。 */
