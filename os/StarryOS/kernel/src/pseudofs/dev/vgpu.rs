@@ -88,6 +88,9 @@ pub const DRM_IOCTL_GEM_CLOSE: u32 = iow::<DrmGemClose>(DRM_TYPE, 0x09);
 // consts stop at 0xBE so nothing collides).
 pub const DRM_IOCTL_SYNCOBJ_CREATE: u32 = iowr::<DrmSyncobjCreate>(DRM_TYPE, 0xBF);
 pub const DRM_IOCTL_SYNCOBJ_DESTROY: u32 = iowr::<DrmSyncobjDestroy>(DRM_TYPE, 0xC0);
+pub const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: u32 = iowr::<DrmSyncobjHandle>(DRM_TYPE, 0xC1);
+pub const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u32 = iowr::<DrmSyncobjHandle>(DRM_TYPE, 0xC2);
+pub const DRM_IOCTL_SYNCOBJ_WAIT: u32 = iowr::<DrmSyncobjWait>(DRM_TYPE, 0xC3);
 pub const DRM_IOCTL_SYNCOBJ_RESET: u32 = iowr::<DrmSyncobjArray>(DRM_TYPE, 0xC4);
 pub const DRM_IOCTL_SYNCOBJ_SIGNAL: u32 = iowr::<DrmSyncobjArray>(DRM_TYPE, 0xC5);
 pub const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: u32 = iowr::<DrmSyncobjTimelineWait>(DRM_TYPE, 0xCA);
@@ -244,6 +247,26 @@ pub struct DrmSyncobjCreate {
 #[derive(Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmSyncobjDestroy {
     pub handle: u32,
+    pub pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmSyncobjHandle {
+    pub handle: u32,
+    pub flags: u32,
+    pub fd: i32,
+    pub pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmSyncobjWait {
+    pub handles: u64,
+    pub timeout_nsec: i64,
+    pub count_handles: u32,
+    pub flags: u32,
+    pub first_signaled: u32,
     pub pad: u32,
 }
 
@@ -613,6 +636,15 @@ impl VgpuCard {
         };
 
         let res_id = self.next_res_id.fetch_add(1, Ordering::Relaxed);
+        // TEMP-PROBE(vkprobe): identify which blob the ICD creates.
+        warn!(
+            "vgpu TEMP-PROBE create_blob res={res_id} blob_mem={:#x} blob_flags={:#x} blob_id={:#x} size={:#x} cmd={}",
+            args.blob_mem,
+            args.blob_flags,
+            args.blob_id,
+            args.size,
+            args.cmd_size
+        );
         // The wire size is rounded up to the BAR slot granularity so the
         // host-side subregion (and every EPT subsection the hvf listener
         // derives from it) stays 16 KiB-aligned; see [`BAR_SLOT_ALIGN`].
@@ -750,7 +782,10 @@ impl VgpuCard {
             // syncobj path covers venus's needs.
             return Err(VfsError::OperationNotSupported);
         }
-        if args.size == 0 || args.size as usize > MAX_EXECBUF_BYTES {
+        // size == 0 is legal for ring-based contexts: the commands live in
+        // the ring buffer and the EXECBUFFER only kicks the host (Linux
+        // passes the empty stream through to SUBMIT_3D verbatim).
+        if args.size as usize > MAX_EXECBUF_BYTES {
             return Err(VfsError::InvalidInput);
         }
 
@@ -787,25 +822,48 @@ impl VgpuCard {
         }
 
         // Copy the command stream into contiguous kernel pages so the
-        // device layer can DMA it as one descriptor.
-        let page_count = args.size.div_ceil(PAGE_SIZE_4K as u32) as usize;
-        let cmd_page = GlobalPage::alloc_contiguous(page_count, PAGE_SIZE_4K)
-            .map_err(|_| VfsError::NoMemory)?;
-        {
+        // device layer can DMA it as one descriptor. Empty streams (ring
+        // kicks) skip this entirely. The GlobalPage binding must live at
+        // this scope: the slice handed to the submit borrows its pages.
+        let cmd_page = if args.size == 0 {
+            None
+        } else {
+            let page_count = args.size.div_ceil(PAGE_SIZE_4K as u32) as usize;
+            Some(GlobalPage::alloc_contiguous(page_count, PAGE_SIZE_4K).map_err(|_| VfsError::NoMemory)?)
+        };
+        if let Some(cmd_page) = &cmd_page {
+            // TEMP-PROBE(csblob3): pre-copy read straight off the user VA.
+            if let Ok(pre) = vm_load::<u8>(current, args.command as *const u8, 16) {
+                warn!(
+                    "vgpu TEMP-PROBE pre-copy cs = {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}",
+                    pre[0], pre[1], pre[2], pre[3], pre[4], pre[5], pre[6], pre[7],
+                    pre[8], pre[9], pre[10], pre[11], pre[12], pre[13], pre[14], pre[15]
+                );
+            }
             let loaded = vm_load::<u8>(current, args.command as *const u8, args.size as usize)
                 .map_err(|_| VfsError::BadAddress)?;
             // SAFETY: `cmd_page` is `page_count` pages long and
             // `loaded.len() == args.size` fits inside it.
             let dst = unsafe {
-                core::slice::from_raw_parts_mut(cmd_page.start_vaddr().as_usize() as *mut u8, args.size as usize)
+                core::slice::from_raw_parts_mut(
+                    cmd_page.start_vaddr().as_usize() as *mut u8,
+                    args.size as usize,
+                )
             };
             dst.copy_from_slice(&loaded);
         }
-        // SAFETY: `cmd_page` stays alive for the synchronous submit
-        // below, its pages are contiguous (GlobalPage contract), and the
-        // device layer only reads them during the round-trip.
-        let cmd = unsafe {
-            core::slice::from_raw_parts(cmd_page.start_vaddr().as_usize() as *const u8, args.size as usize)
+        let empty_cmd: [u8; 0] = [];
+        let cmd: &[u8] = match &cmd_page {
+            // SAFETY: `cmd_page` stays alive for the synchronous submit
+            // below, its pages are contiguous (GlobalPage contract), and the
+            // device layer only reads them during the round-trip.
+            Some(cmd_page) => unsafe {
+                core::slice::from_raw_parts(
+                    cmd_page.start_vaddr().as_usize() as *const u8,
+                    args.size as usize,
+                )
+            },
+            None => &empty_cmd,
         };
 
         // Read the out-syncobj list before submitting; their points get
@@ -828,8 +886,38 @@ impl VgpuCard {
             }
         }
 
-        let fence = !out_syncobjs.is_empty();
-        self.dev()?.submit_3d(ctx.ctx_id, cmd, ring_idx, fence).map_err(vfs_err)?;
+        // Linux fences EVERY execbuffer (virtio_gpu_execbuffer_ioctl always
+        // allocates an out-fence, and the ring idx rides on it). For a
+        // venus context the host defers the SUBMIT_3D response to fence
+        // retire regardless, so an unfenced submit would block forever on
+        // the synchronous round-trip.
+        let fence = true;
+
+        // TEMP-PROBE(vkprobe): surface the wire-level failure reason.
+        if let Err(err) = self.dev()?.submit_3d(ctx.ctx_id, cmd, ring_idx, fence) {
+            warn!(
+                "vgpu TEMP-PROBE submit_3d failed: {err:?} (ctx={} size={} ring={ring_idx:?} fence={fence} out={}",
+                ctx.ctx_id,
+                args.size,
+                out_syncobjs.len()
+            );
+            return Err(vfs_err(err));
+        }
+        warn!(
+            "vgpu TEMP-PROBE submit ok size={} bo={} in={} out={} cs0={:02x}{:02x}{:02x}{:02x} cs4={:02x}{:02x}{:02x}{:02x}",
+            args.size,
+            args.num_bo_handles,
+            args.num_in_syncobjs,
+            out_syncobjs.len(),
+            cmd.first().copied().unwrap_or(0),
+            cmd.get(1).copied().unwrap_or(0),
+            cmd.get(2).copied().unwrap_or(0),
+            cmd.get(3).copied().unwrap_or(0),
+            cmd.get(4).copied().unwrap_or(0),
+            cmd.get(5).copied().unwrap_or(0),
+            cmd.get(6).copied().unwrap_or(0),
+            cmd.get(7).copied().unwrap_or(0),
+        );
 
         for (handle, point) in out_syncobjs {
             let syncobjs = self.syncobjs.lock();
@@ -852,6 +940,20 @@ impl VgpuCard {
                 .filter(|m| m.mmap_key == offset)
                 .map(|m| (m.phys, m.size, m.map_info))
         })
+    }
+
+    /// TEMP-PROBE(csblob3): dump every mapped blob's BAR range (no
+    /// physical dereference — an EL1 read of MMIO phys without the
+    /// exception table crashed the kernel last round).
+    pub(crate) fn temp_probe_dump_blobs(&self) {
+        let resources = self.resources.lock();
+        for (bo, res) in resources.iter() {
+            let Some(m) = &res.map else { continue };
+            warn!(
+                "vgpu TEMP-PROBE blob bo={bo} res={} phys={:#x} size={:#x} map_info={:#x}",
+                res.res_handle, m.phys, m.size, m.map_info
+            );
+        }
     }
 
     // ---- KMS present side (blob scanout) ----
@@ -1045,6 +1147,53 @@ impl VgpuCard {
             }
             if ax_runtime::hal::time::monotonic_time_nanos().saturating_sub(start)
                 >= args.timeout_nsec
+            {
+                return Err(VfsError::TimedOut);
+            }
+            crate::task::yield_now();
+        }
+    }
+
+    /// Binary `DRM_IOCTL_SYNCOBJ_WAIT` — same predicate as the timeline
+    /// wait but every handle is checked at point 1. Shares the watermark
+    /// sleep policy: unsatisfied waits only reference future points, so
+    /// they block to the timeout only when `WAIT_FOR_SUBMIT` is set.
+    pub(crate) fn handle_syncobj_wait(&self, current: &UserTaskRef, arg: usize) -> VfsResult<usize> {
+        let args: DrmSyncobjWait = load_arg(current, arg)?;
+        let handles: Vec<u32> = vm_load(current, args.handles as *const u32, args.count_handles as usize)
+            .map_err(|_| VfsError::BadAddress)?;
+
+        let check = |syncobjs: &BTreeMap<u32, Arc<Mutex<SyncobjState>>>| -> VfsResult<bool> {
+            let mut any = false;
+            let mut all = true;
+            for handle in &handles {
+                let Some(state) = syncobjs.get(handle) else {
+                    return Err(VfsError::NotFound);
+                };
+                let done = state.lock().signaled_point >= 1;
+                any |= done;
+                all &= done;
+            }
+            Ok(if args.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0 {
+                all
+            } else {
+                any
+            })
+        };
+
+        let allow_block = args.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0;
+        let start = ax_runtime::hal::time::monotonic_time_nanos();
+        loop {
+            let syncobjs = self.syncobjs.lock();
+            if check(&syncobjs)? {
+                return Ok(0);
+            }
+            drop(syncobjs);
+            if !allow_block {
+                return Err(VfsError::InvalidInput);
+            }
+            if ax_runtime::hal::time::monotonic_time_nanos().saturating_sub(start)
+                >= args.timeout_nsec.unsigned_abs()
             {
                 return Err(VfsError::TimedOut);
             }

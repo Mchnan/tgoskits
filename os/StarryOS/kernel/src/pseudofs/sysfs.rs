@@ -153,6 +153,7 @@ impl SimpleDirOps for DevCharDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         let mut v: Vec<Cow<'a, str>> = alloc::vec![
             Cow::Owned(format!("{DRM_MAJOR}:0")),
+            Cow::Owned(format!("{DRM_MAJOR}:128")),
             Cow::Owned(format!("{FB_MAJOR}:0")),
         ];
         for i in 0..input_device_count() {
@@ -171,6 +172,7 @@ impl SimpleDirOps for DevCharDir {
             .ok_or(VfsError::NotFound)?;
         let target = match (maj, min) {
             (DRM_MAJOR, 0) => "../../devices/virtual/drm/card0".to_owned(),
+            (DRM_MAJOR, 128) => "../../devices/virtual/drm/renderD128".to_owned(),
             (FB_MAJOR, 0) => "../../devices/virtual/graphics/fb0".to_owned(),
             (INPUT_MAJOR, m)
                 if m >= EVDEV_MINOR_BASE && (m - EVDEV_MINOR_BASE) < input_device_count() =>
@@ -211,7 +213,7 @@ impl SimpleDirOps for ClassDir {
         Ok(NodeOpsMux::Dir(match name {
             "drm" => SimpleDir::new_maker(
                 fs.clone(),
-                Arc::new(ClassSubsystemDir::new(fs, "drm", &["card0"])),
+                Arc::new(ClassSubsystemDir::new(fs, "drm", &["card0", "renderD128"])),
             ),
             "graphics" => SimpleDir::new_maker(
                 fs.clone(),
@@ -845,7 +847,10 @@ impl SimpleDirOps for VirtualDir {
                 Arc::new(DeviceContainer::new(
                     fs,
                     "drm",
-                    &[("card0", (DRM_MAJOR, 0), "dri/card0")],
+                    &[
+                        ("card0", (DRM_MAJOR, 0), "dri/card0"),
+                        ("renderD128", (DRM_MAJOR, 128), "dri/renderD128"),
+                    ],
                 )),
             ),
             "graphics" => SimpleDir::new_maker(
@@ -1129,7 +1134,9 @@ struct PlatformDeviceDir {
 impl SimpleDirOps for PlatformDeviceDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         // virtio-gpu0 also exposes PCI-style identifiers so Mesa's DRI
-        // loader can match the device to a driver.
+        // loader can match the device to a driver, plus the kernel's DRM
+        // device-group directory (`<device>/drm/`) that libdrm's
+        // `drmNodeIsDRM` stats to recognize a DRM node.
         let mut names: Vec<&'static str> = alloc::vec!["uevent", "subsystem"];
         if self.driver == "virtio-gpu" {
             names.extend_from_slice(&[
@@ -1139,6 +1146,7 @@ impl SimpleDirOps for PlatformDeviceDir {
                 "subsystem_device",
                 "revision",
                 "class",
+                "drm",
             ]);
         }
         Box::new(names.into_iter().map(Cow::Borrowed))
@@ -1150,7 +1158,14 @@ impl SimpleDirOps for PlatformDeviceDir {
             "uevent" => {
                 let driver = self.driver.to_owned();
                 SimpleFile::new_regular(fs, move || {
-                    Ok(format!("DRIVER={driver}\nSUBSYSTEM=platform\n"))
+                    // MODALIAS is what libdrm's drmParseOFBusInfo falls back
+                    // to when the (virtual) platform device has no OF data:
+                    // without it drmGetDevice2 fails with ENOENT and
+                    // drmGetDevices2 never yields the render node, which
+                    // leaves the venus ICD with an empty device list.
+                    Ok(format!(
+                        "DRIVER={driver}\nSUBSYSTEM=platform\nMODALIAS=platform:{driver}\n"
+                    ))
                 })
                 .into()
             }
@@ -1179,7 +1194,40 @@ impl SimpleDirOps for PlatformDeviceDir {
                 // PCI class 0x030000 = display controller / VGA.
                 SimpleFile::new_regular(fs, || Ok("0x030000\n".to_owned())).into()
             }
+            "drm" if self.driver == "virtio-gpu" => {
+                // The kernel groups a device's DRM nodes under
+                // `<device>/drm/` (card0, renderD128, ...). libdrm's
+                // `drmNodeIsDRM` stats exactly this path before accepting
+                // a node from /dev/dri, so its absence makes
+                // drmGetDevices2 silently drop every node.
+                NodeOpsMux::Dir(SimpleDir::new_maker(
+                    fs.clone(),
+                    Arc::new(DrmDeviceGroupDir { fs }),
+                ))
+            }
             _ => return Err(VfsError::NotFound),
         })
+    }
+}
+
+/// `/sys/devices/platform/virtio-gpu0/drm/` — the DRM node group. The
+/// children are stub directories (libdrm only checks the group exists).
+struct DrmDeviceGroupDir {
+    fs: Arc<SimpleFs>,
+}
+
+impl SimpleDirOps for DrmDeviceGroupDir {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        Box::new(["card0", "renderD128"].into_iter().map(Cow::Borrowed))
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        if name != "card0" && name != "renderD128" {
+            return Err(VfsError::NotFound);
+        }
+        Ok(NodeOpsMux::Dir(SimpleDir::new_maker(
+            self.fs.clone(),
+            Arc::new(DevBlockDir),
+        )))
     }
 }

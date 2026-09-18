@@ -191,6 +191,12 @@ pub const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
 /// `modifier[]` array and validates every entry against the set we
 /// advertise in the plane's `IN_FORMATS` blob.
 pub const DRM_CAP_ADDFB2_MODIFIERS: u64 = 0x10;
+/// Reported so libdrm users (mesa's `util_sync_provider_drm`) take the
+/// kernel-syncobj path instead of a userspace simulation.
+pub const DRM_CAP_SYNCOBJ: u64 = 0x13;
+/// Timeline semantics (`TIMELINE_SIGNAL`/`TIMELINE_WAIT`/point `QUERY`).
+/// mesa's venus gates its fence signalling on this cap being non-zero.
+pub const DRM_CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
 
 /// `DRM_MODE_FB_MODIFIERS` — caller is providing `modifier[]` entries.
 /// Without this flag the `modifier[]` array in `drm_mode_fb_cmd2` is

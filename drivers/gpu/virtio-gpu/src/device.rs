@@ -49,8 +49,10 @@ const PAGE_SIZE: usize = 0x1000;
 const MAX_CMD_BYTES: usize = 128;
 /// Spin budget for a synchronous response wait before declaring the
 /// device unresponsive. Purely an error path — responses normally land
-/// in microseconds.
-const SPIN_BUDGET: u64 = 400_000_000;
+/// in microseconds. The venus host can take tens of milliseconds to
+/// respond to RING-blob creation (it spawns the ring worker thread), so
+/// the budget has to cover host-side latency spikes on macOS.
+const SPIN_BUDGET: u64 = 8_000_000_000;
 
 /// Fixed 2D scanout resource id (same value `VirtIOGpu` uses); 3D
 /// resource ids live in a disjoint range so the two faces never collide
@@ -447,6 +449,7 @@ impl<H: Hal, T: Transport> Inner<H, T> {
 
     /// Fire-and-forget fenced submit: takes ownership of the header and
     /// payload so they outlive this call, and returns without waiting.
+    /// An empty payload (ring kick) contributes no descriptor at all.
     fn submit_fenced(&mut self, header: &[u8], payload: &[u8]) -> Result<(), Gpu3DError> {
         if self.broken {
             return Err(Gpu3DError::IO);
@@ -458,17 +461,24 @@ impl<H: Hal, T: Transport> Inner<H, T> {
 
         let mut owned_header: Box<[u8; MAX_CMD_BYTES]> = Box::new([0; MAX_CMD_BYTES]);
         owned_header[..header.len()].copy_from_slice(header);
-        let payload_dma = DmaBuffer::<H>::new(payload.len(), BufferDirection::DriverToDevice)?;
-        payload_dma.write(payload);
+        let payload_dma = if payload.is_empty() {
+            None
+        } else {
+            let payload_dma = DmaBuffer::<H>::new(payload.len(), BufferDirection::DriverToDevice)?;
+            payload_dma.write(payload);
+            Some(payload_dma)
+        };
 
         let recv = (self.queue_buf_recv.as_mut_slice().as_mut_ptr(), PAGE_SIZE);
         // SAFETY: the header and payload buffers are owned by the pending
-        // entry pushed below, which keeps them alive until the response
-        // is consumed; the receive side is the scratch page.
+        // entry pushed below, which keeps them alive until the response is
+        // consumed; the receive side is the scratch page.
         let token = unsafe {
             self.add_chain(
                 (owned_header.as_ptr(), header.len()),
-                Some((payload_dma.slice(payload.len()).as_ptr(), payload.len())),
+                payload_dma
+                    .as_ref()
+                    .map(|dma| (dma.slice(payload.len()).as_ptr(), payload.len())),
                 recv,
             )?
         };
@@ -478,7 +488,7 @@ impl<H: Hal, T: Transport> Inner<H, T> {
             payload_borrow: None,
             buffers: PendingBuffers::Owned {
                 header: owned_header,
-                payload: Some(payload_dma),
+                payload: payload_dma,
                 payload_len: payload.len(),
             },
         });
@@ -878,6 +888,11 @@ impl<H: Hal, T: Transport> VirtioGpu3D for VirtioGpuDevice<H, T> {
             // stream retires the fence, so this must not block; the
             // entry owns its buffers until the response is drained.
             inner.submit_fenced(bytes_of(&req), cmd)?;
+        } else if cmd.is_empty() {
+            // Ring kicks carry no stream; skip the zero-length payload
+            // descriptor entirely.
+            let recv = (inner.queue_buf_recv.as_mut_slice().as_mut_ptr(), PAGE_SIZE);
+            inner.request_sync(bytes_of(&req), None, recv)?;
         } else {
             // Unfenced submits respond immediately; a synchronous
             // round-trip is safe (and matches Linux's single-fence

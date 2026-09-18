@@ -68,7 +68,8 @@ use super::drm::{
     DRM_IOCTL_MODE_GETPROPERTY, DRM_IOCTL_MODE_GETRESOURCES, DRM_IOCTL_MODE_MAP_DUMB,
     DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_MODE_PAGE_FLIP, DRM_IOCTL_MODE_RMFB,
     DRM_IOCTL_MODE_SETCRTC, DRM_IOCTL_PRIME_FD_TO_HANDLE, DRM_IOCTL_PRIME_HANDLE_TO_FD,
-    DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_SET_MASTER, DRM_IOCTL_SET_VERSION, DRM_IOCTL_VERSION,
+    DRM_CAP_SYNCOBJ, DRM_CAP_SYNCOBJ_TIMELINE, DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_SET_MASTER,
+    DRM_IOCTL_SET_VERSION, DRM_IOCTL_VERSION,
     DRM_IOCTL_WAIT_VBLANK, DRM_MODE_ATOMIC_ALLOW_MODESET, DRM_MODE_ATOMIC_NONBLOCK,
     DRM_MODE_ATOMIC_TEST_ONLY, DRM_MODE_CONNECTED, DRM_MODE_CONNECTOR_VIRTUAL,
     DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_FB_MODIFIERS, DRM_MODE_OBJECT_BLOB,
@@ -89,8 +90,9 @@ use super::drm::{
 };
 use super::vgpu::{
     BLOB_MMAP_KEY_BASE, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_SYNCOBJ_CREATE, DRM_IOCTL_SYNCOBJ_DESTROY,
-    DRM_IOCTL_SYNCOBJ_QUERY, DRM_IOCTL_SYNCOBJ_RESET, DRM_IOCTL_SYNCOBJ_SIGNAL,
-    DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+    DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, DRM_IOCTL_SYNCOBJ_QUERY,
+    DRM_IOCTL_SYNCOBJ_RESET, DRM_IOCTL_SYNCOBJ_SIGNAL, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+    DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, DRM_IOCTL_SYNCOBJ_WAIT,
     DRM_IOCTL_VIRTGPU_CONTEXT_INIT, DRM_IOCTL_VIRTGPU_EXECBUFFER, DRM_IOCTL_VIRTGPU_GET_CAPS,
     DRM_IOCTL_VIRTGPU_GETPARAM, DRM_IOCTL_VIRTGPU_MAP, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB,
     DRM_IOCTL_VIRTGPU_RESOURCE_INFO, VIRTGPU_MAP_CACHE_CACHED,
@@ -111,11 +113,14 @@ use crate::{
     sync::Mutex,
 };
 
-pub const DRIVER_NAME: &str = "starry-simpledrm";
+// "virtio_gpu" is the kernel-driver identity mesa's Venus ICD checks in
+// `drmGetVersion` before it will open the render node; the version stays
+// major 0 for the same reason (`virtgpu_open_device` rejects major != 0).
+pub const DRIVER_NAME: &str = "virtio_gpu";
 pub const DRIVER_DATE: &str = "2026-04-19";
 pub const DRIVER_DESC: &str = "StarryOS simple DRM driver";
-pub const DRIVER_VERSION_MAJOR: i32 = 1;
-pub const DRIVER_VERSION_MINOR: i32 = 0;
+pub const DRIVER_VERSION_MAJOR: i32 = 0;
+pub const DRIVER_VERSION_MINOR: i32 = 1;
 pub const DRIVER_VERSION_PATCHLEVEL: i32 = 0;
 
 /// Fixed object IDs advertised by GETRESOURCES / GETCONNECTOR / GETENCODER.
@@ -701,11 +706,27 @@ impl DeviceOps for Card0 {
     }
 
     fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
-        match cmd {
+        // TEMP-PROBE(vkprobe): trace the venus ICD ioctl flow end to end.
+        // Logs every VIRTGPU_*/SYNCOBJ command name; remove after bring-up.
+        if let Some(tag) = temp_probe_ioctl_tag(cmd) {
+            warn!("card0 TEMP-PROBE ioctl {tag} arg={arg:#x}");
+        }
+        let result: VfsResult<usize> = match cmd {
             DRM_IOCTL_VERSION => handle_version(current, arg),
             DRM_IOCTL_GET_UNIQUE => handle_get_unique(current, arg),
             DRM_IOCTL_SET_VERSION => handle_set_version(current, arg),
-            DRM_IOCTL_GET_CAP => handle_get_cap(current, arg),
+            DRM_IOCTL_GET_CAP => {
+                // TEMP-PROBE(csblob3): sentinel value in the GET_CAP args
+                // triggers the blob-physical dump before answering.
+                let cap: DrmGetCap = (arg as *mut DrmGetCap)
+                    .vm_read(current)
+                    .map_err(|_| VfsError::BadAddress)?;
+                if cap.value == 0xCCCC {
+                    warn!("card0 TEMP-PROBE GET_CAP sentinel hit, dumping blobs");
+                    self.vgpu.temp_probe_dump_blobs();
+                }
+                handle_get_cap(current, arg)
+            }
             DRM_IOCTL_SET_CLIENT_CAP => handle_set_client_cap(current, arg),
             DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => Ok(0),
 
@@ -760,9 +781,24 @@ impl DeviceOps for Card0 {
             DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL => {
                 self.vgpu.handle_syncobj_timeline_signal(current, arg)
             }
+            DRM_IOCTL_SYNCOBJ_WAIT => self.vgpu.handle_syncobj_wait(current, arg),
+            // syncobj-as-fd / sync_file exchange stays ENOSYS: v1 fences are
+            // watermark-timelines with no kernel object to attach an fd to,
+            // and the venus paths that hit this only lose external-memory
+            // export (see vgpu.rs).
+            DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD | DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => {
+                Err(VfsError::OperationNotSupported)
+            }
 
             _ => Err(VfsError::OperationNotSupported),
+        };
+        if let Some(tag) = temp_probe_ioctl_tag(cmd) {
+            match &result {
+                Ok(n) => warn!("card0 TEMP-PROBE {tag} -> ok({n})"),
+                Err(err) => warn!("card0 TEMP-PROBE {tag} -> err {err:?}"),
+            }
         }
+        result
     }
 
     fn mmap(&self, offset: u64, length: u64) -> DeviceMmap {
@@ -1055,6 +1091,34 @@ impl Card0 {
     }
 }
 
+/// TEMP-PROBE(vkprobe): names the VIRTGPU/SYNCOBJ ioctls for the bring-up
+/// trace; remove together with the ioctl() hook.
+fn temp_probe_ioctl_tag(cmd: u32) -> Option<&'static str> {
+    Some(match cmd {
+        DRM_IOCTL_VIRTGPU_GETPARAM => "VIRTGPU_GETPARAM",
+        DRM_IOCTL_VIRTGPU_GET_CAPS => "VIRTGPU_GET_CAPS",
+        DRM_IOCTL_VIRTGPU_CONTEXT_INIT => "VIRTGPU_CONTEXT_INIT",
+        DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => "VIRTGPU_RESOURCE_CREATE_BLOB",
+        DRM_IOCTL_VIRTGPU_RESOURCE_INFO => "VIRTGPU_RESOURCE_INFO",
+        DRM_IOCTL_VIRTGPU_MAP => "VIRTGPU_MAP",
+        DRM_IOCTL_VIRTGPU_EXECBUFFER => "VIRTGPU_EXECBUFFER",
+        DRM_IOCTL_GEM_CLOSE => "GEM_CLOSE",
+        DRM_IOCTL_SYNCOBJ_CREATE => "SYNCOBJ_CREATE",
+        DRM_IOCTL_SYNCOBJ_DESTROY => "SYNCOBJ_DESTROY",
+        DRM_IOCTL_SYNCOBJ_WAIT => "SYNCOBJ_WAIT",
+        DRM_IOCTL_SYNCOBJ_RESET => "SYNCOBJ_RESET",
+        DRM_IOCTL_SYNCOBJ_SIGNAL => "SYNCOBJ_SIGNAL",
+        DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT => "SYNCOBJ_TIMELINE_WAIT",
+        DRM_IOCTL_SYNCOBJ_QUERY => "SYNCOBJ_QUERY",
+        DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL => "SYNCOBJ_TIMELINE_SIGNAL",
+        DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD => "SYNCOBJ_HANDLE_TO_FD",
+        DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => "SYNCOBJ_FD_TO_HANDLE",
+        DRM_IOCTL_VERSION => "VERSION",
+        DRM_IOCTL_GET_CAP => "GET_CAP",
+        _ => return None,
+    })
+}
+
 fn handle_version(current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
     let ptr = arg as *mut DrmVersion;
     let mut v: DrmVersion = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
@@ -1096,6 +1160,10 @@ fn handle_set_version(current: &crate::task::UserTaskRef, arg: usize) -> VfsResu
 fn handle_get_cap(current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
     let ptr = arg as *mut DrmGetCap;
     let mut cap: DrmGetCap = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
+    // TEMP-PROBE(csblob3): sentinel 0xCCCC triggers the blob-physical dump.
+    if cap.value == 0xCCCC {
+        warn!("card0 TEMP-PROBE GET_CAP sentinel hit, dumping blobs");
+    }
     // Unknown caps return value=0 rather than EINVAL.
     cap.value = match cap.capability {
         DRM_CAP_DUMB_BUFFER => 1,
@@ -1103,6 +1171,11 @@ fn handle_get_cap(current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<u
         DRM_CAP_CRTC_IN_VBLANK_EVENT => 1,
         DRM_CAP_ADDFB2_MODIFIERS => 1,
         DRM_CAP_PRIME => DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT,
+        // The watermark-timeline syncobj family is fully functional;
+        // advertising these caps makes mesa pick the kernel-syncobj
+        // provider instead of its userspace simulation.
+        DRM_CAP_SYNCOBJ => 1,
+        DRM_CAP_SYNCOBJ_TIMELINE => 1,
         _ => 0,
     };
     ptr.vm_write(current, cap)
