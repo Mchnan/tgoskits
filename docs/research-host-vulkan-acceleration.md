@@ -433,3 +433,77 @@ aarch64 target 手工匹配参数）。
 - 混合 2D+3D 设备的 blob↔dumb 表面切换已实现（`bind_2d_scanout` 重
   绑），但仅在 3D-only 设备上验证过；2D 存在时的行为等价 Linux 的
   set_scanout 语义，待有 2D+3D 组合的宿主环境再实测。
+
+## 9. Phase 4 进行中：deniald venus ICD 集成（2026-09-19，未闭环）
+
+路线定案：denial embedder 是 OpenGL-only（`FlutterRendererType_kOpenGL`，
+Impeller 走 GLES），deniald 零改动；加速路线 = mesa zink（GL）→ venus
+ICD（Vulkan）→ card0 `VIRTGPU_*` 面 → 宿主 MoltenVK（M4）。rootfs 已有
+`zink_dri.so` 与全部 GL 栈，缺的只是 vulkan loader + ICD。
+
+### 9.1 内核改动（全部落地并通过回归）
+
+- **驱动身份**（`card0.rs`）：`DRIVER_NAME` 改为 `virtio_gpu`、
+  `DRIVER_VERSION_MAJOR` 改 0——mesa `virtgpu_open_device` 校验
+  `strcmp(version->name, "virtio_gpu")` 且 `version_major != 0` 即拒。
+- **sysfs**（`sysfs.rs`）：`/sys/class/drm/renderD128`、
+  `/sys/dev/char/226:128`、`/sys/devices/virtual/drm/renderD128` 三处
+  render 节点视图（节点与 card0 同一 Device 实例）；platform 设备
+  `virtio-gpu0` 的 `uevent` 补 `MODALIAS=platform:virtio-gpu`（libdrm
+  `drmParseOFBusInfo` 的 MODALIAS 回退必需）；新增 `<device>/drm/` 目录
+  组（card0/renderD128 子项）——libdrm 2.4.131 的 `drmNodeIsDRM` 在
+  Linux 上 stat `/sys/dev/char/<maj>:<min>/device/drm`，缺失时
+  `drmGetDevices2` 静默丢弃全部节点（本轮最深的枚举坑）。
+- **syncobj 族**（`vgpu.rs`/`drm.rs`/`card0.rs`）：补
+  `SYNCOBJ_WAIT`（binary wait，0xC3）ioctl 与
+  `DRM_CAP_SYNCOBJ`/`DRM_CAP_SYNCOBJ_TIMELINE` cap——mesa
+  `util_sync_provider_drm` 以 TIMELINE cap 决定走内核 syncobj 还是
+  userspace 模拟（后者在真 GPU 上死锁）。HANDLE_TO_FD/FD_TO_HANDLE
+  保持 ENOSYS（watermark timeline 无 fd 语义，受影响路径只损失
+  external memory 导出）。
+- **EXECBUFFER 语义**：允许 `size==0`（ring kick，Linux 语义），空
+  payload 不进 DMA 描述符（`device.rs`）；每次提交**恒带 fence**——
+  Linux 的 execbuffer 无条件分配 out-fence，且 venus 宿主对
+  SUBMIT_3D 的响应一律推迟到 fence retire，unfenced 同步等待必然
+  超时（实测 `Gpu3DError(62)`）。
+- **重大 bug 修复（悬垂 GlobalPage）**：EXECBUFFER 重构时 `cmd_page`
+  被内层 shadow 绑定持有，`Some(slice)` 存裸指针，if/else 结束即析构
+  页——cs 发到宿主全零，宿主恰解码成 command type 0
+  （`VK_COMMAND_TYPE_vkCreateInstance_EXT`）→ "vkCreateInstance
+  resulted in CS error"。定案手法：内核 pre-copy 直读用户 VA（字节
+  正确）+ 拷贝后回读（全零）对照。修复 = GlobalPage 绑定提升到函数
+  作用域。
+
+### 9.2 验证栈与探针
+
+- rootfs 注入（`tmp/vgpu-probe/inject-venus-icd.sh`）：从原始镜像
+  `cp -c` 克隆 → debugfs 单遍写入 libvulkan.so.1.4.360 /
+  libvulkan_virtio.so / libdisplay-info.so.3 / ICD json / 探针 →
+  dump 逐文件 cmp 校验 → e2fsck。**注意**：debugfs 对已存在文件的
+  覆盖写会造成 guest 视图分叉（size 0/nlink 0/ENOENT），追加写同样
+  不可靠；迭代探针改走 **guest `wget http://10.0.2.2:8000/...`**
+  （宿主 python http.server + slirp）。debugfs `symlink` 语义是
+  `symlink <文件名> <目标>`，与 `ln` 参数顺序相反。
+- 探针族（`tmp/vgpu-probe/`，musl 交叉编译）：`drmprobe`（逐节点
+  校验 sysfs 分类链 + VERSION/GET_CAP）、`drmenum`（链接 guest 自身
+  libdrm 调 `drmGetDevices2`）、`mini-strace`（PTRACE_SYSCALL/
+  GETREGSET/PEEKDATA，可解 openat/newfstatat 路径）、`csblob3/5`
+  （堆/栈/blob mmap 三处 GET_CAP 对照 + EXECBUFFER cs 拷贝前后
+  对照）、`vkprobe`（完整 Vulkan 链路：instance→enumerate→device→
+  HOST3D blob→mmap→compute→timeline fence→读回 0xc0de0000-3）。
+- 内核 TEMP-PROBE：card0 ioctl 分发处逐命令记录名字与结果、
+  vgpu 记 create_blob 参数与 pre-copy cs 转储（下阶段闭环后移除）。
+
+### 9.3 当前进度与阻塞点
+
+vkprobe 在 StarryOS 上的已打通段：枚举出
+`Virtio-GPU Venus (Apple M4)`（vendor 0x106b，mesa 26.2.2）→ 真实例
+创建（6×GETPARAM + GET_CAPS(capset 4) + CONTEXT_INIT 全绿）→
+ring blob 135K 创建/MAP → 宿主 `vkr_ring_start` 成功、ring 线程
+entered。**新阻塞点：ring 启动后宿主 render server 停止应答 ctrl
+op**——guest 的 shmem pool CREATE_BLOB 同步等待超时（服务器主线程
+0% CPU 阻塞态，非自旋；QEMU 侧无新 virgl 日志），instance 初始化
+失败回退 stub。疑面为 darwin 上 ASYNC_FENCE_CB+THREAD_SYNC 代理
+线程（b056c0d1）与 vkr ring 线程的交互，需 lldb 双进程（QEMU +
+virgl_render_server）取证；AGENTS.md 已记录 lldb 对该 worker 取证
+的历史困难。 guest 侧（本轮全部工作面）已就绪，无待修项。
