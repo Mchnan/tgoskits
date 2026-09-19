@@ -507,3 +507,66 @@ op**——guest 的 shmem pool CREATE_BLOB 同步等待超时（服务器主线�
 线程（b056c0d1）与 vkr ring 线程的交互，需 lldb 双进程（QEMU +
 virgl_render_server）取证；AGENTS.md 已记录 lldb 对该 worker 取证
 的历史困难。 guest 侧（本轮全部工作面）已就绪，无待修项。
+### 9.4 闭环（2026-09-19）：vkprobe 端到端 PASS 与三层修复
+
+**vkprobe 端到端打通**：guest 侧完整 Vulkan 链路全绿——vkCreateInstance
+→ vkEnumeratePhysicalDevices（枚举 Virtio-GPU Venus (Apple M4)）→
+vkCreateDevice → HOST3D blob 分配（vkAllocateMemory）→ hostmem BAR
+mmap（vkMapMemory）→ compute dispatch → vkWaitForFences（timeline
+syncobj）→ 读回 0xc0de0000-3 全 MATCH。带时序窗口的探针两次复验
+PASS；bar-pattern（BAR 映射图案写读回环）MATCH。
+
+**根因一（本仓库 fix(virtio-gpu) 5f41676a6）：控制响应乱序配对楔死**。
+vkCreateRingMESA 的 SUBMIT_3D 恒带 fence、宿主把响应推迟到 fence
+retire，而 shmem pool 的 RESOURCE_CREATE_BLOB 响应立即写 used ring——
+used ring 乱序（blob 先、execbuffer 后）。驱动的 drain_completed 按
+FIFO 配对：队头的未完成 execbuffer 使 drain 在 WrongToken 时
+push_front+break，后续已完成的响应永远轮不到，同步等待自旋 118 秒
+（SPIN_BUDGET=8e9）后超时置 broken，之后整个 card0 全部 Io（粘性、
+设备级共享）。修复 = WrongToken 时轮转 pending 队列继续按 token 匹配
+used-ring 头（virtio-drivers 的 WrongToken 是纯读、无副作用）；同时
+给 fire-and-forget 条目分配独立 recv 缓冲，消除「fence 推迟响应覆盖
+同步等待者正在读的共享 scratch 页」的竞态。取证手法：QEMU
+`-d trace:virtqueue_pop/virtqueue_fill/virtio_gpu_fence_ctrl/fence_resp`
+看到 blob 响应已 fill+flush 而 guest 未消费，即知问题在 guest 驱动。
+
+**根因二（本仓库 feat(starry-kernel) dc609f0e1）：两个上下文/句柄楔子。**
+(1) CONTEXT_INIT 对同一进程身份的第二次调用返回 EEXIST：mesa 每进程建
+多个 Vulkan 设备（GBM 与 EGL 各一次），且致命退出的进程不会走 close(2)
+清理，陈旧条目楔死所有复用该 pid 的后来者（gbm_create_device 间歇性
+EEXIST）。修复 = Linux 替换语义：新上下文替换并销毁旧的。
+(2) PRIME_HANDLE_TO_FD 只认 dumb buffer，gbm/EGL 无法导出 HOST3D 渲染
+缓冲（deniald 报 "Buffer returned invalid file descriptor"）。card0 的
+PRIME handler 现在对 blob 句柄下探到 vgpu 面：HANDLE_TO_FD 安装内核本地
+dma-buf 替身（VgpuBlobFd：GEM 句柄 + hostmem BAR 映射 + 缓存属性），
+FD_TO_HANDLE 解析回 GEM 句柄（SCM_RIGHTS 共享后仍可解析——FileLike 随
+fd 传递被复制）。数据面不动，fd 仅由本内核解释。
+
+**根因三（宿主 darwin fork e0c96b73）：MoltenVK 能力缺口两处 shim。**
+(1) MVK 声明 KHR/EXT_robustness2 但 nullDescriptor=0，而 zink 硬性要求；
+vkr 在 Features2 查询里强制 nullDescriptor=true（Metal 对 nil 描述符的
+天然行为——读返零、写丢弃——恰好等于 nullDescriptor 契约），并在
+vkCreateDevice 的 pNext 链剥离 Robustness2Features 结构体以免 MVK 拒绝。
+(2) MVK 无 dma-buf 外部内存能力，zink 的 gbm 渲染缓冲路径直接 EINVAL；
+vkr 对 ExternalBufferProperties / ImageFormatProperties2 强制报告
+DMA_BUF 可导出可导入（宿主整查询失败时去掉 external pNext 重试再合成）。
+数据面从不经过宿主 fd 命名空间：缓冲是 HOST3D blob，guest 侧导出/导入
+走内核 PRIME ioctl（见上）。
+
+**验证与工具**：宿主 metal-shm-test（~/venus-stack/）独立验证 MoltenVK
+mtl_shm 路径 GPU 写入落 shm 且独立 mmap 可见（隔离宿主/内核责任）；
+mini-strace 定位 gbmtest 的 EEXIST/EINVAL 到具体 ioctl；guest 探针迭代
+走 wget http://10.0.2.2:8000（宿主 recv-log.py 同时服务 GET/POST，dd.log
+大文件用 POST 回传，串口只做小命令）。
+
+**遗留（Phase 4.2 之前必须知道）**：
+- **fence 语义缺口**：本栈的 fence 在宿主「派发命令」时 retire（vkr ring
+  fence 语义），不覆盖 Metal 实际完成——首次管线编译（数秒）期间
+  vkWaitForFences 已返回，紧随的 CPU 读回拿到旧数据（vkprobe 无窗口
+  版本 readback[0] 打印 0、比较时已变 magic 即证据）。对 Impeller/zink
+  的 staging 上传语义有影响，需 vkr fence 线程接 MoltenVK 完成回调。
+- **mesa gbm-zink-venus 缓冲创建仍 EINVAL**：zink screen 初始化成功后
+  gbm_bo_create(64x64) 在 mesa 内部 EINVAL（未到内核，strace 无 ioctl），
+  疑 DRI image 路径能力/修饰符链缺口——这是 deniald 桌面（Phase 4.2）
+  的当前阻塞点，属 mesa 用户态集成工作。
+- 内核 TEMP-PROBE 与 vkr TEMP 日志已可移除（本轮留作排查）。

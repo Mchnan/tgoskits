@@ -10,7 +10,7 @@ function FL({ path, label }: { path: string; label: string }) {
   return <FileLink path={path} label={label} dispatch={dispatch} />;
 }
 
-// ---- 加速链路 DAG：guest ICD → 宿主 MoltenVK，环上标出当前死锁 ----
+// ---- 加速链路 DAG：guest ICD → 宿主 MoltenVK，环上标注本轮修复点 ----
 const chain = {
   nodes: [
     { id: "app", label: "deniald/vkprobe" },
@@ -30,7 +30,7 @@ const chain = {
     { from: "vgpu", to: "vkr", label: "ctrl vq" },
     { from: "vkr", to: "mvk", label: "render server" },
     { from: "mvk", to: "m4", label: "dispatch" },
-    { from: "vkr", to: "vgpu", label: "ring 后死锁", tone: "back" as const },
+    { from: "vkr", to: "vgpu", label: "乱序配对已修", tone: "back" as const },
   ],
 };
 
@@ -42,8 +42,16 @@ const commitRows: (string | JSX.Element)[][] = [
     "card0 面补齐 mesa venus ICD 契约：驱动身份、sysfs render 节点、syncobj 族、EXECBUFFER 语义 + 悬垂 GlobalPage 修复（6 files, +340/-37）",
   ],
   [
-    <Code>27b8ad716 docs</Code>,
-    "研究文档 §9（路线/注入配方/探针族/枚举坑/fence 语义/死锁证据）+ AGENTS.md Phase 4 条目",
+    <Code>5f41676a6 fix(virtio-gpu)</Code>,
+    "drain_completed 按 token 轮转匹配乱序响应 + fenced 条目独立 recv 缓冲——shmem pool blob 118s 超时/设备粘性 broken 的根因",
+  ],
+  [
+    <Code>dc609f0e1 feat(starry-kernel)</Code>,
+    "CONTEXT_INIT 替换语义（解除 pid 复用楔死）+ PRIME blob fd 导出（VgpuBlobFd，deniald gbm/EGL 导出路径）",
+  ],
+  [
+    <Code>e0c96b73 vkr(darwin)</Code>,
+    "宿主 shim：nullDescriptor 强制 + dma-buf 可导出（MoltenVK 能力缺口，zink 得以初始化）",
   ],
 ];
 
@@ -84,16 +92,17 @@ const kernelRows: (string | JSX.Element)[][] = [
 const probeHeaders = ["链路段", "状态", "证据"];
 const probeTones2: Array<TableRowTone | undefined> = [
   "success", "success", "success", "success",
-  "success", "success", "warning",
+  "success", "success", "success", "success",
 ];
 const probeRows: (string | JSX.Element)[][] = [
   ["ICD 加载", "通过", "VK_LOADER_DEBUG 确认 dlopen libvulkan_virtio.so，vkCreateInstance 真实例"],
   ["设备枚举", "通过", "drmGetDevices2 → Virtio-GPU Venus (Apple M4)，vendor 0x106b，mesa 26.2.2"],
   ["实例参数", "通过", "GETPARAM×6（3D/blob/host-visible/context-init…）全绿"],
-  ["上下文", "通过", "GET_CAPS(capset 4) + CONTEXT_INIT → starry-vgpu-{pid}"],
+  ["上下文", "通过", "GET_CAPS(capset 4) + CONTEXT_INIT → starry-vgpu-{pid}（替换语义修复后不再楔死）"],
   ["ring 建立", "通过", "ring blob 135K 创建/MAP；宿主 vkr_ring_start 成功、线程 entered"],
-  ["MoltenVK 加载", "通过", "宿主日志确认 render server worker 上下文携带 MoltenVK（M4）"],
-  ["ring 后 ctrl 应答", "阻塞", "shmem pool CREATE_BLOB 同步等待超时；宿主主线程 0% CPU 阻塞态（非自旋），QEMU 侧无新日志"],
+  ["shmem pool blob", "通过", "乱序配对修复后 RESOURCE_CREATE_BLOB(1MB) 即时返回（此前自旋 118s 超时）"],
+  ["compute + fence", "通过", "vkQueueSubmit → timeline syncobj → vkWaitForFences VK_SUCCESS"],
+  ["读回 4/4", "通过", "readback 0xc0de0000-3 全 MATCH；bar-pattern（BAR 写读回环）MATCH；两次复验"],
 ];
 
 // ---- 本轮坑 ----
@@ -127,32 +136,32 @@ const pitRows: (string | JSX.Element)[][] = [
   ],
 ];
 
-// ---- 下阶段清单 ----
+// ---- Phase 4.2 待办 ----
 const nextHeaders = ["方向", "说明"];
-const nextTones: Array<TableRowTone | undefined> = ["danger", "warning", "neutral", "neutral"];
+const nextTones: Array<TableRowTone | undefined> = ["warning", "warning", "neutral", "neutral"];
 const nextRows: (string | JSX.Element)[][] = [
   [
-    "宿主 ring 死锁定锤（第一优先）",
-    "lldb 双进程（QEMU + virgl_render_server）抓阻塞栈；疑面 = darwin ASYNC_FENCE_CB+THREAD_SYNC 代理线程（b056c0d1）与 vkr ring 线程交互；AGENTS.md 已记录 lldb 对该 worker 取证的历史困难",
+    "fence 语义缺口",
+    "本栈 fence 在宿主派发命令时 retire（vkr ring fence 语义），不覆盖 Metal 实际完成；首次管线编译期间 vkWaitForFences 提前返回。需 vkr fence 线程接 MoltenVK 完成回调后推进 shmem timeline",
   ],
   [
-    "vkprobe 端到端",
-    "死锁解开后：compute 提交 → timeline fence → 读回 0xc0de0000-3 → VKPROBE PASS",
+    "mesa gbm-zink-venus 缓冲路径",
+    "zink screen 已初始化（nullDescriptor/dma-buf shim 生效、gbm_create_device OK），但 gbm_bo_create 在 mesa 内部 EINVAL（strace 无 ioctl 到内核）——Phase 4.2 deniald 桌面的当前阻塞点，属 mesa 用户态集成",
+  ],
+  [
+    "TEMP 探针移除",
+    "内核 TEMP-PROBE（card0 逐 ioctl + vgpu pre-copy cs 转储）与 vkr TEMP 日志在 Phase 4.2 启动前移除",
   ],
   [
     "deniald zink 桌面",
-    "zink 环境变量（MESA_LOADER_DRIVER_OVERRIDE=zink 或 loader platform 路径自动映射）+ refusald 启动；目标 raster_avg 87–127ms → <5ms",
-  ],
-  [
-    "临时探针移除",
-    "内核 TEMP-PROBE（card0 逐 ioctl + vgpu pre-copy cs 转储）在闭环后回滚",
+    "gbm/EGL 链打通后目标 raster_avg 87–127ms → <5ms；渲染审计（DENIA_RENDER_AUDIT）在无截屏窗口采集",
   ],
 ];
 
 export default function VenusPhase4Canvas(): JSX.Element {
   return (
     <Stack gap={16} style={{ padding: 24 }}>
-      <H1>venus Phase 4：deniald venus ICD 集成 — 内核面完成，宿主 ring 死锁待解</H1>
+      <H1>venus Phase 4：deniald venus ICD 集成 — vkprobe 端到端闭环</H1>
       <Text>
         2026-09-19。分支 fix/card0-vblank-clock。路线定案：denial embedder 是
         OpenGL-only（FlutterRendererType_kOpenGL，Impeller 走 GLES），deniald
@@ -179,22 +188,33 @@ export default function VenusPhase4Canvas(): JSX.Element {
         </Card>
         <Card>
           <CardBody>
-            <Stat value="死锁" label="宿主 ring 后停应答" tone="danger" />
+            <Stat value="端到端 PASS" label="vkprobe 4/4 读回" tone="success" />
           </CardBody>
         </Card>
       </Grid>
 
-      <Callout tone="danger" title="当前阻塞点：ring 启动后宿主 render server 停止应答 ctrl op">
-        guest 的 shmem pool CREATE_BLOB 同步等待超时（SPIN_BUDGET 8s 量级）；宿主
-        virgl_render_server 主线程 0% CPU 阻塞态（非自旋），QEMU 侧无新 virgl
-        日志。疑面 = darwin 上 ASYNC_FENCE_CB+THREAD_SYNC 代理线程（b056c0d1）
-        与 vkr ring 线程的交互，需 lldb 双进程取证。guest 侧本轮全部工作面已就绪，
-        无待修项。
+      <Callout tone="success" title="vkprobe 端到端闭环（2026-09-19）">
+        完整 Vulkan 链路全绿：instance → enumerate（Venus/M4）→ device →
+        HOST3D blob → BAR mmap → compute → timeline fence → 读回 0xc0de0000-3
+        全 MATCH。三层修复：驱动控制响应乱序配对（drain 按 token 轮转 +
+        fenced 条目独立 recv 缓冲，5f41676a6）；CONTEXT_INIT 替换语义 + PRIME
+        blob fd 导出（dc609f0e1）；宿主 vkr shim 强制 nullDescriptor 与
+        dma-buf 可导出（MoltenVK 能力缺口，fork e0c96b73）。
+      </Callout>
+
+      <Callout tone="warning" title="Phase 4.2（deniald 桌面）遗留两点">
+        ① fence 语义缺口：本栈 fence 在宿主派发命令时 retire，不覆盖 Metal
+        实际完成——首次管线编译期间 vkWaitForFences 提前返回，紧随的 CPU
+        读回拿旧数据（vkprobe 无窗口版 readback[0] 打印 0、比较时已变 magic
+        即证据），需 vkr fence 线程接 MoltenVK 完成回调。② mesa gbm-zink
+        缓冲创建仍 EINVAL：zink screen 已能初始化（nullDescriptor/dma-buf
+        shim 生效），但 gbm_bo_create 在 mesa 内部失败、未到内核——属 mesa
+        用户态集成工作。
       </Callout>
 
       <Divider />
 
-      <H2>加速链路与死锁位置</H2>
+      <H2>加速链路与修复位置</H2>
       <Card>
         <CardHeader>
           <H3>guest ICD → 宿主 MoltenVK（虚线 = 当前死锁反馈）</H3>
