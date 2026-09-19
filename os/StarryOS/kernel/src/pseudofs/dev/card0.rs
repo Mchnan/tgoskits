@@ -1217,7 +1217,17 @@ impl Card0 {
         let mut req: DrmPrimeHandle = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
 
         let dumbs = self.dumbs.lock();
-        let buf = dumbs.get(&req.handle).ok_or(VfsError::InvalidInput)?;
+        let buf = match dumbs.get(&req.handle) {
+            Some(buf) => buf,
+            // Not a dumb buffer: it may be a HOST3D blob (venus render
+            // buffers are gbm-exported through VIRTGPU_RESOURCE_CREATE_BLOB).
+            // The vgpu face exports those as kernel-local dma-buf stand-ins
+            // naming the blob's GEM handle.
+            None => {
+                drop(dumbs);
+                return self.vgpu.handle_prime_handle_to_fd(current, arg);
+            }
+        };
 
         // Convert the dumb buffer's virtual address to a physical address
         // range that the mmap machinery can map into user space.
@@ -1277,10 +1287,12 @@ impl Card0 {
         let mut req: DrmPrimeHandle = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
 
         let file = crate::file::get_file_like(req.fd).map_err(|_| VfsError::BadFileDescriptor)?;
-        let dma_buf: &DmaBufGem = file
-            .as_any()
-            .downcast_ref::<DmaBufGem>()
-            .ok_or(VfsError::InvalidInput)?;
+        let dma_buf: &DmaBufGem = match file.as_any().downcast_ref::<DmaBufGem>() {
+            Some(dma_buf) => dma_buf,
+            // A blob fd exported by the vgpu face: round-trip back to the
+            // blob's GEM handle instead of minting a dumb-buffer alias.
+            None => return self.vgpu.handle_prime_fd_to_handle(current, arg),
+        };
 
         let handle = self.next_dumb_handle.fetch_add(1, Ordering::Relaxed);
         let offset = self

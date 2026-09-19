@@ -26,6 +26,7 @@
 //!   ENOSYS; venus uses the timeline path exclusively.
 
 use alloc::{
+    borrow::Cow,
     collections::BTreeMap,
     format,
     string::String,
@@ -36,14 +37,18 @@ use alloc::{
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ax_alloc::GlobalPage;
-use ax_memory_addr::PAGE_SIZE_4K;
+use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr, PhysAddrRange};
+use axpoll::{IoEvents, Pollable};
+use linux_raw_sys::general::O_RDWR;
 use bytemuck::{AnyBitPattern, NoUninit};
 
 use super::drm::{
-    DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DRM_TYPE, iow, iowr,
+    DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DRM_TYPE, DrmPrimeHandle, iow, iowr,
 };
 use crate::{
+    file::{FileLike, Kstat, add_file_like, get_file_like},
     mm::{vm_load, vm_write_slice},
+    pseudofs::DeviceMmap,
     sync::Mutex,
     task::UserTaskRef,
 };
@@ -520,9 +525,6 @@ impl VgpuCard {
 
         let pid = process_key(current);
         let mut contexts = self.contexts.lock();
-        if contexts.contains_key(&pid) {
-            return Err(VfsError::AlreadyExists);
-        }
 
         let mut capset_id = 0u32;
         let mut num_rings = 1u32;
@@ -580,6 +582,18 @@ impl VgpuCard {
         };
         self.dev()?.ctx_create(ctx_id, capset_id, capset_id, &debug_name).map_err(vfs_err)?;
 
+        // Linux replaces the drm file's context on a second CONTEXT_INIT
+        // instead of failing. A process may also die without close(2)
+        // reaching us (fatal exit while another fd keeps the device busy),
+        // so a stale entry for a recycled pid must never wedge the next
+        // owner: the new context replaces the old, which is destroyed.
+        if let Some(stale) = contexts.remove(&pid) {
+            warn!(
+                "vgpu CONTEXT_INIT replaces stale context pid={pid} ctx_id={}",
+                stale.ctx_id
+            );
+            let _ = self.dev()?.ctx_destroy(stale.ctx_id);
+        }
         contexts.insert(pid, VgpuContext { ctx_id, num_rings });
         Ok(0)
     }
@@ -768,6 +782,51 @@ impl VgpuCard {
             let _ = dev.unmap_blob(res.res_handle);
         }
         let _ = dev.resource_unref(res.res_handle);
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_PRIME_HANDLE_TO_FD` for a mapped HOST3D blob: installs a
+    /// kernel-local dma-buf stand-in fd that names the blob's GEM handle.
+    /// Mesa's gbm/EGL paths export render buffers this way before feeding
+    /// the fd back through `FD_TO_HANDLE` + `ADDFB2`; the memory itself is
+    /// the blob's hostmem BAR mapping, so no data moves.
+    pub(crate) fn handle_prime_handle_to_fd(
+        &self,
+        current: &UserTaskRef,
+        arg: usize,
+    ) -> VfsResult<usize> {
+        let mut args: DrmPrimeHandle = load_arg(current, arg)?;
+        let resources = self.resources.lock();
+        let res = resources.get(&args.handle).ok_or(VfsError::NotFound)?;
+        let Some(map) = &res.map else {
+            return Err(VfsError::InvalidInput);
+        };
+        let file: Arc<dyn FileLike> = Arc::new(VgpuBlobFd {
+            bo_handle: args.handle,
+            phys: map.phys,
+            size: map.size,
+            cached: map.map_info == VIRTGPU_MAP_CACHE_CACHED,
+        });
+        args.fd = add_file_like(file, true).map_err(|_| VfsError::Io)?;
+        store_arg(current, arg, &args)?;
+        Ok(0)
+    }
+
+    /// `DRM_IOCTL_PRIME_FD_TO_HANDLE`: resolves a fd installed by
+    /// [`Self::handle_prime_handle_to_fd`] (possibly after SCM_RIGHTS
+    /// sharing) back to its GEM handle.
+    pub(crate) fn handle_prime_fd_to_handle(
+        &self,
+        current: &UserTaskRef,
+        arg: usize,
+    ) -> VfsResult<usize> {
+        let mut args: DrmPrimeHandle = load_arg(current, arg)?;
+        let file = get_file_like(args.fd).map_err(|_| VfsError::InvalidInput)?;
+        let blob = file
+            .downcast_arc::<VgpuBlobFd>()
+            .map_err(|_| VfsError::InvalidInput)?;
+        args.handle = blob.bo_handle;
+        store_arg(current, arg, &args)?;
         Ok(0)
     }
 
@@ -1276,10 +1335,67 @@ pub(crate) fn virtio_format_of(drm: u32) -> Option<u32> {
     }
 }
 
+/// A kernel-local dma-buf stand-in naming a mapped HOST3D blob.
+///
+/// Linux exports virtio-gpu blobs as real dma-buf fds so gbm/EGL can move
+/// render buffers between processes and into KMS. StarryOS has no
+/// cross-process dma-buf object, but every consumer here talks to this
+/// kernel anyway: the fd identifies the blob (its GEM handle plus the
+/// hostmem BAR mapping), `FD_TO_HANDLE` round-trips it (also across
+/// SCM_RIGHTS, which duplicates the `FileLike`), and `mmap` resolves to
+/// the same physical range the BAR slice covers.
+pub(crate) struct VgpuBlobFd {
+    bo_handle: u32,
+    phys: u64,
+    size: u64,
+    cached: bool,
+}
+
+impl Pollable for VgpuBlobFd {
+    fn poll(&self) -> IoEvents {
+        IoEvents::IN | IoEvents::OUT
+    }
+
+    unsafe fn register_shared(
+        &self,
+        _sink: &mut dyn axpoll::SharedRegistrationSink,
+        _events: IoEvents,
+    ) {
+    }
+}
+
+impl FileLike for VgpuBlobFd {
+    fn stat(&self) -> crate::StarryResult<Kstat> {
+        Ok(Kstat {
+            size: self.size,
+            ..Default::default()
+        })
+    }
+
+    fn path(&self) -> Cow<'_, str> {
+        Cow::Borrowed("/dev/dri/gem-blob-fd")
+    }
+
+    fn open_flags(&self) -> u32 {
+        O_RDWR
+    }
+
+    fn device_mmap(&self, _offset: u64, length: u64) -> crate::StarryResult<DeviceMmap> {
+        let range = PhysAddrRange::from_start_size(
+            PhysAddr::from(self.phys as usize),
+            (length.min(self.size)).max(1) as usize,
+        );
+        if self.cached {
+            Ok(DeviceMmap::PhysicalCached(range, None))
+        } else {
+            Ok(DeviceMmap::Physical(range, None))
+        }
+    }
+}
+
 fn process_key(current: &UserTaskRef) -> u64 {
     current.as_thread().proc_data.identity().id().get()
 }
-
 fn load_arg<T: AnyBitPattern>(current: &UserTaskRef, arg: usize) -> VfsResult<T> {
     let loaded = vm_load::<T>(current, arg as *const T, 1).map_err(|_| VfsError::BadAddress)?;
     Ok(loaded[0])
