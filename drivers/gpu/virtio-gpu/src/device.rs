@@ -244,6 +244,10 @@ enum PendingBuffers<H: Hal> {
         header: Box<[u8; MAX_CMD_BYTES]>,
         payload: Option<DmaBuffer<H>>,
         payload_len: usize,
+        /// Receive buffer for fire-and-forget submissions. The host may
+        /// retire a fenced response at any time, so these entries must not
+        /// share the scratch page a synchronous waiter is about to read.
+        recv: Option<DmaBuffer<H>>,
     },
 }
 
@@ -307,59 +311,84 @@ impl<H: Hal, T: Transport> Inner<H, T> {
         Ok(token)
     }
 
-    /// Consumes every completed chain at the head of the used ring,
-    /// releasing its buffers.
+    /// Consumes every completed chain in the used ring, releasing its
+    /// buffers.
+    ///
+    /// Responses may complete out of order: fenced submissions are retired
+    /// by the host at its discretion while synchronous requests complete
+    /// immediately. Entries are therefore matched by descriptor token,
+    /// rotating past submissions whose responses have not landed yet.
     fn drain_completed(&mut self) {
         while self.control_queue.can_pop() {
-            let Some(front) = self.pending.pop_front() else {
+            let count = self.pending.len();
+            if count == 0 {
                 break;
-            };
-            let PendingBuffers::Owned {
-                header: h,
-                payload: pl,
-                payload_len,
-            } = &front.buffers;
-            let header: (*const u8, usize) = (h.as_ptr(), front.send_len);
-            let payload = match pl {
-                Some(d) => Some((d.slice(*payload_len).as_ptr(), *payload_len)),
-                // Synchronous entry: payload is borrowed from the caller.
-                None => front.payload_borrow,
-            };
-            let recv: (*mut u8, usize) = (
-                self.queue_buf_recv.as_slice().as_ptr() as *mut u8,
-                PAGE_SIZE,
-            );
-
-            // SAFETY: the pending entry guarantees header/payload are
-            // alive until its response is consumed (now), and `recv` is
-            // either the caller's live buffer or the scratch page.
-            let popped = unsafe {
-                let inputs = [
-                    core::slice::from_raw_parts(header.0, header.1),
-                    core::slice::from_raw_parts(
-                        payload
-                            .map(|p| p.0)
-                            .unwrap_or(core::ptr::NonNull::dangling().as_ptr()),
-                        payload.map(|p| p.1).unwrap_or(0),
+            }
+            let mut consumed = false;
+            for _ in 0..count {
+                let Some(front) = self.pending.pop_front() else {
+                    break;
+                };
+                let PendingBuffers::Owned {
+                    header: h,
+                    payload: pl,
+                    payload_len,
+                    recv: entry_recv,
+                } = &front.buffers;
+                let header: (*const u8, usize) = (h.as_ptr(), front.send_len);
+                let payload = match pl {
+                    Some(d) => Some((d.slice(*payload_len).as_ptr(), *payload_len)),
+                    // Synchronous entry: payload is borrowed from the caller.
+                    None => front.payload_borrow,
+                };
+                let recv: (*mut u8, usize) = match entry_recv {
+                    Some(dma) => (dma.base().as_ptr(), PAGE_SIZE),
+                    None => (
+                        self.queue_buf_recv.as_slice().as_ptr() as *mut u8,
+                        PAGE_SIZE,
                     ),
-                ];
-                let input_count = if payload.is_some() { 2 } else { 1 };
-                let mut outputs = [core::slice::from_raw_parts_mut(recv.0, recv.1)];
-                self.control_queue
-                    .pop_used(front.token, &inputs[..input_count], &mut outputs)
-            };
-            match popped {
-                Ok(_) => {}
-                // Not ours yet / nothing usable: put it back and stop.
-                Err(VirtIoError::WrongToken | VirtIoError::NotReady) => {
-                    self.pending.push_front(front);
-                    break;
+                };
+
+                // SAFETY: the pending entry guarantees header/payload are
+                // alive until its response is consumed (now), and `recv` is
+                // either the entry's private buffer, the caller's live
+                // buffer, or the scratch page.
+                let popped = unsafe {
+                    let inputs = [
+                        core::slice::from_raw_parts(header.0, header.1),
+                        core::slice::from_raw_parts(
+                            payload
+                                .map(|p| p.0)
+                                .unwrap_or(core::ptr::NonNull::dangling().as_ptr()),
+                            payload.map(|p| p.1).unwrap_or(0),
+                        ),
+                    ];
+                    let input_count = if payload.is_some() { 2 } else { 1 };
+                    let mut outputs = [core::slice::from_raw_parts_mut(recv.0, recv.1)];
+                    self.control_queue
+                        .pop_used(front.token, &inputs[..input_count], &mut outputs)
+                };
+                match popped {
+                    Ok(_) => {
+                        consumed = true;
+                        break;
+                    }
+                    // Not ours yet: keep it (order preserved) and try the
+                    // next pending entry against the same used-ring head.
+                    Err(VirtIoError::WrongToken | VirtIoError::NotReady) => {
+                        self.pending.push_back(front);
+                    }
+                    Err(_) => {
+                        self.pending.push_front(front);
+                        self.broken = true;
+                        return;
+                    }
                 }
-                Err(_) => {
-                    self.pending.push_front(front);
-                    self.broken = true;
-                    break;
-                }
+            }
+            if !consumed {
+                // The used-ring head belongs to no pending entry yet; its
+                // response has not been written by the host.
+                break;
             }
         }
     }
@@ -397,6 +426,7 @@ impl<H: Hal, T: Transport> Inner<H, T> {
                 header: owned_header,
                 payload: None,
                 payload_len: 0,
+                recv: None,
             },
             payload_borrow: payload_ptr,
         });
@@ -468,11 +498,16 @@ impl<H: Hal, T: Transport> Inner<H, T> {
             payload_dma.write(payload);
             Some(payload_dma)
         };
+        // The response lands whenever the host retires the fence, which may
+        // be long after later synchronous responses were written; give the
+        // entry its own receive buffer instead of the shared scratch page.
+        let recv_dma = DmaBuffer::<H>::new(PAGE_SIZE, BufferDirection::DeviceToDriver)?;
 
-        let recv = (self.queue_buf_recv.as_mut_slice().as_mut_ptr(), PAGE_SIZE);
-        // SAFETY: the header and payload buffers are owned by the pending
-        // entry pushed below, which keeps them alive until the response is
-        // consumed; the receive side is the scratch page.
+        let recv = (recv_dma.base().as_ptr(), PAGE_SIZE);
+        // SAFETY: the header, payload and receive buffers are owned by the
+        // pending entry pushed below, which keeps them alive until the
+        // response is consumed (or the device is declared broken, which
+        // stops the host from ever writing again).
         let token = unsafe {
             self.add_chain(
                 (owned_header.as_ptr(), header.len()),
@@ -490,6 +525,7 @@ impl<H: Hal, T: Transport> Inner<H, T> {
                 header: owned_header,
                 payload: payload_dma,
                 payload_len: payload.len(),
+                recv: Some(recv_dma),
             },
         });
         Ok(())
