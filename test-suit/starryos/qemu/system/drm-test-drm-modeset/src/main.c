@@ -320,6 +320,17 @@ int main(void)
           "GETCRTC fb_id unchanged after failed SETCRTC");
     check_binding(fd, plane_ids[0], crtc_ids[0], next_fb.fb_id);
 
+    /* Linux rejects a disable request that still names connectors and leaves
+     * the previously committed state intact. */
+    struct drm_mode_crtc bad_disable = {
+        .crtc_id = crtc_ids[0],
+        .set_connectors_ptr = (uint64_t)(uintptr_t)conn_ids,
+        .count_connectors = 1,
+    };
+    CHECK_ERR(ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &bad_disable), EINVAL,
+              "disable CRTC rejects connectors");
+    check_binding(fd, plane_ids[0], crtc_ids[0], next_fb.fb_id);
+
     struct drm_mode_crtc disable = { .crtc_id = crtc_ids[0] };
     CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_SETCRTC, &disable), 0, "disable CRTC");
     check_binding(fd, plane_ids[0], crtc_ids[0], 0);

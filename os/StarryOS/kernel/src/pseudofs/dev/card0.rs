@@ -1079,9 +1079,12 @@ impl Card0 {
             return Err(VfsError::InvalidInput);
         }
 
-        // Linux uses mode_valid, not the framebuffer or connector fields, to
-        // request disable. The remaining fields are ignored for this path.
+        // Linux uses mode_valid to request disable, but still rejects a
+        // disable request that names connectors.
         if c.mode_valid == 0 {
+            if c.count_connectors != 0 {
+                return Err(VfsError::InvalidInput);
+            }
             *self.state.lock() = ModesetState::default();
             return Ok(0);
         }
