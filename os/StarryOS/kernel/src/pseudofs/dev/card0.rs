@@ -78,7 +78,7 @@ use super::drm::{
 };
 use crate::{
     StarryError, StarryResult,
-    file::{FileLike, add_file_like},
+    file::{FileLike, add_file_like, dma_buf_seek},
     mm::{VmMutPtr, VmPtr, vm_load, vm_write_slice},
     pseudofs::{DeviceMmap, DeviceOps},
     sync::Mutex,
@@ -260,12 +260,7 @@ impl FileLike for DmaBufGem {
     }
 
     fn seek(&self, pos: ax_io::SeekFrom) -> StarryResult<u64> {
-        // Linux dma_buf_llseek is a size probe, not a file cursor.
-        match pos {
-            ax_io::SeekFrom::Start(0) => Ok(0),
-            ax_io::SeekFrom::End(0) => Ok(self.size),
-            _ => Err(StarryError::InvalidInput),
-        }
+        dma_buf_seek(self.size, pos)
     }
 
     fn device_mmap(&self, offset: u64, length: u64) -> StarryResult<DeviceMmap> {

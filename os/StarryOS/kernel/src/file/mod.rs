@@ -200,6 +200,18 @@ pub trait ReadBuf: Read + IoBuf {}
 impl<T: Read + IoBuf> ReadBuf for T {}
 pub type IoSrc<'a> = dyn ReadBuf + 'a;
 
+/// Apply Linux dma-buf size-probe seek semantics.
+///
+/// A dma-buf has no file cursor. It accepts only `SEEK_SET(0)` and
+/// `SEEK_END(0)` so userspace can query the exported buffer size.
+pub(crate) fn dma_buf_seek(size: u64, pos: ax_io::SeekFrom) -> StarryResult<u64> {
+    match pos {
+        ax_io::SeekFrom::Start(0) => Ok(0),
+        ax_io::SeekFrom::End(0) => Ok(size),
+        _ => Err(StarryError::InvalidInput),
+    }
+}
+
 #[allow(dead_code)]
 pub trait FileLike: Pollable + DowncastSync {
     /// Seek a special file using its own offset rules.
