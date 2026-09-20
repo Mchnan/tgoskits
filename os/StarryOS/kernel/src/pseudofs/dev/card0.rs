@@ -302,30 +302,20 @@ impl Pollable for DmaBufGem {
     }
 }
 
-/// Last legacy `SETCRTC` binding so `GETCRTC` can report what the
-/// CRTC is currently scanning out. Linux DRM keeps this state on the
-/// CRTC object itself; we keep it next to the atomic state but on a
-/// separate lock because legacy SETCRTC needs to validate against
-/// `fbs` and we don't want to nest locks when the validation may need
-/// to take `fbs` while another path holds `state`.
-#[derive(Debug, Default, Clone)]
-struct LegacyCrtcState {
-    fb_id: u32,
-    connectors: Vec<u32>,
-    mode: DrmModeModeInfo,
-    mode_valid: u32,
-    x: u32,
-    y: u32,
+/// A mode's identity and backing travel with the candidate/committed state.
+#[derive(Debug, Clone)]
+struct ModeBlob {
+    id: u32,
+    info: DrmModeModeInfo,
+    bytes: Arc<Vec<u8>>,
 }
 
-/// Current values of all atomic-tunable properties on our single-CRTC /
-/// single-connector / single-plane layout. Guarded by one mutex because
-/// atomic commits touch multiple fields at once and userspace expects
-/// the commit to be all-or-nothing.
-#[derive(Debug, Default, Clone, Copy)]
+/// The single committed state shared by legacy and atomic KMS. Cloned
+/// candidates keep mode references alive and publish only after validation.
+#[derive(Debug, Default, Clone)]
 struct ModesetState {
     crtc_active: u64,
-    crtc_mode_id: u32,
+    mode: Option<ModeBlob>,
     conn_crtc_id: u32,
     plane_fb_id: u32,
     plane_crtc_id: u32,
@@ -347,13 +337,10 @@ pub struct Card0 {
     poll_rx: PollSet,
     /// Monotonically-increasing vblank sequence.
     sequence: AtomicU32,
-    /// Current values of all atomic-tunable properties.
+    /// Serializes modeset validation, scanout and publication. Lock order is
+    /// state -> fbs/blobs -> display; display IRQ handling never takes state.
+    /// User copies and event wakeups happen outside this sleepable mutex.
     state: Mutex<ModesetState>,
-    /// Legacy `SETCRTC` binding readable via `GETCRTC`. Atomic commits
-    /// don't update this — userspace that mixes legacy and atomic gets
-    /// the well-defined "legacy state reflects the last SETCRTC"
-    /// behavior libdrm expects.
-    legacy_crtc: Mutex<LegacyCrtcState>,
     /// `CREATE_DUMB`-allocated buffers keyed by handle. Dropping an
     /// entry releases Card0's strong ref on the backing pages; user
     /// mappings hold their own refs via `LinearBackend::retain`.
@@ -369,19 +356,8 @@ pub struct Card0 {
     fbs: Mutex<BTreeMap<u32, Framebuffer>>,
     /// Next fb id to hand out.
     next_fb_id: AtomicU32,
-    /// User-created `CREATEPROPBLOB` blobs keyed by their blob_id.
-    /// Distinct from `system_blobs` so DESTROY_BLOB cannot remove
-    /// kernel-owned blobs (e.g. `IN_FORMATS`). Stored behind `Arc`
-    /// so committed modeset state (see [`Self::mode_id_blob_ref`]) can
-    /// hold its own backing reference past a user `DESTROYPROPBLOB`.
+    /// User-published blobs. A committed mode pins its own reference in state.
     blobs: Mutex<BTreeMap<u32, Arc<Vec<u8>>>>,
-    /// Strong reference to the blob backing the currently-committed
-    /// `MODE_ID` property. Linux DRM pins the mode blob from the CRTC
-    /// state, so a user `DESTROYPROPBLOB` on the publish handle only
-    /// drops the user's reference — `GETPROPBLOB` on the same id keeps
-    /// working until a later atomic commit replaces or clears
-    /// `MODE_ID`. Cleared/replaced atomically with `state.crtc_mode_id`.
-    mode_id_blob_ref: Mutex<Option<Arc<Vec<u8>>>>,
     /// Next blob id to hand out.
     next_blob_id: AtomicU32,
     /// Kernel-owned immutable blobs (e.g. plane `IN_FORMATS`) keyed by
@@ -406,7 +382,6 @@ impl Card0 {
             poll_rx: PollSet::new(),
             sequence: AtomicU32::new(0),
             state: Mutex::new(ModesetState::default()),
-            legacy_crtc: Mutex::new(LegacyCrtcState::default()),
             dumbs: Mutex::new(BTreeMap::new()),
             next_dumb_handle: AtomicU32::new(FIRST_DUMB_HANDLE),
             // Start at STRIDE rather than 0 so a zero `offset` argument
@@ -416,7 +391,6 @@ impl Card0 {
             fbs: Mutex::new(BTreeMap::new()),
             next_fb_id: AtomicU32::new(FIRST_FB_ID),
             blobs: Mutex::new(BTreeMap::new()),
-            mode_id_blob_ref: Mutex::new(None),
             next_blob_id: AtomicU32::new(FIRST_BLOB_ID),
             system_blobs: Mutex::new(BTreeMap::new()),
             in_formats_blob: AtomicU32::new(0),
@@ -1078,37 +1052,27 @@ impl Card0 {
         if c.crtc_id != CRTC_ID {
             return Err(VfsError::InvalidInput);
         }
-        let legacy = self.legacy_crtc.lock().clone();
+        let state = self.state.lock().clone();
         c.gamma_size = 0;
-        if legacy.fb_id != 0 {
-            // Report the bound state from the last successful SETCRTC.
-            c.x = legacy.x;
-            c.y = legacy.y;
-            c.fb_id = legacy.fb_id;
-            c.mode_valid = legacy.mode_valid;
-            c.mode = if legacy.mode_valid != 0 {
-                legacy.mode
+        c.x = (state.plane_src_x >> 16) as u32;
+        c.y = (state.plane_src_y >> 16) as u32;
+        c.fb_id = state.plane_fb_id;
+        c.mode_valid = u32::from(state.mode.is_some());
+        c.mode = state
+            .mode
+            .as_ref()
+            .map_or_else(Default::default, |mode| mode.info);
+        let connectors = [CONNECTOR_ID];
+        c.count_connectors = report_user_array(
+            current,
+            c.set_connectors_ptr,
+            c.count_connectors,
+            if state.conn_crtc_id != 0 {
+                &connectors
             } else {
-                DrmModeModeInfo::default()
-            };
-            c.count_connectors = report_user_array(
-                current,
-                c.set_connectors_ptr,
-                c.count_connectors,
-                &legacy.connectors,
-            )?;
-        } else {
-            // Unbound CRTC: no fb, no connectors, advertise the current
-            // synthetic mode so probes still see a coherent mode.
-            c.x = 0;
-            c.y = 0;
-            c.fb_id = 0;
-            c.mode_valid = 1;
-            c.mode = current_mode();
-            let empty: &[u32] = &[];
-            c.count_connectors =
-                report_user_array(current, c.set_connectors_ptr, c.count_connectors, empty)?;
-        }
+                &[]
+            },
+        )?;
         ptr.vm_write(current, c).map_err(|_| VfsError::BadAddress)?;
         Ok(0)
     }
@@ -1120,17 +1084,11 @@ impl Card0 {
             return Err(VfsError::InvalidInput);
         }
 
-        // fb_id == 0 with no connectors is the libdrm "disable CRTC"
-        // idiom. Anything else must pass full validation.
-        if c.fb_id == 0 && c.count_connectors == 0 {
-            *self.legacy_crtc.lock() = LegacyCrtcState::default();
+        // Linux uses mode_valid, not the framebuffer or connector fields, to
+        // request disable. The remaining fields are ignored for this path.
+        if c.mode_valid == 0 {
+            *self.state.lock() = ModesetState::default();
             return Ok(0);
-        }
-
-        // Validate the fb exists. Snapshot under the lock so a racing
-        // RMFB can't pull the rug between validation and present.
-        if c.fb_id == 0 || !self.fbs.lock().contains_key(&c.fb_id) {
-            return Err(VfsError::InvalidInput);
         }
 
         // A non-disable SETCRTC must list at least one connector and
@@ -1155,14 +1113,28 @@ impl Card0 {
             }
         }
 
-        // Validation passed — commit state, then push pixels.
-        *self.legacy_crtc.lock() = LegacyCrtcState {
-            fb_id: c.fb_id,
-            connectors,
-            mode: c.mode,
-            mode_valid: c.mode_valid,
-            x: c.x,
-            y: c.y,
+        let mut state = self.state.lock();
+        if c.fb_id == 0 || !self.fbs.lock().contains_key(&c.fb_id) {
+            return Err(VfsError::InvalidInput);
+        }
+        // Legacy SETCRTC uses the same mode/plane state as an atomic commit.
+        *state = ModesetState {
+            crtc_active: 1,
+            mode: Some(ModeBlob {
+                id: self.next_blob_id.fetch_add(1, Ordering::Relaxed),
+                info: c.mode,
+                bytes: Arc::new(bytes_of(&c.mode).to_vec()),
+            }),
+            conn_crtc_id: CRTC_ID,
+            plane_crtc_id: CRTC_ID,
+            plane_fb_id: c.fb_id,
+            plane_src_x: u64::from(c.x) << 16,
+            plane_src_y: u64::from(c.y) << 16,
+            plane_src_w: u64::from(c.mode.hdisplay) << 16,
+            plane_src_h: u64::from(c.mode.vdisplay) << 16,
+            plane_crtc_w: u64::from(c.mode.hdisplay),
+            plane_crtc_h: u64::from(c.mode.vdisplay),
+            ..ModesetState::default()
         };
         self.present_fb(c.fb_id);
         Ok(0)
@@ -1288,14 +1260,10 @@ impl Card0 {
     fn handle_rmfb(&self, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
         let ptr = arg as *const u32;
         let fb_id: u32 = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
+        let mut state = self.state.lock();
         self.fbs.lock().remove(&fb_id);
-        // If the removed fb was the one bound by legacy SETCRTC, clear
-        // the binding so GETCRTC stops reporting a stale fb_id.
-        {
-            let mut legacy = self.legacy_crtc.lock();
-            if legacy.fb_id == fb_id {
-                *legacy = LegacyCrtcState::default();
-            }
+        if state.plane_fb_id == fb_id {
+            *state = ModesetState::default();
         }
         Ok(0)
     }
@@ -1319,7 +1287,7 @@ impl Card0 {
         if p.plane_id != PLANE_ID {
             return Err(VfsError::InvalidInput);
         }
-        let state = *self.state.lock();
+        let state = self.state.lock().clone();
         p.crtc_id = state.plane_crtc_id;
         p.fb_id = state.plane_fb_id;
         p.possible_crtcs = 1;
@@ -1343,7 +1311,7 @@ impl Card0 {
         let mut q: DrmModeObjGetProperties =
             ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
 
-        let state = *self.state.lock();
+        let state = self.state.lock().clone();
         let (prop_ids, prop_vals): (&[u32], Vec<u64>) = match (q.obj_type, q.obj_id) {
             (DRM_MODE_OBJECT_PLANE, PLANE_ID) => {
                 let blob_id = self.ensure_in_formats_blob() as u64;
@@ -1440,7 +1408,10 @@ fn build_in_formats_blob() -> Vec<u8> {
 }
 
 fn crtc_prop_values(s: &ModesetState) -> Vec<u64> {
-    vec![s.crtc_active, s.crtc_mode_id as u64]
+    vec![
+        s.crtc_active,
+        s.mode.as_ref().map_or(0, |mode| u64::from(mode.id)),
+    ]
 }
 
 fn conn_prop_values(s: &ModesetState) -> Vec<u64> {
@@ -1608,10 +1579,19 @@ impl Card0 {
     fn handle_page_flip(&self, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
         let ptr = arg as *const DrmModeCrtcPageFlip;
         let f: DrmModeCrtcPageFlip = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
-        if f.crtc_id != CRTC_ID || !self.fbs.lock().contains_key(&f.fb_id) {
+        if f.crtc_id != CRTC_ID {
             return Err(VfsError::InvalidInput);
         }
+        let mut state = self.state.lock();
+        if state.plane_fb_id == 0 {
+            return Err(VfsError::ResourceBusy);
+        }
+        if state.crtc_active == 0 || !self.fbs.lock().contains_key(&f.fb_id) {
+            return Err(VfsError::InvalidInput);
+        }
+        state.plane_fb_id = f.fb_id;
         self.present_fb(f.fb_id);
+        drop(state);
         if f.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
             self.queue_flip_event(f.user_data);
         }
@@ -1721,13 +1701,7 @@ impl Card0 {
             .map_err(|_| VfsError::BadAddress)?;
 
         let mut state = self.state.lock();
-        let mut proposed = *state;
-        // Outer Option: "the commit assigned MODE_ID at least once".
-        // Inner Option: the resolved Arc (None means clearing MODE_ID to 0).
-        // Only published into `mode_id_blob_ref` after the whole batch
-        // validates so a TEST_ONLY commit or a later property error
-        // leaves the committed mode blob ref untouched.
-        let mut new_mode_blob: Option<Option<Arc<Vec<u8>>>> = None;
+        let mut proposed = state.clone();
         let mut idx = 0;
         for (obj_i, &obj_id) in objs.iter().enumerate() {
             let obj_type = object_type_of(obj_id).ok_or(VfsError::NotFound)?;
@@ -1735,7 +1709,7 @@ impl Card0 {
                 let prop_id = props[idx];
                 let value = values[idx];
                 idx += 1;
-                if !self.apply_prop(obj_type, prop_id, value, &mut proposed, &mut new_mode_blob)? {
+                if !self.apply_prop(obj_type, prop_id, value, &mut proposed)? {
                     return Err(VfsError::InvalidInput);
                 }
             }
@@ -1746,13 +1720,10 @@ impl Card0 {
         }
         let current_fb = proposed.plane_fb_id;
         *state = proposed;
-        drop(state);
-        if let Some(new_ref) = new_mode_blob {
-            *self.mode_id_blob_ref.lock() = new_ref;
-        }
-        if current_fb != 0 {
+        if current_fb != 0 && state.crtc_active != 0 {
             self.present_fb(current_fb);
         }
+        drop(state);
         if a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
             self.queue_flip_event(a.user_data);
         }
@@ -1768,7 +1739,6 @@ impl Card0 {
         prop_id: u32,
         value: u64,
         s: &mut ModesetState,
-        new_mode_blob: &mut Option<Option<Arc<Vec<u8>>>>,
     ) -> VfsResult<bool> {
         match (obj_type, prop_id) {
             (DRM_MODE_OBJECT_PLANE, PROP_PLANE_TYPE) => {
@@ -1818,28 +1788,29 @@ impl Card0 {
                 s.crtc_active = value;
             }
             (DRM_MODE_OBJECT_CRTC, PROP_CRTC_MODE_ID) => {
-                let blob = value as u32;
-                let arc = if blob == 0 {
+                let id = u32::try_from(value).map_err(|_| VfsError::InvalidInput)?;
+                s.mode = if id == 0 {
                     None
                 } else {
-                    // Resolve the Arc backing in priority order:
-                    //   1. user-publish table — the normal case.
-                    //   2. the existing `mode_id_blob_ref` if the
-                    //      requested id matches the currently-committed
-                    //      MODE_ID — keeps a re-commit of the same id
-                    //      working even after the user destroyed their
-                    //      publish handle.
-                    let arc = self.blobs.lock().get(&blob).cloned().or_else(|| {
-                        if s.crtc_mode_id == blob {
-                            self.mode_id_blob_ref.lock().clone()
-                        } else {
-                            None
-                        }
-                    });
-                    Some(arc.ok_or(VfsError::InvalidInput)?)
+                    let bytes = self
+                        .blobs
+                        .lock()
+                        .get(&id)
+                        .cloned()
+                        .or_else(|| {
+                            s.mode
+                                .as_ref()
+                                .filter(|mode| mode.id == id)
+                                .map(|mode| mode.bytes.clone())
+                        })
+                        .ok_or(VfsError::InvalidInput)?;
+                    if bytes.len() != size_of::<DrmModeModeInfo>() {
+                        return Err(VfsError::InvalidInput);
+                    }
+                    let info = bytemuck::try_pod_read_unaligned(&bytes)
+                        .map_err(|_| VfsError::InvalidInput)?;
+                    Some(ModeBlob { id, info, bytes })
                 };
-                s.crtc_mode_id = blob;
-                *new_mode_blob = Some(arc);
             }
             (DRM_MODE_OBJECT_CONNECTOR, PROP_CONN_CRTC_ID) => {
                 let c = value as u32;
@@ -1885,9 +1856,9 @@ impl Card0 {
         if self.system_blobs.lock().contains_key(&d.blob_id) {
             return Err(VfsError::PermissionDenied);
         }
-        // Drop the user-publish reference. If `mode_id_blob_ref` still
-        // holds the same Arc (i.e. an atomic commit pinned this blob as
-        // the CRTC's `MODE_ID`), the blob data stays alive and
+        // Drop the user-publish reference. If `state.mode` still
+        // holds the same Arc (i.e. a commit pinned this blob as the CRTC's
+        // `MODE_ID`), the blob data stays alive and
         // `GETPROPBLOB` keeps succeeding via the committed-state lookup
         // below until a later atomic commit replaces `MODE_ID`.
         self.blobs
@@ -1900,26 +1871,20 @@ impl Card0 {
     fn handle_get_blob(&self, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
         let ptr = arg as *mut DrmModeGetBlob;
         let mut g: DrmModeGetBlob = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
-        // Clone the Arc backing out of the lock — `vm_write_slice` can
-        // page-fault and sleep, and we don't want to hold the blob
-        // map locked across that. Lookup order:
-        //   1. user-publish table (`blobs`)
-        //   2. committed `MODE_ID` ref, only when the requested id
-        //      matches `state.crtc_mode_id` — this is the lifeline that
-        //      keeps a user-destroyed-but-still-committed mode blob
-        //      visible.
-        //   3. system blobs (kernel-owned, e.g. `IN_FORMATS`).
-        let bytes = if let Some(b) = self.blobs.lock().get(&g.blob_id).cloned() {
-            b
-        } else if g.blob_id == self.state.lock().crtc_mode_id
-            && let Some(b) = self.mode_id_blob_ref.lock().clone()
-        {
-            b
-        } else if let Some(b) = self.system_blobs.lock().get(&g.blob_id).cloned() {
-            b
-        } else {
-            return Err(VfsError::NotFound);
-        };
+        // Never hold a registry/state lock across faultable output copies.
+        // Separate lookups also avoid nesting blobs -> state against commits.
+        let published = self.blobs.lock().get(&g.blob_id).cloned();
+        let bytes = published
+            .or_else(|| {
+                self.state
+                    .lock()
+                    .mode
+                    .as_ref()
+                    .filter(|mode| mode.id == g.blob_id)
+                    .map(|mode| mode.bytes.clone())
+            })
+            .or_else(|| self.system_blobs.lock().get(&g.blob_id).cloned())
+            .ok_or(VfsError::NotFound)?;
         if g.data != 0 && g.length > 0 {
             let n = (g.length as usize).min(bytes.len());
             vm_write_slice(current, g.data as *mut u8, &bytes[..n])

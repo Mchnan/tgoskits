@@ -31,6 +31,19 @@ struct drm_mode_mode_info {
     uint16_t vdisplay, vsync_start, vsync_end, vtotal, vscan;
     uint32_t vrefresh, flags, kind; char name[32];
 };
+struct drm_mode_crtc {
+    uint64_t set_connectors_ptr; uint32_t count_connectors;
+    uint32_t crtc_id; uint32_t fb_id; uint32_t x; uint32_t y;
+    uint32_t gamma_size; uint32_t mode_valid;
+    struct drm_mode_mode_info mode;
+};
+#define DRM_IOCTL_MODE_GETCRTC _IOWR('d', 0xA1, struct drm_mode_crtc)
+#define DRM_IOCTL_MODE_SETCRTC _IOWR('d', 0xA2, struct drm_mode_crtc)
+struct drm_mode_crtc_page_flip {
+    uint32_t crtc_id; uint32_t fb_id; uint32_t flags; uint32_t reserved;
+    uint64_t user_data;
+};
+#define DRM_IOCTL_MODE_PAGE_FLIP _IOWR('d', 0xB0, struct drm_mode_crtc_page_flip)
 struct drm_mode_card_res {
     uint64_t fb_id_ptr; uint64_t crtc_id_ptr; uint64_t connector_id_ptr;
     uint64_t encoder_id_ptr;
@@ -413,6 +426,24 @@ int main(void)
                   "GETPLANE after atomic commit");
         CHECK(gp2.fb_id == fb.fb_id, "GETPLANE reports committed fb_id");
         CHECK(gp2.crtc_id == crtcs[0], "GETPLANE reports committed crtc_id");
+        struct drm_mode_crtc crtc = { .crtc_id = crtcs[0] };
+        CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_GETCRTC, &crtc), 0,
+                  "GETCRTC after atomic commit");
+        CHECK(crtc.fb_id == fb.fb_id && crtc.mode_valid == 1 &&
+              crtc.mode.hdisplay == modes[0].hdisplay, "GETCRTC observes atomic binding and mode");
+        struct drm_mode_fb_cmd2 next_fb = fb;
+        next_fb.fb_id = 0;
+        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &next_fb), 0, "mixed API flip target");
+        struct drm_mode_crtc_page_flip flip = { .crtc_id = crtcs[0], .fb_id = next_fb.fb_id };
+        CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_PAGE_FLIP, &flip), 0,
+                  "legacy flip after atomic modeset");
+        CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_GETPLANE, &gp2), 0, "GETPLANE after mixed flip");
+        CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_GETCRTC, &crtc), 0, "GETCRTC after mixed flip");
+        CHECK(gp2.fb_id == next_fb.fb_id && crtc.fb_id == next_fb.fb_id &&
+              obj_prop_value(fd, planes[0], DRM_MODE_OBJECT_PLANE, P_PLANE_FB_ID) == next_fb.fb_id,
+              "legacy flip updates both queries and atomic FB_ID");
+        flip.fb_id = fb.fb_id;
+        CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_PAGE_FLIP, &flip), 0, "restore original framebuffer");
     }
 
     /* IN_FENCE_FD borrows a sync-file; it never owns the caller's fd.
@@ -559,6 +590,17 @@ int main(void)
     };
     CHECK_ERR(ioctl(fd, DRM_IOCTL_MODE_GETPROPBLOB, &gb_orphan), ENOENT,
               "orphan blob is ENOENT after destroy");
+
+    struct drm_mode_crtc disable = { .crtc_id = crtcs[0] };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_SETCRTC, &disable), 0,
+              "legacy disable after atomic modeset");
+    CHECK(obj_prop_value(fd, planes[0], DRM_MODE_OBJECT_PLANE, P_PLANE_FB_ID) == 0 &&
+          obj_prop_value(fd, planes[0], DRM_MODE_OBJECT_PLANE, P_PLANE_CRTC_ID) == 0 &&
+          obj_prop_value(fd, crtcs[0], DRM_MODE_OBJECT_CRTC, P_CRTC_ACTIVE) == 0 &&
+          obj_prop_value(fd, crtcs[0], DRM_MODE_OBJECT_CRTC, P_CRTC_MODE_ID) == 0,
+          "legacy disable clears shared atomic bindings and mode");
+    CHECK_ERR(ioctl(fd, DRM_IOCTL_MODE_GETPROPBLOB, &gb_after), ENOENT,
+              "disable releases the last committed mode blob reference");
 
     close(fd);
     TEST_DONE();
