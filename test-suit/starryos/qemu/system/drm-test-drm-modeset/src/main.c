@@ -16,11 +16,16 @@
 
 #define _GNU_SOURCE
 #include "test_framework.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -158,6 +163,107 @@ static void check_binding(int fd, uint32_t plane, uint32_t crtc, uint32_t fb)
     CHECK(p.fb_id == fb && c.fb_id == fb, "plane and CRTC report committed framebuffer");
     CHECK(p.crtc_id == (fb ? crtc : 0), "plane reports committed CRTC binding");
     CHECK(c.mode_valid == (fb ? 1u : 0u), "CRTC mode validity follows enable/disable");
+}
+
+static volatile sig_atomic_t vblank_signal_seen;
+
+static void vblank_signal_handler(int signo)
+{
+    vblank_signal_seen = signo == SIGUSR1;
+}
+
+static int wait_for_vblank_sleep(pid_t child)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%ld/status", (long)child);
+    struct timespec started;
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
+        return 1;
+    for (;;) {
+        FILE *file = fopen(path, "r");
+        if (!file)
+            return 1;
+        char line[128], state = 0;
+        while (fgets(line, sizeof(line), file)) {
+            if (sscanf(line, "State: %c", &state) == 1)
+                break;
+        }
+        fclose(file);
+        if (state == 'S')
+            return 0;
+        if (state == 'Z' || state == 'X')
+            return 1;
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+            now.tv_sec - started.tv_sec >= 5)
+            return 1;
+        sched_yield();
+    }
+}
+
+static int interrupted_vblank_child(int fd, int ready_fd)
+{
+    struct sigaction action = {.sa_handler = vblank_signal_handler};
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGUSR1, &action, NULL) != 0)
+        return 1;
+    sigset_t unblocked;
+    sigemptyset(&unblocked);
+    sigaddset(&unblocked, SIGUSR1);
+    if (sigprocmask(SIG_UNBLOCK, &unblocked, NULL) != 0)
+        return 1;
+
+    union drm_wait_vblank wait = {0};
+    wait.req.type = _DRM_VBLANK_RELATIVE;
+    wait.req.sequence = 180;
+    wait.req.signal = 0x12345678;
+    if (write(ready_fd, "R", 1) != 1)
+        return 1;
+    close(ready_fd);
+
+    errno = 0;
+    long result = syscall(SYS_ioctl, fd, DRM_IOCTL_WAIT_VBLANK, &wait);
+    if (result != -1 || errno != EINTR || !vblank_signal_seen ||
+        wait.req.type != _DRM_VBLANK_RELATIVE || wait.req.sequence != 180 ||
+        wait.req.signal != 0x12345678) {
+        fprintf(stderr, "FAIL: interrupted WAIT_VBLANK result=%ld errno=%d signal=%d\n",
+                result, errno, (int)vblank_signal_seen);
+        return 1;
+    }
+    return 0;
+}
+
+static void check_vblank_signal_interrupt(int fd)
+{
+    int ready_pipe[2];
+    int piped = pipe(ready_pipe);
+    CHECK(piped == 0, "create vblank signal synchronization pipe");
+    if (piped != 0)
+        return;
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready_pipe[0]);
+        _exit(interrupted_vblank_child(fd, ready_pipe[1]));
+    }
+    CHECK(child >= 0, "fork vblank waiter");
+    if (child < 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        return;
+    }
+    close(ready_pipe[1]);
+    char ready;
+    ssize_t n = read(ready_pipe[0], &ready, 1);
+    close(ready_pipe[0]);
+    int blocked = n == 1 && ready == 'R' && wait_for_vblank_sleep(child) == 0;
+    CHECK(blocked, "WAIT_VBLANK enters an interruptible wait");
+    if (!blocked || kill(child, SIGUSR1) != 0) {
+        kill(child, SIGKILL);
+    }
+    int status;
+    int waited = waitpid(child, &status, 0);
+    CHECK(blocked && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "signal interrupts WAIT_VBLANK without writing a reply");
 }
 
 int main(void)
@@ -442,6 +548,8 @@ int main(void)
           "relative wait 2 spans 1-2 vblank periods");
     CHECK(wblock.reply.sequence > wev.reply.sequence,
           "blocking wait advanced the counter");
+
+    check_vblank_signal_interrupt(fd);
 
     /* --- 队列再次清空 --- */
     CHECK_ERR(read(fd, buf, sizeof(buf)), EAGAIN, "event queue drained");

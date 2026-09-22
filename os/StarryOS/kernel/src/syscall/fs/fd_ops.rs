@@ -104,17 +104,19 @@ fn add_to_fd(
             // /dev/xx handling
             if let Ok(device) = file.location().entry().downcast::<Device>() {
                 let inner = device.inner().as_any();
-                if crate::pseudofs::dev::card0::is_card0_device(inner) {
-                    let wrapped = crate::pseudofs::dev::card0::open_card0_file(
-                        device.inner().clone(), file, flags,
-                    )?;
+                if crate::pseudofs::usbfs::is_usbfs_device(inner) {
+                    let wrapped = crate::pseudofs::usbfs::open_usbfs_file(inner, file, flags)?;
                     if flags & O_NONBLOCK != 0 {
                         wrapped.set_nonblocking(true)?;
                     }
                     return add_file_like(wrapped, flags & O_CLOEXEC != 0);
                 }
-                if crate::pseudofs::usbfs::is_usbfs_device(inner) {
-                    let wrapped = crate::pseudofs::usbfs::open_usbfs_file(inner, file, flags)?;
+                if crate::pseudofs::dev::card0::is_card0_device(inner) {
+                    let wrapped = crate::pseudofs::dev::card0::open_card0_file(
+                        inner,
+                        file,
+                        flags,
+                    )?;
                     if flags & O_NONBLOCK != 0 {
                         wrapped.set_nonblocking(true)?;
                     }
