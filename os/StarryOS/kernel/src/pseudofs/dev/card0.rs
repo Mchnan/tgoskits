@@ -44,6 +44,7 @@ use core::{
 };
 
 use ax_alloc::GlobalPage;
+use ax_fs_ng::vfs::{FileBackend, FileFlags};
 use ax_memory_addr::{PAGE_SIZE_4K, PhysAddrRange};
 use ax_runtime::hal::{mem::virt_to_phys, time::monotonic_time_nanos};
 use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
@@ -642,8 +643,8 @@ impl FileLike for Card0File {
         Ok(self.card().ioctl_for_file(self, current, cmd, arg)?)
     }
 
-    fn device_mmap(&self, offset: u64, length: u64) -> StarryResult<DeviceMmap> {
-        Ok(self.card().mmap(offset, length))
+    fn file_mmap(&self) -> StarryResult<(FileBackend, FileFlags)> {
+        self.base.file_mmap()
     }
 
     fn open_flags(&self) -> u32 { self.base.open_flags() }
