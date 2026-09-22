@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.23](https://github.com/rcore-os/tgoskits/compare/ax-percpu-v0.4.22...ax-percpu-v0.4.23) - 2026-09-18
+
+### Other
+
+- *(sched)* reduce scheduler and futex hot-path overhead ([#2399](https://github.com/rcore-os/tgoskits/pull/2399))
+
+## [0.4.22](https://github.com/rcore-os/tgoskits/compare/ax-percpu-v0.4.21...ax-percpu-v0.4.22) - 2026-09-13
+
+### Other
+
+- updated the following local packages: cpu-local
+
+## [0.4.21](https://github.com/rcore-os/tgoskits/compare/ax-percpu-v0.4.20...ax-percpu-v0.4.21) - 2026-09-11
+
+### Other
+
+- updated the following local packages: cpu-local
+
 ## [0.4.20](https://github.com/rcore-os/tgoskits/compare/ax-percpu-v0.4.19...ax-percpu-v0.4.20) - 2026-09-10
 
 ### Fixed

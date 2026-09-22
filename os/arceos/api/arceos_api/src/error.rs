@@ -71,6 +71,11 @@ fn task_error_to_io_error(error: TaskError) -> IoError {
         // Linux copy_process() reports the global thread limit as EAGAIN.
         TaskError::ThreadCapacity => IoError::WouldBlock,
         TaskError::TimerCapacity => IoError::NoMemory,
+        TaskError::RuntimeFailure(status)
+            if status == ax_runtime::task::runtime::RuntimeStatus::NoMemory as u32 =>
+        {
+            IoError::NoMemory
+        }
         TaskError::UnsafeContext => IoError::OperationNotPermitted,
         TaskError::StaleThreadId => IoError::NotFound,
         TaskError::NotInitialized
@@ -129,6 +134,7 @@ fn vfs_error_to_io_error(error: VfsError) -> IoError {
         VfsError::ReadOnlyFilesystem => IoError::ReadOnlyFilesystem,
         VfsError::ResourceBusy => IoError::ResourceBusy,
         VfsError::StorageFull => IoError::StorageFull,
+        VfsError::TextFileBusy => IoError::ResourceBusy,
         VfsError::TimedOut => IoError::TimedOut,
         VfsError::TooManyLinks => IoError::Io,
         VfsError::Unsupported => IoError::Unsupported,

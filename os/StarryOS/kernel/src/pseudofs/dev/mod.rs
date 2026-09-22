@@ -1,21 +1,19 @@
 //! Special devices
 
 mod axivc;
-mod card0;
+pub(crate) mod card0;
 #[cfg(feature = "rknpu")]
-mod card1;
+pub(crate) mod card1;
 // The real contiguous coherent dma-heap is shared by every accelerator that
 // exchanges buffers (JPU / NPU / RGA).
 #[cfg(any(feature = "jpeg", feature = "rknpu", feature = "rga"))]
 mod dmaheap;
 mod drm;
 mod vblank;
-#[cfg(feature = "input")]
 pub mod event;
 mod fb;
 #[cfg(feature = "sg2002")]
 pub mod ion;
-#[cfg(any(feature = "input", feature = "k230-kpu"))]
 mod irq_service;
 mod kmsg;
 #[cfg(feature = "k230-kpu")]
@@ -29,7 +27,6 @@ mod memtrack;
 mod mpp_service;
 #[cfg(feature = "sg2002")]
 mod pinmux;
-#[cfg(any(feature = "sg2002", feature = "rk3588-pwm"))]
 pub(super) mod pwm;
 #[cfg(feature = "rga")]
 pub(crate) mod rga;
@@ -765,7 +762,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     }
 
     // Input devices
-    #[cfg(feature = "input")]
     root.add(
         "input",
         SimpleDir::new_maker(fs.clone(), Arc::new(event::input_devices(fs.clone()))),

@@ -12,26 +12,14 @@
 //! timestamps rather than latched by an interrupt
 //! (`drivers/gpu/drm/drm_vblank.c`, `drm_vblank_count_and_time`).
 //!
-//! Queued events (`CRTC_QUEUE_SEQUENCE`, `WAIT_VBLANK` with
-//! `_DRM_VBLANK_EVENT`) are delivered lazily by [`Card0::poll`], not by
-//! a kernel timer thread: real hardware raises a vblank IRQ per edge,
-//! and the emulation's equivalent observation point is userspace
-//! polling the DRM fd. Delivery latency is therefore bounded by the
-//! caller's poll interval rather than the vblank period, while event
-//! timestamps always carry the synthesized edge time.
+//! Each open file owns its queued events and a deadline worker wakes readers
+//! at the next edge; only the monotonic clock is shared by the device.
 
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-
-use crate::sync::Mutex;
 
 /// Nanoseconds between synthesized vblank edges (60 Hz, matching the
 /// mode's `DEFAULT_VREFRESH` advertised by the card).
 pub const VBLANK_PERIOD_NS: u64 = 1_000_000_000 / 60;
-
-/// Upper bound on simultaneously pending vblank events, matching the
-/// event-queue cap on the card.
-pub const MAX_PENDING_EVENTS: usize = 128;
 
 /// Wrap-aware "has the counter reached `target`" test on u64 sequences.
 /// Mirrors Linux's `vblank_passed()` in `drivers/gpu/drm/drm_vblank.c`:
@@ -46,16 +34,9 @@ pub const fn vblank_passed(current: u64, target: u64) -> bool {
 /// Linux's `widen_32_to_64()` (`drm_vblank.c`): reconstructs the full
 /// u64 sequence a u32 counter value refers to, given a nearby full-width
 /// reference. Low values just above a wrap resolve to the next cycle;
-/// values that look "behind" the reference's low half resolve to the
-/// reference's own high word.
+/// values on either side of the reference resolve to the nearest wrap.
 pub const fn widen_32_to_64(low: u32, reference: u64) -> u64 {
-    let high_span = 0xffff_ffff_0000_0000u64;
-    let sign_fix = if low & 0x8000_0000 != 0 {
-        0
-    } else {
-        high_span
-    };
-    (low as u64).wrapping_add(reference & high_span ^ sign_fix)
+    reference.wrapping_add(low.wrapping_sub(reference as u32) as i32 as i64 as u64)
 }
 
 /// An event queued for a future vblank edge by `CRTC_QUEUE_SEQUENCE` or
@@ -75,52 +56,6 @@ pub(super) struct PendingVblankEvent {
     pub target_sequence: u64,
 }
 
-/// Time-derived vblank sequence source plus the queue of events waiting
-/// for future edges. Shared state is a plain mutex; both writers (ioctl
-/// tasks queuing) and the drainer (`Card0::poll`) are sleepable task
-/// contexts, and no lock is held across another acquisition.
-pub(super) struct VblankScheduler {
-    clock: VblankClock,
-    pending: Mutex<Vec<PendingVblankEvent>>,
-}
-
-impl VblankScheduler {
-    pub(super) fn new(now_ns: u64) -> Self {
-        Self {
-            clock: VblankClock::new(now_ns),
-            pending: Mutex::new(Vec::new()),
-        }
-    }
-
-    pub(super) fn clock(&self) -> &VblankClock {
-        &self.clock
-    }
-
-    /// Queues an event for a future edge. Returns `false` when the
-    /// pending cap is reached (the caller maps this to Linux's
-    /// event-reservation `-ENOMEM`).
-    pub(super) fn queue(&self, event: PendingVblankEvent) -> bool {
-        let mut pending = self.pending.lock();
-        if pending.len() >= MAX_PENDING_EVENTS {
-            return false;
-        }
-        pending.push(event);
-        true
-    }
-
-    /// Removes and returns every event whose target edge has passed at
-    /// `now_ns`. Called from `Card0::poll`.
-    pub(super) fn take_expired(&self, now_ns: u64) -> Vec<PendingVblankEvent> {
-        let current = self.clock.sequence_at(now_ns);
-        let mut pending = self.pending.lock();
-        let (expired, remaining) = pending
-            .drain(..)
-            .partition(|event| vblank_passed(current, event.target_sequence));
-        *pending = remaining;
-        expired
-    }
-}
-
 /// Sequence counter derived from elapsed monotonic time. Sequence 0 is
 /// the card-creation anchor; edge *N* occurs at
 /// `anchor_ns + N * VBLANK_PERIOD_NS`.
@@ -129,7 +64,7 @@ pub(super) struct VblankClock {
 }
 
 impl VblankClock {
-    fn new(now_ns: u64) -> Self {
+    pub(super) fn new(now_ns: u64) -> Self {
         Self {
             anchor_ns: AtomicU64::new(now_ns),
         }
@@ -163,8 +98,9 @@ mod tests {
         // just below u64::MAX.
         assert!(vblank_passed(u64::MAX, u64::MAX - 1));
         assert!(vblank_passed(0, u64::MAX));
-        // Far-future targets must not look passed through the wrap.
-        assert!(!vblank_passed(1, u64::MAX));
+        // A nearby target just before wrap has passed; a future target has not.
+        assert!(vblank_passed(1, u64::MAX));
+        assert!(!vblank_passed(1, 2));
     }
 
     #[test]
@@ -173,10 +109,10 @@ mod tests {
         assert_eq!(widen_32_to_64(5, 0), 5);
         // Value in the same high-word neighborhood as the reference.
         assert_eq!(widen_32_to_64(5, 0x1_0000_0005), 0x1_0000_0005);
-        // A "negative-looking" u32 near the wrap widens forward.
-        assert_eq!(widen_32_to_64(0xffff_fff0, 0), 0xffff_fff0);
-        // Reference with a nonzero high word pulls small lows up with it.
-        assert_eq!(widen_32_to_64(0xffff_fff0, 0x2_0000_0000), 0x2_ffff_fff0);
+        // Values resolve to the closest wrap on either side of the reference.
+        assert_eq!(widen_32_to_64(0xffff_fff0, 0), u64::MAX - 15);
+        assert_eq!(widen_32_to_64(5, 0xffff_fff0), 0x1_0000_0005);
+        assert_eq!(widen_32_to_64(0xffff_fff0, 0x2_0000_0000), 0x1_ffff_fff0);
     }
 
     #[test]

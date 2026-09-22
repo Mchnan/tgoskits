@@ -9,7 +9,8 @@ use ax_memory_addr::PAGE_SIZE_4K;
 use ax_std::os::arceos::task::{
     executor::wake_waker_sync,
     sync::{
-        WaitQueueRegistration, WaitQueueWakeOutcome, WaitQueueWakeToken, wait_until_registered,
+        WaitQueue, WaitQueueRegistration, WaitQueueWakeOutcome, WaitQueueWakeToken,
+        wait_until_registered,
     },
 };
 use axpoll::{IoEvents, PollRegistration, PollSource, Pollable, RegistrationMode};
@@ -23,7 +24,7 @@ use ringbuf::{
 };
 use starry_signal::{SignalInfo, Signo};
 
-use super::{FileLike, Kstat};
+use super::{FileLike, InodeKey, Kstat};
 use crate::{
     StarryError, StarryResult,
     file::{IoDst, IoSrc},
@@ -31,6 +32,8 @@ use crate::{
     sync::Mutex,
     task::{current_user_task, send_signal_to_process},
 };
+
+mod named;
 
 const RING_BUFFER_INIT_SIZE: usize = 65536; // 64 KiB
 
@@ -541,6 +544,7 @@ struct Shared {
     wait_rx: PipeWaitSet,
     wait_tx: PipeWaitSet,
     poll_usage: AtomicBool,
+    open_wait: WaitQueue,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -551,6 +555,8 @@ struct PipeState {
     buffers: VecDeque<PipeBuffer>,
     readers: usize,
     writers: usize,
+    reader_generation: u64,
+    writer_generation: u64,
 }
 
 struct PipeBuffer {
@@ -606,6 +612,7 @@ impl Shared {
             wait_rx: PipeWaitSet::new(),
             wait_tx: PipeWaitSet::new(),
             poll_usage: AtomicBool::new(false),
+            open_wait: WaitQueue::new(),
         }
     }
 
@@ -673,6 +680,28 @@ impl PipeReadiness {
 }
 
 impl PipeState {
+    fn empty() -> Self {
+        Self {
+            buffer: HeapRb::new(RING_BUFFER_INIT_SIZE),
+            buffers: VecDeque::new(),
+            readers: 0,
+            writers: 0,
+            reader_generation: 0,
+            writer_generation: 0,
+        }
+    }
+
+    fn add_endpoint(&mut self, access: PipeAccess) {
+        if access.reads() {
+            self.readers += 1;
+            self.reader_generation = self.reader_generation.wrapping_add(1);
+        }
+        if access.writes() {
+            self.writers += 1;
+            self.writer_generation = self.writer_generation.wrapping_add(1);
+        }
+    }
+
     #[cfg(all(test, axtest))]
     fn new(capacity: usize) -> Self {
         Self {
@@ -680,6 +709,8 @@ impl PipeState {
             buffers: VecDeque::new(),
             readers: 1,
             writers: 1,
+            reader_generation: 1,
+            writer_generation: 1,
         }
     }
 
@@ -711,6 +742,8 @@ impl PipeState {
     }
 
     fn copy_from(&mut self, src: &mut IoSrc, limit: usize) -> StarryResult<usize> {
+        // Publish this chunk only after both reads succeed. A source fault may
+        // consume input bytes, but must not expose a partial chunk to readers.
         let (left, right) = self.buffer.vacant_slices_mut();
         let left_limit = left.len().min(limit);
         // `left` covers vacant ring storage and the following `read` initializes
@@ -770,34 +803,51 @@ impl PipeState {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PipeAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl PipeAccess {
+    const fn reads(self) -> bool {
+        !matches!(self, Self::Write)
+    }
+
+    const fn writes(self) -> bool {
+        !matches!(self, Self::Read)
+    }
+}
+
 pub struct Pipe {
-    read_side: bool,
+    access: PipeAccess,
     shared: Arc<Shared>,
     non_blocking: AtomicBool,
+    named: Option<named::NamedFile>,
 }
 
 impl Drop for Pipe {
     fn drop(&mut self) {
-        if self.read_side {
-            let wake_writers = self.shared.update_state(|state| {
+        let (wake_writers, wake_readers) = self.shared.update_state(|state| {
+            if self.is_read() {
                 debug_assert!(state.readers > 0);
-                state.readers = state.readers.saturating_sub(1);
-                state.readers == 0
-            });
-            if wake_writers {
-                // Reader count is published before waking blocked writers.
-                wake_pipe_waiters_all(&self.shared.wait_tx, IoEvents::ERR | IoEvents::OUT);
+                state.readers -= 1;
             }
-            return;
-        }
-
-        let wake_readers = self.shared.update_state(|state| {
-            debug_assert!(state.writers > 0);
-            state.writers = state.writers.saturating_sub(1);
-            state.writers == 0
+            if self.is_write() {
+                debug_assert!(state.writers > 0);
+                state.writers -= 1;
+            }
+            (
+                self.is_read() && state.readers == 0,
+                self.is_write() && state.writers == 0,
+            )
         });
+        // Both endpoint counts are published together before any notification.
+        if wake_writers {
+            wake_pipe_waiters_all(&self.shared.wait_tx, IoEvents::ERR | IoEvents::OUT);
+        }
         if wake_readers {
-            // Writer count is published before waking blocked readers.
             wake_pipe_waiters_all(&self.shared.wait_rx, IoEvents::HUP | IoEvents::IN);
         }
     }
@@ -805,21 +855,20 @@ impl Drop for Pipe {
 
 impl Pipe {
     pub fn new() -> (Pipe, Pipe) {
-        let shared = Arc::new(Shared::new(PipeState {
-            buffer: HeapRb::new(RING_BUFFER_INIT_SIZE),
-            buffers: VecDeque::new(),
-            readers: 1,
-            writers: 1,
-        }));
+        let mut state = PipeState::empty();
+        state.add_endpoint(PipeAccess::ReadWrite);
+        let shared = Arc::new(Shared::new(state));
         let read_end = Pipe {
-            read_side: true,
+            access: PipeAccess::Read,
             shared: shared.clone(),
             non_blocking: AtomicBool::new(false),
+            named: None,
         };
         let write_end = Pipe {
-            read_side: false,
+            access: PipeAccess::Write,
             shared,
             non_blocking: AtomicBool::new(false),
+            named: None,
         };
         (read_end, write_end)
     }
@@ -831,27 +880,23 @@ impl Pipe {
     /// endpoint count must therefore be incremented so closing either file
     /// description cannot prematurely report EOF or a broken pipe.
     pub(crate) fn reopen(&self, non_blocking: bool) -> Pipe {
-        self.shared.update_state(|state| {
-            if self.read_side {
-                state.readers += 1;
-            } else {
-                state.writers += 1;
-            }
-        });
-
+        debug_assert!(self.named.is_none());
+        self.shared
+            .update_state(|state| state.add_endpoint(self.access));
         Pipe {
-            read_side: self.read_side,
+            access: self.access,
             shared: self.shared.clone(),
             non_blocking: AtomicBool::new(non_blocking),
+            named: None,
         }
     }
 
     pub const fn is_read(&self) -> bool {
-        self.read_side
+        self.access.reads()
     }
 
     pub const fn is_write(&self) -> bool {
-        !self.read_side
+        self.access.writes()
     }
 
     pub fn capacity(&self) -> usize {
@@ -936,7 +981,7 @@ impl Pipe {
         enum WriteStep {
             Closed,
             WouldBlock,
-            Wrote(usize),
+            Wrote,
         }
 
         let mut total_written = 0;
@@ -949,6 +994,9 @@ impl Pipe {
         let mut wait_recorded = false;
         let mut task = None;
         loop {
+            // Keep committed progress outside the fallible step: a later
+            // source fault must not discard bytes already published to readers.
+            let mut written = 0;
             let step = self
                 .shared
                 .update_state(|state| -> StarryResult<WriteStep> {
@@ -964,7 +1012,6 @@ impl Pipe {
                         sample_initial_was_empty = false;
                     }
 
-                    let mut written = 0;
                     if merge_pending {
                         merge_pending = false;
                         if merge_bytes > 0 && state.can_merge(merge_bytes) {
@@ -981,15 +1028,24 @@ impl Pipe {
                     if written == 0 {
                         Ok(WriteStep::WouldBlock)
                     } else {
-                        Ok(WriteStep::Wrote(written))
+                        Ok(WriteStep::Wrote)
                     }
                 });
 
+            total_written += written;
+            #[cfg(feature = "qperf-metrics")]
+            if written > 0 {
+                PIPE_WRITE_BYTES.fetch_add(written as u64, Ordering::Relaxed);
+            }
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
                     self.finish_write_wakes(was_empty, wake_next_writer);
-                    return Err(error);
+                    return if total_written > 0 {
+                        Ok(total_written)
+                    } else {
+                        Err(error)
+                    };
                 }
             };
             match step {
@@ -1002,10 +1058,7 @@ impl Pipe {
                     return Err(StarryError::BrokenPipe);
                 }
                 WriteStep::WouldBlock => {}
-                WriteStep::Wrote(written) => {
-                    #[cfg(feature = "qperf-metrics")]
-                    PIPE_WRITE_BYTES.fetch_add(written as u64, Ordering::Relaxed);
-                    total_written += written;
+                WriteStep::Wrote => {
                     if total_written == size || self.nonblocking() {
                         self.finish_write_wakes(was_empty, wake_next_writer);
                         return Ok(total_written);
@@ -1048,9 +1101,10 @@ impl Pipe {
         assert!(self.is_read());
         self.shared.update_state(|state| state.readers += 1);
         Pipe {
-            read_side: true,
+            access: PipeAccess::Read,
             shared: self.shared.clone(),
             non_blocking: AtomicBool::new(self.nonblocking()),
+            named: None,
         }
     }
 
@@ -1059,9 +1113,10 @@ impl Pipe {
         assert!(self.is_write());
         self.shared.update_state(|state| state.writers += 1);
         Pipe {
-            read_side: false,
+            access: PipeAccess::Write,
             shared: self.shared.clone(),
             non_blocking: AtomicBool::new(self.nonblocking()),
+            named: None,
         }
     }
 
@@ -1212,6 +1267,14 @@ fn raise_pipe() {
 }
 
 impl FileLike for Pipe {
+    fn validate_write_access(&self) -> StarryResult {
+        if self.is_write() {
+            Ok(())
+        } else {
+            Err(StarryError::BadFileDescriptor)
+        }
+    }
+
     fn read(&self, dst: &mut IoDst) -> StarryResult<usize> {
         if !self.is_read() {
             return Err(StarryError::BadFileDescriptor);
@@ -1289,22 +1352,54 @@ impl FileLike for Pipe {
     }
 
     fn write(&self, src: &mut IoSrc) -> StarryResult<usize> {
-        self.write_with_broken_pipe_handler(src, raise_pipe)
+        let result = self.write_with_broken_pipe_handler(src, raise_pipe);
+        if let Ok(bytes) = result
+            && bytes > 0
+            && let Some(file) = self.named_file()
+        {
+            super::inotify::notify_modify_path(file.path().as_ref());
+        }
+        result
     }
 
     fn stat(&self) -> StarryResult<Kstat> {
+        if let Some(file) = self.named_file() {
+            return file.stat();
+        }
         Ok(Kstat {
             mode: S_IFIFO | if self.is_read() { 0o444 } else { 0o222 },
             ..Default::default()
         })
     }
 
+    fn inode_key(&self) -> Option<InodeKey> {
+        self.named_file().and_then(|file| file.inode_key())
+    }
+
     fn path(&self) -> Cow<'_, str> {
+        if let Some(file) = self.named_file() {
+            return file.path();
+        }
         format!("pipe:[{}]", self as *const _ as usize).into()
     }
 
     fn open_flags(&self) -> u32 {
+        if let Some(file) = self.named_file() {
+            return file.open_flags()
+                & !(linux_raw_sys::general::O_NONBLOCK | linux_raw_sys::general::O_APPEND);
+        }
         if self.is_read() { O_RDONLY } else { O_WRONLY }
+    }
+
+    fn append(&self) -> bool {
+        self.named_file().is_some_and(|file| file.append())
+    }
+
+    fn set_append(&self, append: bool) -> StarryResult {
+        if let Some(file) = self.named_file() {
+            file.set_append(append)?;
+        }
+        Ok(())
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> StarryResult {
@@ -1339,7 +1434,29 @@ impl Pollable for Pipe {
     fn poll(&self) -> IoEvents {
         // Linux reports POLLOUT when the pipe has a free PIPE_BUF-sized slot,
         // independently of whether the reader has already closed.
-        self.shared.readiness().poll_events(self.read_side)
+        let (readiness, suppress_hup) = if let Some(generation) = self
+            .named
+            .as_ref()
+            .and_then(|named| named.initial_writer_generation)
+        {
+            // Peer presence and its generation must describe the same instant:
+            // mixing snapshots could report HUP as the first writer arrives.
+            let state = self.shared.state.lock();
+            (state.readiness(), state.writer_generation == generation)
+        } else {
+            (self.shared.readiness(), false)
+        };
+        let mut events = IoEvents::empty();
+        if self.is_read() {
+            events |= readiness.poll_events(true);
+        }
+        if self.is_write() {
+            events |= readiness.poll_events(false);
+        }
+        if suppress_hup {
+            events.remove(IoEvents::HUP);
+        }
+        events
     }
 
     unsafe fn register_shared(
@@ -1367,33 +1484,26 @@ impl Pipe {
     fn register_poll_source(
         &self,
         events: IoEvents,
-        register: impl FnOnce(&dyn PollSource, IoEvents),
+        mut register: impl FnMut(&dyn PollSource, IoEvents),
     ) {
-        // Linux publishes poll_usage for every pipe_poll() attempt, including
-        // exclusive consumers, so non-empty writes keep notifying pollers.
         self.shared.poll_usage.store(true, Ordering::Release);
-        let read_ready = events.intersects(IoEvents::IN | IoEvents::RDNORM);
-        let write_ready = events.intersects(IoEvents::OUT | IoEvents::WRNORM);
-        let mut interests = if self.read_side {
-            events & IoEvents::HUP
-        } else {
-            events & IoEvents::ERR
-        };
-        if self.read_side && read_ready {
-            interests.insert(IoEvents::IN);
-            interests.insert(IoEvents::HUP);
+        if self.is_read() {
+            let mut interests = events & IoEvents::HUP;
+            if events.intersects(IoEvents::IN | IoEvents::RDNORM) {
+                interests |= IoEvents::IN | IoEvents::HUP;
+            }
+            if !interests.is_empty() {
+                register(&self.shared.wait_rx, interests);
+            }
         }
-        if !self.read_side && write_ready {
-            interests.insert(IoEvents::OUT);
-            interests.insert(IoEvents::ERR);
-        }
-        if interests.is_empty() {
-            return;
-        }
-        if self.read_side {
-            register(&self.shared.wait_rx, interests);
-        } else {
-            register(&self.shared.wait_tx, interests);
+        if self.is_write() {
+            let mut interests = events & IoEvents::ERR;
+            if events.intersects(IoEvents::OUT | IoEvents::WRNORM) {
+                interests |= IoEvents::OUT | IoEvents::ERR;
+            }
+            if !interests.is_empty() {
+                register(&self.shared.wait_tx, interests);
+            }
         }
     }
 }
@@ -1525,20 +1635,16 @@ mod tests {
         // SAFETY: the extension owns no data and only publishes bounded atomic
         // observations from scheduler switch callbacks.
         let extension = unsafe { ThreadExtension::new(0, &BLOCK_OBSERVER_OPS) };
-        // SAFETY: unique ownership of `extension` is transferred exactly once.
-        let direct = unsafe {
-            ax_std::os::arceos::thread::spawn_raw_with_extension(
-                move || {
+        let direct =
+            ax_std::os::arceos::thread::builder("pipe-direct-exclusive-waiter".to_string())
+                .stack_size(256 * 1024)
+                .extension(extension)
+                .spawn(move || {
                     DIRECT_WAIT_ARMED.store(true, Ordering::Release);
                     waiters.wait_until(|| DIRECT_READY.load(Ordering::Acquire));
                     DIRECT_WOKEN.store(true, Ordering::Release);
-                },
-                "pipe-direct-exclusive-waiter".to_string(),
-                256 * 1024,
-                Some(extension),
-            )
-        }
-        .expect("failed to spawn direct pipe waiter");
+                })
+                .expect("failed to spawn direct pipe waiter");
         wait_for(&DIRECT_BLOCKED, "direct pipe waiter did not block");
         direct
     }
@@ -1632,8 +1738,7 @@ mod tests {
         DIRECT_READY.store(true, Ordering::Release);
         wake_pipe_waiter_sync(waiters.as_ref(), IoEvents::IN);
         wait_for(&DIRECT_WOKEN, "direct pipe waiter was not selected");
-        ax_std::os::arceos::thread::join_thread(direct)
-            .expect("direct pipe waiter must exit cleanly");
+        direct.join().expect("direct pipe waiter must exit cleanly");
         drop(registration);
 
         assert_eq!(
@@ -1724,8 +1829,7 @@ mod tests {
 
         wake_pipe_waiter_sync(waiters.as_ref(), IoEvents::IN);
         wait_for(&DIRECT_WOKEN, "second wake did not select direct waiter");
-        ax_std::os::arceos::thread::join_thread(direct)
-            .expect("direct pipe waiter must exit cleanly");
+        direct.join().expect("direct pipe waiter must exit cleanly");
         drop(registration);
     }
 
@@ -1795,17 +1899,16 @@ mod tests {
         let contender_state = Arc::clone(&waiters.state);
         let contender_attempted = Arc::clone(&attempted);
         let contender_acquired = Arc::clone(&acquired);
-        let contender = ax_std::os::arceos::thread::spawn_raw_with_affinity(
-            move || {
-                contender_attempted.store(true, Ordering::Release);
-                let _state = contender_state.lock();
-                contender_acquired.store(true, Ordering::Release);
-            },
-            "pipe-wait-set-lock-contender".to_string(),
-            256 * 1024,
-            affinity,
-        )
-        .expect("failed to spawn pipe wait-set lock contender");
+        let contender =
+            ax_std::os::arceos::thread::builder("pipe-wait-set-lock-contender".to_string())
+                .stack_size(256 * 1024)
+                .affinity(affinity)
+                .spawn(move || {
+                    contender_attempted.store(true, Ordering::Release);
+                    let _state = contender_state.lock();
+                    contender_acquired.store(true, Ordering::Release);
+                })
+                .expect("failed to spawn pipe wait-set lock contender");
 
         for _ in 0..32 {
             scheduler::thread::current::yield_current_cpu()
@@ -1824,7 +1927,8 @@ mod tests {
         );
         drop(state);
 
-        ax_std::os::arceos::thread::join_thread(contender)
+        contender
+            .join()
             .expect("pipe wait-set lock contender must exit");
         scheduler::thread::current::set_current_thread_affinity(original_affinity)
             .expect("test task affinity must be restored");
@@ -1856,17 +1960,16 @@ mod tests {
         let waiter_started_flag = Arc::clone(&waiter_started);
         let waiter_ready = Arc::clone(&ready);
         let waiter_completed_flag = Arc::clone(&waiter_completed);
-        let waiter = ax_std::os::arceos::thread::spawn_raw_with_affinity(
-            move || {
-                waiter_started_flag.store(true, Ordering::Release);
-                waiter_set.wait_until(|| waiter_ready.load(Ordering::Acquire));
-                waiter_completed_flag.store(true, Ordering::Release);
-            },
-            "pipe-wait-registration-order".to_string(),
-            256 * 1024,
-            affinity,
-        )
-        .expect("failed to spawn pipe wait registration task");
+        let waiter =
+            ax_std::os::arceos::thread::builder("pipe-wait-registration-order".to_string())
+                .stack_size(256 * 1024)
+                .affinity(affinity)
+                .spawn(move || {
+                    waiter_started_flag.store(true, Ordering::Release);
+                    waiter_set.wait_until(|| waiter_ready.load(Ordering::Acquire));
+                    waiter_completed_flag.store(true, Ordering::Release);
+                })
+                .expect("failed to spawn pipe wait registration task");
 
         for _ in 0..32 {
             scheduler::thread::current::yield_current_cpu()
@@ -1883,7 +1986,8 @@ mod tests {
         ready.store(true, Ordering::Release);
         waiters.wake_all(IoEvents::IN);
 
-        ax_std::os::arceos::thread::join_thread(waiter)
+        waiter
+            .join()
             .expect("pipe wait registration task must exit");
         scheduler::thread::current::set_current_thread_affinity(original_affinity)
             .expect("test task affinity must be restored");

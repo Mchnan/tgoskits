@@ -1,16 +1,9 @@
 //! Architecture-neutral contracts shared by target implementations.
 
 pub(crate) mod capabilities;
-#[cfg_attr(
-    not(any(target_arch = "aarch64", target_arch = "riscv64")),
-    expect(
-        dead_code,
-        reason = "CPU-up is an intentionally absent capability on this target"
-    )
-)]
-pub(crate) mod cpu_up;
 pub(crate) mod exit;
 pub(crate) mod ops;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) mod sysreg;
 mod types;
 
@@ -23,7 +16,7 @@ pub(crate) use exit::{handle_hypercall, handle_mmio_read, handle_mmio_write};
 pub(crate) use exit::{try_handle_mmio_read, try_handle_mmio_write};
 pub(crate) use ops::ArchOps;
 pub(crate) use types::{
-    BoundVcpuExit, HypercallExit, MmioReadExit, MmioWriteExit, VcpuRunAction, VcpuRunOutcome,
+    HypercallExit, MmioReadExit, MmioWriteExit, VcpuExitAction, VcpuRunAction, VcpuRunOutcome,
 };
 
 /// Complete compile-time contract implemented by every selected guest architecture.

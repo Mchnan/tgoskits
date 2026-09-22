@@ -11,7 +11,8 @@ use rdrive::{
     register::ProbeFdt,
 };
 pub use rockchip_npu::{
-    GemBufferInfo, GemCachePolicy, RknpuAction,
+    GemBufferInfo, GemCachePolicy, GemOwner, RKNPU_CORE0_MASK, RKNPU_CORE1_MASK, RKNPU_CORE2_MASK,
+    RknpuAction, RknpuTask,
     ioctrl::{RknpuMemCreate, RknpuMemDestroy, RknpuMemMap, RknpuMemSync, RknpuSubmit},
 };
 use rockchip_npu::{Rknpu, RknpuConfig, RknpuType};
@@ -34,6 +35,10 @@ pub enum Error {
     Quarantined,
     #[error("Rockchip NPU request contains invalid data")]
     InvalidData,
+    #[error("Rockchip NPU allocation or quota exhausted")]
+    NoMemory,
+    #[error("Rockchip NPU user task submission is not supported by this DMA setup")]
+    NotSupported,
 }
 
 crate::model_register!(
@@ -154,8 +159,11 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     if resets.is_empty() {
         return Err(OnProbeError::other("RKNPU node has no reset line"));
     }
+    let core = Rknpu::new(&base_regs, config, dma).map_err(|error| {
+        OnProbeError::other(format!("failed to initialize RK3588 NPU: {error}"))
+    })?;
     let npu = RknpuDevice {
-        core: Rknpu::new(&base_regs, config, dma),
+        core,
         resets,
         state: DeviceState::Operational,
     };
@@ -199,14 +207,17 @@ pub fn buffer_retainer(handle: u32) -> Result<Arc<dyn Any + Send + Sync>, Error>
     with_npu(|npu| npu.buffer_retainer(handle).ok_or(Error::NotFound))
 }
 
-pub fn submit(args: &mut RknpuSubmit) -> Result<(), Error> {
+pub fn submit(args: &mut RknpuSubmit, tasks: &mut [RknpuTask]) -> Result<(), Error> {
     let mut npu = rdrive::get_one::<RknpuDevice>()
         .ok_or(Error::NotFound)?
         .try_lock()
         .map_err(|_| Error::Busy)?;
     npu.ensure_available()?;
+    if !npu.core.user_submit_supported() {
+        return Err(Error::NotSupported);
+    }
     let mut clock = axklib::time::monotonic_nanos;
-    match npu.core.submit_ioctrl(args, &mut clock) {
+    match npu.core.submit_ioctrl(args, tasks, &mut clock) {
         Ok(()) => Ok(()),
         Err(rockchip_npu::RknpuError::Timeout) => {
             npu.recover_timeout()?;
@@ -216,8 +227,59 @@ pub fn submit(args: &mut RknpuSubmit) -> Result<(), Error> {
     }
 }
 
-pub fn mem_create(args: &mut RknpuMemCreate) -> Result<(), Error> {
-    with_npu(|npu| npu.create(args).map_err(|_| Error::InvalidData))
+/// Submit a task snapshot for a producer authorized to issue raw DMA commands.
+///
+/// # Safety
+/// The caller must check raw-I/O authority for the current submitting process
+/// and keep its command/data buffers pinned until this synchronous operation
+/// returns. The producer is trusted to access physical memory on Direct DMA.
+pub unsafe fn submit_rawio(args: &mut RknpuSubmit, tasks: &mut [RknpuTask]) -> Result<(), Error> {
+    let mut npu = rdrive::get_one::<RknpuDevice>()
+        .ok_or(Error::NotFound)?
+        .try_lock()
+        .map_err(|_| Error::Busy)?;
+    npu.ensure_available()?;
+    let mut clock = axklib::time::monotonic_nanos;
+    // SAFETY: authorization and buffer lifetime are the caller's documented
+    // contract; this lock serializes the entire submission and recovery.
+    match unsafe { npu.core.submit_rawio(args, tasks, &mut clock) } {
+        Ok(()) => Ok(()),
+        Err(rockchip_npu::RknpuError::Timeout) => {
+            npu.recover_timeout()?;
+            Err(Error::TimedOut)
+        }
+        Err(_) => Err(Error::InvalidData),
+    }
+}
+
+/// Reports whether the current RKNPU instance can safely accept user tasks.
+///
+/// The capability is separate from GEM allocation and mapping: those paths
+/// remain available for the direct DMA domain used by RK3588, while user task
+/// submission stays disabled until a translated IOMMU domain and a matching
+/// CPU physical-address mapping are wired together.
+pub fn submit_available() -> Result<bool, Error> {
+    with_npu(|npu| Ok(npu.user_submit_supported()))
+}
+
+/// Resolve the core mask using the same device state as a later submission.
+///
+/// Card-specific validation uses this result to select only task descriptors
+/// that the portable RKNPU submit path will consume.
+pub fn normalize_core_mask(requested_mask: u32) -> Result<u32, Error> {
+    with_npu(|npu| {
+        npu.normalize_core_mask(requested_mask)
+            .map_err(|_| Error::InvalidData)
+    })
+}
+
+pub fn mem_create(owner: &GemOwner, args: &mut RknpuMemCreate) -> Result<(), Error> {
+    with_npu(|npu| {
+        npu.create(owner, args).map_err(|error| match error {
+            rockchip_npu::RknpuError::OutOfMemory => Error::NoMemory,
+            _ => Error::InvalidData,
+        })
+    })
 }
 
 /// Import an externally-owned, physically-contiguous buffer (resolved from a

@@ -44,7 +44,7 @@ impl Axvisor {
         )?;
         let request = Self::board_test_request(request);
 
-        let cargo = build::load_cargo_config(&request)?;
+        let cargo = build::load_cargo_config(&request, self.app.workspace_context())?;
         let base_uboot = match request.uboot_config.as_deref() {
             Some(_) => self.load_uboot_config(&request, &cargo).await?,
             None => Some(self.app.ensure_uboot_config_for_cargo(&cargo).await?),
@@ -137,6 +137,7 @@ impl Axvisor {
             }
 
             let result = async {
+                super::guest_build::prepare(&mut self.app, &board_test_config).await?;
                 let request = self.prepare_request(
                     axvisor_board_test_build_args(&group),
                     None,
@@ -144,7 +145,7 @@ impl Axvisor {
                     SnapshotPersistence::Discard,
                 )?;
                 let request = Self::board_test_request(request);
-                let cargo = build::load_cargo_config(&request)?;
+                let cargo = build::load_cargo_config(&request, self.app.workspace_context())?;
                 let board_config = self
                     .load_board_config(&cargo, Some(board_test_config.as_path()))
                     .await?;

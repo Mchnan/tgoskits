@@ -23,7 +23,6 @@ pub(crate) enum SchedulerClass {
 
 pub(super) struct ClassEnqueue {
     pub(super) membership: QueueMembershipClass,
-    pub(super) entity: SchedulingEntity,
     pub(super) reason: EnqueueReason,
 }
 
@@ -113,7 +112,6 @@ impl SchedulerClass {
                 fair.renew_request();
             }
         }
-        let entity = thread.active.entity().clone();
         let membership = match self {
             Self::Stop => {
                 thread.migration_capable = false;
@@ -131,17 +129,20 @@ impl SchedulerClass {
                 }
                 QueueMembershipClass::Deadline(run_queue.deadline.insert(thread))
             }
-            Self::Realtime => QueueMembershipClass::Realtime(run_queue.rt.enqueue(thread, reason)),
+            Self::Realtime => {
+                // RT insertion is infallible after the common duplicate check.
+                // Policy changes, migration and requeue do not reset runtime.
+                if reason == EnqueueReason::Wake {
+                    thread.core.reset_realtime_ticks();
+                }
+                QueueMembershipClass::Realtime(run_queue.rt.enqueue(thread, reason))
+            }
             Self::Fair => {
                 run_queue.fair.insert(thread);
                 QueueMembershipClass::Fair
             }
         };
-        Ok(ClassEnqueue {
-            membership,
-            entity,
-            reason,
-        })
+        Ok(ClassEnqueue { membership, reason })
     }
 
     /// Linux `dequeue_task()` class hook. The caller owns `nr_running`,

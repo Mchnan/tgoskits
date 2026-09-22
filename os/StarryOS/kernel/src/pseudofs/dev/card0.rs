@@ -24,9 +24,8 @@
 //!   - `WAIT_VBLANK` and the `CRTC_GET_SEQUENCE` / `CRTC_QUEUE_SEQUENCE`
 //!     pair run on a synthesized 60 Hz vblank clock
 //!     ([`super::vblank`]): the sequence is derived from elapsed
-//!     monotonic time while the CRTC is active, queued events are
-//!     delivered on the next `poll`, and event timestamps carry the
-//!     synthesized edge time.
+//!     monotonic time while the CRTC is active, with per-open pending
+//!     events delivered when their synthesized edge is reached.
 //!   - Mode list: one mode matching axdisplay's resolution at a
 //!     synthesized 60 Hz.
 
@@ -34,8 +33,8 @@ use alloc::{
     borrow::Cow,
     collections::{BTreeMap, VecDeque},
     format,
-    string::String,
-    sync::Arc,
+    string::{String, ToString},
+    sync::{Arc, Weak},
     vec,
     vec::Vec,
 };
@@ -51,6 +50,7 @@ use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
 use axpoll::{IoEvents, Pollable};
 use axpoll_set::PollSet;
 use bytemuck::bytes_of;
+use event_listener::{Event, listener};
 use linux_raw_sys::general::O_CLOEXEC;
 
 use super::drm::{
@@ -71,9 +71,10 @@ use super::drm::{
     DRM_IOCTL_WAIT_VBLANK, DRM_MODE_ATOMIC_ALLOW_MODESET, DRM_MODE_ATOMIC_NONBLOCK,
     DRM_MODE_ATOMIC_TEST_ONLY, DRM_MODE_CONNECTED, DRM_MODE_CONNECTOR_VIRTUAL,
     DRM_MODE_ENCODER_VIRTUAL, DRM_MODE_FB_MODIFIERS, DRM_MODE_OBJECT_CONNECTOR,
-    DRM_MODE_OBJECT_CRTC, DRM_MODE_OBJECT_PLANE, DRM_MODE_PAGE_FLIP_EVENT,
+    DRM_MODE_OBJECT_CRTC, DRM_MODE_OBJECT_FB, DRM_MODE_OBJECT_PLANE, DRM_MODE_PAGE_FLIP_EVENT,
     DRM_MODE_PROP_ATOMIC, DRM_MODE_PROP_BLOB, DRM_MODE_PROP_ENUM, DRM_MODE_PROP_IMMUTABLE,
-    DRM_MODE_PROP_OBJECT, DRM_MODE_PROP_RANGE, DRM_PLANE_TYPE_PRIMARY, DRM_PRIME_CAP_EXPORT,
+    DRM_MODE_PROP_OBJECT, DRM_MODE_PROP_RANGE, DRM_MODE_PROP_SIGNED_RANGE,
+    DRM_PLANE_TYPE_PRIMARY, DRM_PRIME_CAP_EXPORT,
     DRM_PRIME_CAP_IMPORT, DRM_PROP_NAME_LEN, DRM_VBLANK_EVENT, DRM_VBLANK_FLAGS_MASK,
     DRM_VBLANK_HIGH_CRTC_MASK, DRM_VBLANK_NEXTONMISS, DRM_VBLANK_RELATIVE, DRM_VBLANK_SECONDARY,
     DRM_VBLANK_SIGNAL, DRM_VBLANK_TYPES_MASK, DrmAuth, DrmEvent, DrmEventCrtcSequence,
@@ -86,14 +87,15 @@ use super::drm::{
     DrmSetVersion, DrmUnique, DrmVersion, DrmWaitVblank,
 };
 use super::vblank::{
-    PendingVblankEvent, QueuedVblankEvent, VblankScheduler, vblank_passed, widen_32_to_64,
+    PendingVblankEvent, QueuedVblankEvent, VblankClock, vblank_passed, widen_32_to_64,
 };
 use crate::{
     StarryError, StarryResult,
-    file::{FileLike, add_file_like},
+    file::{File, FileLike, IoDst, IoSrc, Kstat, add_file_like, dma_buf_seek},
     mm::{VmMutPtr, VmPtr, vm_load, vm_write_slice},
     pseudofs::{DeviceMmap, DeviceOps},
     sync::Mutex,
+    task::future::{block_on, block_on_user, poll_io, timeout_at},
 };
 
 pub const DRIVER_NAME: &str = "starry-simpledrm";
@@ -141,6 +143,9 @@ const PROP_PLANE_CRTC_H: u32 = 0x10A;
 /// `IN_FORMATS` — immutable blob property advertising the (format,
 /// modifier) tuples this plane accepts.
 const PROP_PLANE_IN_FORMATS: u32 = 0x10B;
+/// Standard explicit-fence property. Only the no-fence sentinel is currently
+/// supported: Starry has no sync-file producer or fence-wait implementation.
+const PROP_PLANE_IN_FENCE_FD: u32 = 0x10C;
 
 const PROP_CRTC_ACTIVE: u32 = 0x200;
 const PROP_CRTC_MODE_ID: u32 = 0x201;
@@ -160,6 +165,7 @@ const PLANE_PROPS: &[u32] = &[
     PROP_PLANE_CRTC_W,
     PROP_PLANE_CRTC_H,
     PROP_PLANE_IN_FORMATS,
+    PROP_PLANE_IN_FENCE_FD,
 ];
 const CRTC_PROPS: &[u32] = &[PROP_CRTC_ACTIVE, PROP_CRTC_MODE_ID];
 const CONN_PROPS: &[u32] = &[PROP_CONN_CRTC_ID];
@@ -177,7 +183,7 @@ const MAX_EVENTS: usize = 128;
 /// from one queue without Rust enum layout leaking into the ABI.
 const EVENT_SLOT_BYTES: usize = core::mem::size_of::<DrmEventVblank>();
 
-/// Fixed-size serialized event slot for the card's event queue.
+/// Fixed-size serialized event slot for an open file's event queue.
 type EventSlot = [u8; EVENT_SLOT_BYTES];
 
 const _: () = {
@@ -272,8 +278,16 @@ struct DmaBufGem {
 }
 
 impl FileLike for DmaBufGem {
+    fn validate_write_access(&self) -> StarryResult {
+        Err(StarryError::InvalidInput)
+    }
+
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:dmabuf".into()
+    }
+
+    fn seek(&self, pos: ax_io::SeekFrom) -> StarryResult<u64> {
+        dma_buf_seek(self.size, pos)
     }
 
     fn device_mmap(&self, offset: u64, length: u64) -> StarryResult<DeviceMmap> {
@@ -310,30 +324,20 @@ impl Pollable for DmaBufGem {
     }
 }
 
-/// Last legacy `SETCRTC` binding so `GETCRTC` can report what the
-/// CRTC is currently scanning out. Linux DRM keeps this state on the
-/// CRTC object itself; we keep it next to the atomic state but on a
-/// separate lock because legacy SETCRTC needs to validate against
-/// `fbs` and we don't want to nest locks when the validation may need
-/// to take `fbs` while another path holds `state`.
-#[derive(Debug, Default, Clone)]
-struct LegacyCrtcState {
-    fb_id: u32,
-    connectors: Vec<u32>,
-    mode: DrmModeModeInfo,
-    mode_valid: u32,
-    x: u32,
-    y: u32,
+/// A mode's identity and backing travel with the candidate/committed state.
+#[derive(Debug, Clone)]
+struct ModeBlob {
+    id: u32,
+    info: DrmModeModeInfo,
+    bytes: Arc<Vec<u8>>,
 }
 
-/// Current values of all atomic-tunable properties on our single-CRTC /
-/// single-connector / single-plane layout. Guarded by one mutex because
-/// atomic commits touch multiple fields at once and userspace expects
-/// the commit to be all-or-nothing.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+/// The single committed state shared by legacy and atomic KMS. Cloned
+/// candidates keep mode references alive and publish only after validation.
+#[derive(Debug, Default, Clone)]
 struct ModesetState {
     crtc_active: u64,
-    crtc_mode_id: u32,
+    mode: Option<ModeBlob>,
     conn_crtc_id: u32,
     plane_fb_id: u32,
     plane_crtc_id: u32,
@@ -348,23 +352,12 @@ struct ModesetState {
 }
 
 pub struct Card0 {
-    /// Queue of serialized DRM events waiting to be delivered via
-    /// `read()` (flip completion, `WAIT_VBLANK` events, and
-    /// `CRTC_QUEUE_SEQUENCE` events).
-    events: Mutex<VecDeque<EventSlot>>,
-    /// Wakes up `poll`-waiters blocked on `read()` when a new event
-    /// arrives.
-    poll_rx: PollSet,
-    /// Synthesized 60 Hz vblank clock and the queue of events waiting
-    /// for future vblank edges.
-    vblank: VblankScheduler,
-    /// Current values of all atomic-tunable properties.
+    /// Device-wide sequence clock; event ownership belongs to each open file.
+    vblank: VblankClock,
+    /// Serializes modeset validation, scanout and publication. Lock order is
+    /// state -> fbs/blobs -> display; display IRQ handling never takes state.
+    /// User copies and event wakeups happen outside this sleepable mutex.
     state: Mutex<ModesetState>,
-    /// Legacy `SETCRTC` binding readable via `GETCRTC`. Atomic commits
-    /// don't update this — userspace that mixes legacy and atomic gets
-    /// the well-defined "legacy state reflects the last SETCRTC"
-    /// behavior libdrm expects.
-    legacy_crtc: Mutex<LegacyCrtcState>,
     /// `CREATE_DUMB`-allocated buffers keyed by handle. Dropping an
     /// entry releases Card0's strong ref on the backing pages; user
     /// mappings hold their own refs via `LinearBackend::retain`.
@@ -380,19 +373,8 @@ pub struct Card0 {
     fbs: Mutex<BTreeMap<u32, Framebuffer>>,
     /// Next fb id to hand out.
     next_fb_id: AtomicU32,
-    /// User-created `CREATEPROPBLOB` blobs keyed by their blob_id.
-    /// Distinct from `system_blobs` so DESTROY_BLOB cannot remove
-    /// kernel-owned blobs (e.g. `IN_FORMATS`). Stored behind `Arc`
-    /// so committed modeset state (see [`Self::mode_id_blob_ref`]) can
-    /// hold its own backing reference past a user `DESTROYPROPBLOB`.
+    /// User-published blobs. A committed mode pins its own reference in state.
     blobs: Mutex<BTreeMap<u32, Arc<Vec<u8>>>>,
-    /// Strong reference to the blob backing the currently-committed
-    /// `MODE_ID` property. Linux DRM pins the mode blob from the CRTC
-    /// state, so a user `DESTROYPROPBLOB` on the publish handle only
-    /// drops the user's reference — `GETPROPBLOB` on the same id keeps
-    /// working until a later atomic commit replaces or clears
-    /// `MODE_ID`. Cleared/replaced atomically with `state.crtc_mode_id`.
-    mode_id_blob_ref: Mutex<Option<Arc<Vec<u8>>>>,
     /// Next blob id to hand out.
     next_blob_id: AtomicU32,
     /// Kernel-owned immutable blobs (e.g. plane `IN_FORMATS`) keyed by
@@ -410,14 +392,293 @@ pub struct Card0 {
     irq_handle: ax_lazyinit::OnceLock<ax_runtime::hal::irq::IrqHandle>,
 }
 
+#[derive(Default)]
+struct Card0Events {
+    ready: VecDeque<EventSlot>,
+    pending: Vec<PendingVblankEvent>,
+    reserved: usize,
+    shutdown: bool,
+}
+
+impl Card0Events {
+    fn has_space(&self) -> bool {
+        self.ready.len() + self.pending.len() + self.reserved < MAX_EVENTS
+    }
+
+    fn next_deadline(&self, clock: &VblankClock) -> Option<core::time::Duration> {
+        self.pending
+            .iter()
+            .map(|event| core::time::Duration::from_nanos(clock.edge_ns_of(event.target_sequence)))
+            .min()
+    }
+}
+
+/// The open-file description owns events; dup and fork retain the same Arc.
+struct Card0File {
+    base: File,
+    card_ops: Arc<dyn DeviceOps>,
+    events: Mutex<Card0Events>,
+    poll_rx: PollSet,
+    arm_event: Arc<Event>,
+}
+
+pub(crate) fn is_card0_device(inner: &dyn Any) -> bool {
+    inner.is::<Card0>()
+}
+
+pub(crate) fn open_card0_file(
+    card_ops: Arc<dyn DeviceOps>,
+    file: ax_fs_ng::File,
+    flags: u32,
+) -> StarryResult<Arc<dyn FileLike>> {
+    card_ops.open(flags & linux_raw_sys::general::O_EXCL != 0)?;
+    let opened = Arc::new(Card0File {
+        base: File::new(file, flags),
+        card_ops,
+        events: Mutex::new(Card0Events::default()),
+        poll_rx: PollSet::new(),
+        arm_event: Arc::new(Event::new()),
+    });
+    let weak = Arc::downgrade(&opened);
+    crate::task::kernel_thread_builder("card0-vblank".to_string())
+        .spawn(move || block_on(run_vblank_timer(weak)))
+        .map_err(|_| StarryError::NoMemory)?;
+    Ok(opened)
+}
+
+impl Card0File {
+    fn card(&self) -> &Card0 {
+        self.card_ops
+            .as_any()
+            .downcast_ref::<Card0>()
+            .expect("card0 file references its originating card")
+    }
+
+    fn reserve_event(&self) -> VfsResult<()> {
+        let mut state = self.events.lock();
+        if !state.has_space() {
+            return Err(VfsError::NoMemory);
+        }
+        state.reserved += 1;
+        Ok(())
+    }
+
+    fn enqueue_reserved_event<E: bytemuck::NoUninit>(&self, event: &E) {
+        let mut state = self.events.lock();
+        state.reserved -= 1;
+        state.ready.push_back(serialize_event(event));
+        drop(state);
+        // The event is visible before notifying registered readers.
+        unsafe { self.poll_rx.wake(IoEvents::IN) };
+    }
+
+    fn enqueue_event<E: bytemuck::NoUninit>(&self, event: &E) -> VfsResult<()> {
+        let mut state = self.events.lock();
+        if !state.has_space() {
+            return Err(VfsError::NoMemory);
+        }
+        state.ready.push_back(serialize_event(event));
+        drop(state);
+        unsafe { self.poll_rx.wake(IoEvents::IN) };
+        Ok(())
+    }
+
+    fn queue_pending(&self, event: PendingVblankEvent) -> VfsResult<()> {
+        let mut state = self.events.lock();
+        if !state.has_space() {
+            return Err(VfsError::NoMemory);
+        }
+        state.pending.push(event);
+        drop(state);
+        self.arm_event.notify(usize::MAX);
+        Ok(())
+    }
+
+    fn serve_pending_vblank_events(&self) {
+        let card = self.card();
+        let current = card.vblank.sequence_at(monotonic_time_nanos());
+        let mut state = self.events.lock();
+        let mut delivered = false;
+        let mut idx = 0;
+        while idx < state.pending.len() {
+            if vblank_passed(current, state.pending[idx].target_sequence) {
+                let event = state.pending.remove(idx);
+                state.ready.push_back(vblank_event_slot(&card.vblank, event));
+                delivered = true;
+            } else {
+                idx += 1;
+            }
+        }
+        drop(state);
+        if delivered {
+            unsafe { self.poll_rx.wake(IoEvents::IN) };
+        }
+    }
+
+    fn read_events(&self, dst: &mut IoDst) -> StarryResult<usize> {
+        self.serve_pending_vblank_events();
+        let mut state = self.events.lock();
+        let mut written = 0;
+        while dst.remaining_mut() >= EVENT_SLOT_BYTES {
+            let Some(event) = state.ready.front() else {
+                break;
+            };
+            dst.write_all(event)?;
+            state.ready.pop_front();
+            written += EVENT_SLOT_BYTES;
+        }
+        if written == 0 {
+            Err(VfsError::WouldBlock.into())
+        } else {
+            Ok(written)
+        }
+    }
+}
+
+fn serialize_event<E: bytemuck::NoUninit>(event: &E) -> EventSlot {
+    let bytes = bytes_of(event);
+    debug_assert_eq!(bytes.len(), EVENT_SLOT_BYTES);
+    let mut slot = [0; EVENT_SLOT_BYTES];
+    slot[..bytes.len()].copy_from_slice(bytes);
+    slot
+}
+
+fn vblank_event_slot(clock: &VblankClock, pending: PendingVblankEvent) -> EventSlot {
+    let target = pending.target_sequence;
+    let edge_ns = clock.edge_ns_of(target);
+    match pending.event {
+        QueuedVblankEvent::Vblank { user_data } => serialize_event(&DrmEventVblank {
+            base: DrmEvent {
+                event_type: DRM_EVENT_VBLANK,
+                length: EVENT_SLOT_BYTES as u32,
+            },
+            user_data,
+            tv_sec: (edge_ns / 1_000_000_000) as u32,
+            tv_usec: ((edge_ns % 1_000_000_000) / 1_000) as u32,
+            sequence: target as u32,
+            crtc_id: CRTC_ID,
+        }),
+        QueuedVblankEvent::CrtcSequence { user_data } => serialize_event(&DrmEventCrtcSequence {
+            base: DrmEvent {
+                event_type: DRM_EVENT_CRTC_SEQUENCE,
+                length: EVENT_SLOT_BYTES as u32,
+            },
+            user_data,
+            tv_ns: edge_ns as i64,
+            sequence: target,
+        }),
+    }
+}
+
+async fn run_vblank_timer(weak: Weak<Card0File>) {
+    loop {
+        let arm_event = {
+            let Some(file) = weak.upgrade() else { return };
+            file.arm_event.clone()
+        };
+        listener!(arm_event => listener);
+        let deadline = {
+            let Some(file) = weak.upgrade() else { return };
+            let state = file.events.lock();
+            if state.shutdown {
+                return;
+            }
+            state.next_deadline(&file.card().vblank)
+        };
+        match deadline {
+            None => listener.await,
+            Some(deadline) => {
+                if timeout_at(Some(deadline), listener).await.is_err() {
+                    let Some(file) = weak.upgrade() else { return };
+                    file.serve_pending_vblank_events();
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Card0File {
+    fn drop(&mut self) {
+        let mut state = self.events.lock();
+        state.shutdown = true;
+        state.pending.clear();
+        drop(state);
+        self.arm_event.notify(usize::MAX);
+    }
+}
+
+impl FileLike for Card0File {
+    fn validate_write_access(&self) -> StarryResult {
+        self.base.validate_write_access()
+    }
+
+    fn read(&self, dst: &mut IoDst) -> StarryResult<usize> {
+        if dst.remaining_mut() == 0 {
+            return Ok(0);
+        }
+        if dst.remaining_mut() < EVENT_SLOT_BYTES {
+            return Err(StarryError::InvalidInput);
+        }
+        let task = crate::task::current_user_task();
+        block_on_user(&task, poll_io(self, IoEvents::IN, self.nonblocking(), || {
+            self.read_events(dst)
+        }))
+        .into_result()?
+    }
+
+    fn write(&self, src: &mut IoSrc) -> StarryResult<usize> {
+        self.base.write(src)
+    }
+
+    fn stat(&self) -> StarryResult<Kstat> {
+        self.base.stat()
+    }
+
+    fn path(&self) -> Cow<'_, str> {
+        self.base.path()
+    }
+
+    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> StarryResult<usize> {
+        Ok(self.card().ioctl_for_file(self, current, cmd, arg)?)
+    }
+
+    fn device_mmap(&self, offset: u64, length: u64) -> StarryResult<DeviceMmap> {
+        Ok(self.card().mmap(offset, length))
+    }
+
+    fn open_flags(&self) -> u32 { self.base.open_flags() }
+    fn nonblocking(&self) -> bool { self.base.nonblocking() }
+    fn set_nonblocking(&self, nonblocking: bool) -> StarryResult {
+        self.base.set_nonblocking(nonblocking)
+    }
+}
+
+impl Pollable for Card0File {
+    fn poll(&self) -> IoEvents {
+        self.serve_pending_vblank_events();
+        let mut events = IoEvents::empty();
+        events.set(IoEvents::IN, !self.events.lock().ready.is_empty());
+        events
+    }
+
+    unsafe fn register_shared(&self, sink: &mut dyn axpoll::SharedRegistrationSink, events: IoEvents) {
+        if events.contains(IoEvents::IN) {
+            unsafe { sink.register_shared(&self.poll_rx, IoEvents::IN) };
+        }
+    }
+
+    unsafe fn register_exclusive(&self, sink: &mut dyn axpoll::ExclusiveRegistrationSink, events: IoEvents) {
+        if events.contains(IoEvents::IN) {
+            unsafe { sink.register_exclusive(&self.poll_rx, IoEvents::IN) };
+        }
+    }
+}
+
 impl Card0 {
     pub fn new() -> Arc<Self> {
         let card = Arc::new(Self {
-            events: Mutex::new(VecDeque::with_capacity(MAX_EVENTS)),
-            poll_rx: PollSet::new(),
-            vblank: VblankScheduler::new(monotonic_time_nanos()),
+            vblank: VblankClock::new(monotonic_time_nanos()),
             state: Mutex::new(ModesetState::default()),
-            legacy_crtc: Mutex::new(LegacyCrtcState::default()),
             dumbs: Mutex::new(BTreeMap::new()),
             next_dumb_handle: AtomicU32::new(FIRST_DUMB_HANDLE),
             // Start at STRIDE rather than 0 so a zero `offset` argument
@@ -427,7 +688,6 @@ impl Card0 {
             fbs: Mutex::new(BTreeMap::new()),
             next_fb_id: AtomicU32::new(FIRST_FB_ID),
             blobs: Mutex::new(BTreeMap::new()),
-            mode_id_blob_ref: Mutex::new(None),
             next_blob_id: AtomicU32::new(FIRST_BLOB_ID),
             system_blobs: Mutex::new(BTreeMap::new()),
             in_formats_blob: AtomicU32::new(0),
@@ -594,38 +854,14 @@ fn current_mode() -> DrmModeModeInfo {
     }
 }
 
-impl DeviceOps for Card0 {
-    fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if buf.len() < EVENT_SLOT_BYTES {
-            return Err(VfsError::InvalidInput);
-        }
-        // Serve any queued sequence events whose edge has passed before
-        // draining, so a reader that never polls still observes them.
-        self.serve_pending_vblank_events();
-        let mut events = self.events.lock();
-        let mut written = 0;
-        while written + EVENT_SLOT_BYTES <= buf.len() {
-            let Some(ev) = events.pop_front() else {
-                break;
-            };
-            buf[written..written + EVENT_SLOT_BYTES].copy_from_slice(&ev);
-            written += EVENT_SLOT_BYTES;
-        }
-        if written == 0 {
-            Err(VfsError::WouldBlock)
-        } else {
-            Ok(written)
-        }
-    }
-
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Err(VfsError::BadFileDescriptor)
-    }
-
-    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
+impl Card0 {
+    fn ioctl_for_file(
+        &self,
+        file: &Card0File,
+        current: &crate::task::UserTaskRef,
+        cmd: u32,
+        arg: usize,
+    ) -> VfsResult<usize> {
         match cmd {
             DRM_IOCTL_VERSION => handle_version(current, arg),
             DRM_IOCTL_GET_UNIQUE => handle_get_unique(current, arg),
@@ -633,7 +869,6 @@ impl DeviceOps for Card0 {
             DRM_IOCTL_GET_CAP => handle_get_cap(current, arg),
             DRM_IOCTL_SET_CLIENT_CAP => handle_set_client_cap(current, arg),
             DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => Ok(0),
-
             DRM_IOCTL_MODE_GETRESOURCES => handle_get_resources(current, arg),
             DRM_IOCTL_MODE_GETCRTC => self.handle_get_crtc(current, arg),
             DRM_IOCTL_MODE_SETCRTC => self.handle_set_crtc(current, arg),
@@ -644,29 +879,35 @@ impl DeviceOps for Card0 {
             DRM_IOCTL_MODE_CREATE_DUMB => self.handle_create_dumb(current, arg),
             DRM_IOCTL_MODE_MAP_DUMB => self.handle_map_dumb(current, arg),
             DRM_IOCTL_MODE_DESTROY_DUMB => self.handle_destroy_dumb(current, arg),
-
             DRM_IOCTL_MODE_GETPLANERESOURCES => handle_get_plane_resources(current, arg),
-            DRM_IOCTL_MODE_GETPLANE => handle_get_plane(current, arg),
+            DRM_IOCTL_MODE_GETPLANE => self.handle_get_plane(current, arg),
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.handle_obj_get_properties(current, arg),
             DRM_IOCTL_MODE_GETPROPERTY => handle_get_property(current, arg),
-            DRM_IOCTL_MODE_PAGE_FLIP => self.handle_page_flip(current, arg),
-            DRM_IOCTL_WAIT_VBLANK => self.handle_wait_vblank(current, arg),
+            DRM_IOCTL_MODE_PAGE_FLIP => self.handle_page_flip(file, current, arg),
+            DRM_IOCTL_WAIT_VBLANK => self.handle_wait_vblank(file, current, arg),
             DRM_IOCTL_CRTC_GET_SEQUENCE => self.handle_crtc_get_sequence(current, arg),
-            DRM_IOCTL_CRTC_QUEUE_SEQUENCE => self.handle_crtc_queue_sequence(current, arg),
-
-            DRM_IOCTL_MODE_ATOMIC => self.handle_atomic(current, arg),
+            DRM_IOCTL_CRTC_QUEUE_SEQUENCE => self.handle_crtc_queue_sequence(file, current, arg),
+            DRM_IOCTL_MODE_ATOMIC => self.handle_atomic(file, current, arg),
             DRM_IOCTL_MODE_CREATEPROPBLOB => self.handle_create_blob(current, arg),
             DRM_IOCTL_MODE_DESTROYPROPBLOB => self.handle_destroy_blob(current, arg),
             DRM_IOCTL_MODE_GETPROPBLOB => self.handle_get_blob(current, arg),
-
             DRM_IOCTL_GET_MAGIC => handle_get_magic(current, arg),
             DRM_IOCTL_AUTH_MAGIC => handle_auth_magic(current, arg),
             DRM_IOCTL_MODE_DIRTYFB => self.handle_dirty_fb(current, arg),
             DRM_IOCTL_PRIME_HANDLE_TO_FD => self.handle_prime_handle_to_fd(current, arg),
             DRM_IOCTL_PRIME_FD_TO_HANDLE => self.handle_prime_fd_to_handle(current, arg),
-
             _ => Err(VfsError::OperationNotSupported),
         }
+    }
+}
+
+impl DeviceOps for Card0 {
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(VfsError::BadFileDescriptor)
     }
 
     fn mmap(&self, offset: u64, length: u64) -> DeviceMmap {
@@ -692,45 +933,8 @@ impl DeviceOps for Card0 {
         self
     }
 
-    fn as_pollable(&self) -> Option<&dyn Pollable> {
-        Some(self)
-    }
-
     fn flags(&self) -> NodeFlags {
         NodeFlags::NON_CACHEABLE | NodeFlags::STREAM
-    }
-}
-
-impl Pollable for Card0 {
-    fn poll(&self) -> IoEvents {
-        // Real hardware raises a vblank IRQ when an edge passes; the
-        // emulation's equivalent observation point is this poll, which
-        // also makes lazily-queued sequence events readable without a
-        // kernel timer thread.
-        self.serve_pending_vblank_events();
-        let mut events = IoEvents::empty();
-        events.set(IoEvents::IN, !self.events.lock().is_empty());
-        events
-    }
-
-    unsafe fn register_shared(
-        &self,
-        sink: &mut dyn axpoll::SharedRegistrationSink,
-        events: IoEvents,
-    ) {
-        if events.contains(IoEvents::IN) {
-            unsafe { sink.register_shared(&self.poll_rx, IoEvents::IN) };
-        }
-    }
-
-    unsafe fn register_exclusive(
-        &self,
-        sink: &mut dyn axpoll::ExclusiveRegistrationSink,
-        events: IoEvents,
-    ) {
-        if events.contains(IoEvents::IN) {
-            unsafe { sink.register_exclusive(&self.poll_rx, IoEvents::IN) };
-        }
     }
 }
 
@@ -1098,37 +1302,27 @@ impl Card0 {
         if c.crtc_id != CRTC_ID {
             return Err(VfsError::InvalidInput);
         }
-        let legacy = self.legacy_crtc.lock().clone();
+        let state = self.state.lock().clone();
         c.gamma_size = 0;
-        if legacy.fb_id != 0 {
-            // Report the bound state from the last successful SETCRTC.
-            c.x = legacy.x;
-            c.y = legacy.y;
-            c.fb_id = legacy.fb_id;
-            c.mode_valid = legacy.mode_valid;
-            c.mode = if legacy.mode_valid != 0 {
-                legacy.mode
+        c.x = (state.plane_src_x >> 16) as u32;
+        c.y = (state.plane_src_y >> 16) as u32;
+        c.fb_id = state.plane_fb_id;
+        c.mode_valid = u32::from(state.mode.is_some());
+        c.mode = state
+            .mode
+            .as_ref()
+            .map_or_else(Default::default, |mode| mode.info);
+        let connectors = [CONNECTOR_ID];
+        c.count_connectors = report_user_array(
+            current,
+            c.set_connectors_ptr,
+            c.count_connectors,
+            if state.conn_crtc_id != 0 {
+                &connectors
             } else {
-                DrmModeModeInfo::default()
-            };
-            c.count_connectors = report_user_array(
-                current,
-                c.set_connectors_ptr,
-                c.count_connectors,
-                &legacy.connectors,
-            )?;
-        } else {
-            // Unbound CRTC: no fb, no connectors, advertise the current
-            // synthetic mode so probes still see a coherent mode.
-            c.x = 0;
-            c.y = 0;
-            c.fb_id = 0;
-            c.mode_valid = 1;
-            c.mode = current_mode();
-            let empty: &[u32] = &[];
-            c.count_connectors =
-                report_user_array(current, c.set_connectors_ptr, c.count_connectors, empty)?;
-        }
+                &[]
+            },
+        )?;
         ptr.vm_write(current, c).map_err(|_| VfsError::BadAddress)?;
         Ok(0)
     }
@@ -1140,17 +1334,14 @@ impl Card0 {
             return Err(VfsError::InvalidInput);
         }
 
-        // fb_id == 0 with no connectors is the libdrm "disable CRTC"
-        // idiom. Anything else must pass full validation.
-        if c.fb_id == 0 && c.count_connectors == 0 {
-            *self.legacy_crtc.lock() = LegacyCrtcState::default();
+        // Linux uses mode_valid to request disable, but still rejects a
+        // disable request that names connectors.
+        if c.mode_valid == 0 {
+            if c.count_connectors != 0 {
+                return Err(VfsError::InvalidInput);
+            }
+            *self.state.lock() = ModesetState::default();
             return Ok(0);
-        }
-
-        // Validate the fb exists. Snapshot under the lock so a racing
-        // RMFB can't pull the rug between validation and present.
-        if c.fb_id == 0 || !self.fbs.lock().contains_key(&c.fb_id) {
-            return Err(VfsError::InvalidInput);
         }
 
         // A non-disable SETCRTC must list at least one connector and
@@ -1175,14 +1366,28 @@ impl Card0 {
             }
         }
 
-        // Validation passed — commit state, then push pixels.
-        *self.legacy_crtc.lock() = LegacyCrtcState {
-            fb_id: c.fb_id,
-            connectors,
-            mode: c.mode,
-            mode_valid: c.mode_valid,
-            x: c.x,
-            y: c.y,
+        let mut state = self.state.lock();
+        if c.fb_id == 0 || !self.fbs.lock().contains_key(&c.fb_id) {
+            return Err(VfsError::InvalidInput);
+        }
+        // Legacy SETCRTC uses the same mode/plane state as an atomic commit.
+        *state = ModesetState {
+            crtc_active: 1,
+            mode: Some(ModeBlob {
+                id: self.next_blob_id.fetch_add(1, Ordering::Relaxed),
+                info: c.mode,
+                bytes: Arc::new(bytes_of(&c.mode).to_vec()),
+            }),
+            conn_crtc_id: CRTC_ID,
+            plane_crtc_id: CRTC_ID,
+            plane_fb_id: c.fb_id,
+            plane_src_x: u64::from(c.x) << 16,
+            plane_src_y: u64::from(c.y) << 16,
+            plane_src_w: u64::from(c.mode.hdisplay) << 16,
+            plane_src_h: u64::from(c.mode.vdisplay) << 16,
+            plane_crtc_w: u64::from(c.mode.hdisplay),
+            plane_crtc_h: u64::from(c.mode.vdisplay),
+            ..ModesetState::default()
         };
         self.present_fb(c.fb_id);
         Ok(0)
@@ -1308,14 +1513,10 @@ impl Card0 {
     fn handle_rmfb(&self, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
         let ptr = arg as *const u32;
         let fb_id: u32 = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
+        let mut state = self.state.lock();
         self.fbs.lock().remove(&fb_id);
-        // If the removed fb was the one bound by legacy SETCRTC, clear
-        // the binding so GETCRTC stops reporting a stale fb_id.
-        {
-            let mut legacy = self.legacy_crtc.lock();
-            if legacy.fb_id == fb_id {
-                *legacy = LegacyCrtcState::default();
-            }
+        if state.plane_fb_id == fb_id {
+            *state = ModesetState::default();
         }
         Ok(0)
     }
@@ -1332,27 +1533,28 @@ fn handle_get_plane_resources(current: &crate::task::UserTaskRef, arg: usize) ->
     Ok(0)
 }
 
-fn handle_get_plane(current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
-    let ptr = arg as *mut DrmModeGetPlane;
-    let mut p: DrmModeGetPlane = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
-    if p.plane_id != PLANE_ID {
-        return Err(VfsError::InvalidInput);
-    }
-    p.crtc_id = CRTC_ID;
-    p.fb_id = 0;
-    p.possible_crtcs = 1;
-    p.gamma_size = 0;
-    p.count_format_types = report_user_array(
-        current,
-        p.format_type_ptr,
-        p.count_format_types,
-        SUPPORTED_FORMATS,
-    )?;
-    ptr.vm_write(current, p).map_err(|_| VfsError::BadAddress)?;
-    Ok(0)
-}
-
 impl Card0 {
+    fn handle_get_plane(&self, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
+        let ptr = arg as *mut DrmModeGetPlane;
+        let mut p: DrmModeGetPlane = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
+        if p.plane_id != PLANE_ID {
+            return Err(VfsError::InvalidInput);
+        }
+        let state = self.state.lock().clone();
+        p.crtc_id = state.plane_crtc_id;
+        p.fb_id = state.plane_fb_id;
+        p.possible_crtcs = 1;
+        p.gamma_size = 0;
+        p.count_format_types = report_user_array(
+            current,
+            p.format_type_ptr,
+            p.count_format_types,
+            SUPPORTED_FORMATS,
+        )?;
+        ptr.vm_write(current, p).map_err(|_| VfsError::BadAddress)?;
+        Ok(0)
+    }
+
     fn handle_obj_get_properties(
         &self,
         current: &crate::task::UserTaskRef,
@@ -1362,7 +1564,7 @@ impl Card0 {
         let mut q: DrmModeObjGetProperties =
             ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
 
-        let state = *self.state.lock();
+        let state = self.state.lock().clone();
         let (prop_ids, prop_vals): (&[u32], Vec<u64>) = match (q.obj_type, q.obj_id) {
             (DRM_MODE_OBJECT_PLANE, PLANE_ID) => {
                 let blob_id = self.ensure_in_formats_blob() as u64;
@@ -1370,6 +1572,15 @@ impl Card0 {
             }
             (DRM_MODE_OBJECT_CRTC, CRTC_ID) => (CRTC_PROPS, crtc_prop_values(&state)),
             (DRM_MODE_OBJECT_CONNECTOR, CONNECTOR_ID) => (CONN_PROPS, conn_prop_values(&state)),
+            (DRM_MODE_OBJECT_FB, fb_id) => {
+                // Linux rejects objects without a property container after
+                // lookup, distinguishing them from nonexistent object IDs.
+                return Err(if self.fbs.lock().contains_key(&fb_id) {
+                    VfsError::InvalidInput
+                } else {
+                    VfsError::NotFound
+                });
+            }
             _ => return Err(VfsError::NotFound),
         };
         report_user_array(current, q.props_ptr, q.count_props, prop_ids)?;
@@ -1394,6 +1605,8 @@ fn plane_prop_values(s: &ModesetState, in_formats: u64) -> Vec<u64> {
         s.plane_crtc_w,
         s.plane_crtc_h,
         in_formats,
+        // No fence is ever pending outside a commit request.
+        u64::MAX,
     ]
 }
 
@@ -1448,7 +1661,10 @@ fn build_in_formats_blob() -> Vec<u8> {
 }
 
 fn crtc_prop_values(s: &ModesetState) -> Vec<u64> {
-    vec![s.crtc_active, s.crtc_mode_id as u64]
+    vec![
+        s.crtc_active,
+        s.mode.as_ref().map_or(0, |mode| u64::from(mode.id)),
+    ]
 }
 
 fn conn_prop_values(s: &ModesetState) -> Vec<u64> {
@@ -1478,7 +1694,12 @@ fn handle_get_property(current: &crate::task::UserTaskRef, arg: usize) -> VfsRes
             g.count_values = report_user_array(current, g.values_ptr, g.count_values, &limits)?;
             g.count_enum_blobs = 0;
         }
-        PropKind::Object | PropKind::Blob => {
+        PropKind::Object(object_type) => {
+            let values = [object_type as u64];
+            g.count_values = report_user_array(current, g.values_ptr, g.count_values, &values)?;
+            g.count_enum_blobs = 0;
+        }
+        PropKind::Blob => {
             g.count_values = 0;
             g.count_enum_blobs = 0;
         }
@@ -1496,7 +1717,7 @@ struct PropMeta {
 enum PropKind {
     Enum(&'static [DrmModePropertyEnum]),
     RangeU64 { min: u64, max: u64 },
-    Object,
+    Object(u32),
     Blob,
 }
 
@@ -1534,12 +1755,12 @@ fn property_meta(id: u32) -> Option<PropMeta> {
         PROP_PLANE_FB_ID => PropMeta {
             name: "FB_ID",
             flags: DRM_MODE_PROP_OBJECT | atomic,
-            kind: PropKind::Object,
+            kind: PropKind::Object(DRM_MODE_OBJECT_FB),
         },
         PROP_PLANE_CRTC_ID => PropMeta {
             name: "CRTC_ID",
             flags: DRM_MODE_PROP_OBJECT | atomic,
-            kind: PropKind::Object,
+            kind: PropKind::Object(DRM_MODE_OBJECT_CRTC),
         },
         PROP_PLANE_SRC_X => range_u32("SRC_X", atomic),
         PROP_PLANE_SRC_Y => range_u32("SRC_Y", atomic),
@@ -1553,6 +1774,16 @@ fn property_meta(id: u32) -> Option<PropMeta> {
             name: "IN_FORMATS",
             flags: DRM_MODE_PROP_BLOB | DRM_MODE_PROP_IMMUTABLE,
             kind: PropKind::Blob,
+        },
+        PROP_PLANE_IN_FENCE_FD => PropMeta {
+            name: "IN_FENCE_FD",
+            // Linux declares this as a signed range [-1, INT_MAX] where -1
+            // (reported as u64::MAX) means "no fence".
+            flags: DRM_MODE_PROP_SIGNED_RANGE | atomic,
+            kind: PropKind::RangeU64 {
+                min: u64::MAX,
+                max: i32::MAX as u64,
+            },
         },
         PROP_CRTC_ACTIVE => PropMeta {
             name: "ACTIVE",
@@ -1569,7 +1800,7 @@ fn property_meta(id: u32) -> Option<PropMeta> {
         PROP_CONN_CRTC_ID => PropMeta {
             name: "CRTC_ID",
             flags: DRM_MODE_PROP_OBJECT | atomic,
-            kind: PropKind::Object,
+            kind: PropKind::Object(DRM_MODE_OBJECT_CRTC),
         },
         _ => return None,
     };
@@ -1598,108 +1829,58 @@ impl Card0 {
         Ok(0)
     }
 
-    fn handle_page_flip(&self, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
+    fn handle_page_flip(&self, file: &Card0File, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
         let ptr = arg as *const DrmModeCrtcPageFlip;
         let f: DrmModeCrtcPageFlip = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
-        if f.crtc_id != CRTC_ID || !self.fbs.lock().contains_key(&f.fb_id) {
+        if f.crtc_id != CRTC_ID {
             return Err(VfsError::InvalidInput);
         }
-        self.present_fb(f.fb_id);
+        let mut state = self.state.lock();
+        if state.plane_fb_id == 0 {
+            return Err(VfsError::ResourceBusy);
+        }
+        if state.crtc_active == 0 || !self.fbs.lock().contains_key(&f.fb_id) {
+            return Err(VfsError::InvalidInput);
+        }
         if f.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            self.queue_flip_event(f.user_data);
+            file.reserve_event()?;
+        }
+        state.plane_fb_id = f.fb_id;
+        self.present_fb(f.fb_id);
+        drop(state);
+        if f.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+            self.queue_flip_event(file, f.user_data);
         }
         Ok(0)
     }
 
-    /// Serializes and enqueues a DRM event payload, waking pollers.
-    /// Every event type on this card is `EVENT_SLOT_BYTES` long (asserted
-    /// at compile time), so a flat byte-slot queue serves `read()` for
-    /// both `DrmEventVblank` and `DrmEventCrtcSequence` payloads.
-    fn enqueue_event<E: bytemuck::NoUninit>(&self, ev: &E) {
-        let bytes = bytes_of(ev);
-        debug_assert_eq!(bytes.len(), EVENT_SLOT_BYTES);
-        let mut slot: EventSlot = [0; EVENT_SLOT_BYTES];
-        slot[..bytes.len()].copy_from_slice(bytes);
-        let enqueued = {
-            let mut queue = self.events.lock();
-            if queue.len() >= MAX_EVENTS {
-                false
-            } else {
-                queue.push_back(slot);
-                true
-            }
-        };
-        if enqueued {
-            // DRM event is queued before waking readers.
-            unsafe { self.poll_rx.wake(IoEvents::IN) };
-        }
-    }
-
-    /// Moves every queued vblank event whose target edge has passed onto
-    /// the event queue. Called from `poll` and `read`.
-    fn serve_pending_vblank_events(&self) {
-        let now_ns = monotonic_time_nanos();
-        for pending in self.vblank.take_expired(now_ns) {
-            let sequence = self.vblank.clock().sequence_at(now_ns);
-            let edge_ns = self.vblank.clock().edge_ns_of(pending.target_sequence) as i64;
-            match pending.event {
-                QueuedVblankEvent::Vblank { user_data } => {
-                    let ev = DrmEventVblank {
-                        base: DrmEvent {
-                            event_type: DRM_EVENT_VBLANK,
-                            length: core::mem::size_of::<DrmEventVblank>() as u32,
-                        },
-                        user_data,
-                        tv_sec: (edge_ns / 1_000_000_000) as u32,
-                        tv_usec: ((edge_ns % 1_000_000_000) / 1_000) as u32,
-                        sequence: sequence as u32,
-                        crtc_id: CRTC_ID,
-                    };
-                    self.enqueue_event(&ev);
-                }
-                QueuedVblankEvent::CrtcSequence { user_data } => {
-                    let ev = DrmEventCrtcSequence {
-                        base: DrmEvent {
-                            event_type: DRM_EVENT_CRTC_SEQUENCE,
-                            length: core::mem::size_of::<DrmEventCrtcSequence>() as u32,
-                        },
-                        user_data,
-                        tv_ns: edge_ns,
-                        sequence: sequence as u64,
-                    };
-                    self.enqueue_event(&ev);
-                }
-            }
-        }
-    }
-
     /// Whether the CRTC is currently scanning out: true once a legacy
-    /// `SETCRTC` bound an fb or an atomic commit set `ACTIVE`. Mirrors
+    /// `SETCRTC` bound an fb or an atomic commit bound an active fb. Mirrors
     /// the `active` visibility `CRTC_GET_SEQUENCE` reports.
     fn crtc_active(&self) -> bool {
-        *self.state.lock() != ModesetState::default()
-            || self.legacy_crtc.lock().fb_id != 0
+        let state = self.state.lock();
+        state.crtc_active != 0 && state.plane_fb_id != 0
     }
 
     /// Enqueue a `drm_event_vblank` flip-completion for the next `read()`.
-    /// Shared by legacy PAGE_FLIP and atomic commits. The sequence and
-    /// timestamp come from the synthesized vblank clock, matching what
-    /// `CRTC_GET_SEQUENCE` would report for the same instant.
-    fn queue_flip_event(&self, user_data: u64) {
+    /// Shared by legacy PAGE_FLIP and atomic commits. Timestamp the edge
+    /// corresponding to the reported sequence, not the commit instant.
+    fn queue_flip_event(&self, file: &Card0File, user_data: u64) {
         let now_ns = monotonic_time_nanos();
-        let sequence = self.vblank.clock().sequence_at(now_ns);
+        let sequence = self.vblank.sequence_at(now_ns);
+        let edge_ns = self.vblank.edge_ns_of(sequence);
         let ev = DrmEventVblank {
             base: DrmEvent {
                 event_type: DRM_EVENT_FLIP_COMPLETE,
                 length: core::mem::size_of::<DrmEventVblank>() as u32,
             },
             user_data,
-            tv_sec: (now_ns / 1_000_000_000) as u32,
-            tv_usec: ((now_ns % 1_000_000_000) / 1_000) as u32,
+            tv_sec: (edge_ns / 1_000_000_000) as u32,
+            tv_usec: ((edge_ns % 1_000_000_000) / 1_000) as u32,
             sequence: sequence as u32,
             crtc_id: CRTC_ID,
         };
-        self.enqueue_event(&ev);
+        file.enqueue_reserved_event(&ev);
     }
 
     /// `CRTC_GET_SEQUENCE` — report the synthesized counter's most recent
@@ -1722,10 +1903,10 @@ impl Card0 {
             return Err(VfsError::InvalidInput);
         }
         let now_ns = monotonic_time_nanos();
-        let sequence = self.vblank.clock().sequence_at(now_ns);
-        g.active = u32::from(self.crtc_active());
+        let sequence = self.vblank.sequence_at(now_ns);
+        g.active = 1;
         g.sequence = sequence;
-        g.sequence_ns = self.vblank.clock().edge_ns_of(sequence) as i64;
+        g.sequence_ns = self.vblank.edge_ns_of(sequence) as i64;
         ptr.vm_write(current, g).map_err(|_| VfsError::BadAddress)?;
         Ok(0)
     }
@@ -1739,6 +1920,7 @@ impl Card0 {
     /// when it fired immediately).
     fn handle_crtc_queue_sequence(
         &self,
+        file: &Card0File,
         current: &crate::task::UserTaskRef,
         arg: usize,
     ) -> VfsResult<usize> {
@@ -1756,7 +1938,7 @@ impl Card0 {
         }
 
         let now_ns = monotonic_time_nanos();
-        let current_sequence = self.vblank.clock().sequence_at(now_ns);
+        let current_sequence = self.vblank.sequence_at(now_ns);
         let mut target = if q.flags & DRM_CRTC_SEQUENCE_RELATIVE != 0 {
             current_sequence.wrapping_add(q.sequence)
         } else {
@@ -1771,8 +1953,8 @@ impl Card0 {
         if vblank_passed(current_sequence, target) {
             // Missed: fire synchronously with the current counter, like
             // Linux's immediate `send_vblank_event`.
-            self.serve_pending_vblank_events();
-            let edge_ns = self.vblank.clock().edge_ns_of(current_sequence) as i64;
+            file.serve_pending_vblank_events();
+            let edge_ns = self.vblank.edge_ns_of(current_sequence) as i64;
             let ev = DrmEventCrtcSequence {
                 base: DrmEvent {
                     event_type: DRM_EVENT_CRTC_SEQUENCE,
@@ -1782,20 +1964,15 @@ impl Card0 {
                 tv_ns: edge_ns,
                 sequence: current_sequence,
             };
-            self.enqueue_event(&ev);
+            file.enqueue_event(&ev)?;
             q.sequence = current_sequence;
         } else {
-            let queued = self.vblank.queue(PendingVblankEvent {
+            file.queue_pending(PendingVblankEvent {
                 event: QueuedVblankEvent::CrtcSequence {
                     user_data: q.user_data,
                 },
                 target_sequence: target,
-            });
-            if !queued {
-                // Linux's event reservation fails with -ENOMEM once the
-                // client's 4 KB event space is exhausted.
-                return Err(VfsError::NoMemory);
-            }
+            })?;
             q.sequence = target;
         }
         ptr.vm_write(current, q).map_err(|_| VfsError::BadAddress)?;
@@ -1813,6 +1990,7 @@ impl Card0 {
     /// timestamp like `drm_wait_vblank_reply()`.
     fn handle_wait_vblank(
         &self,
+        file: &Card0File,
         current: &crate::task::UserTaskRef,
         arg: usize,
     ) -> VfsResult<usize> {
@@ -1838,7 +2016,7 @@ impl Card0 {
 
         let vtype = req.rep_type;
         let now_ns = monotonic_time_nanos();
-        let current_sequence = self.vblank.clock().sequence_at(now_ns);
+        let current_sequence = self.vblank.sequence_at(now_ns);
 
         // Query short-circuit: relative with a zero target and no event
         // or next-on-miss flags just reports the current counter.
@@ -1874,14 +2052,14 @@ impl Card0 {
             // `tv_sec`) is the user_data of the delivered event.
             let user_data = req.tv_sec as u64;
             let fired = vblank_passed(current_sequence, target);
-            self.serve_pending_vblank_events();
+            file.serve_pending_vblank_events();
             if fired {
-                self.queue_vblank_event(user_data, current_sequence);
-            } else if !self.vblank.queue(PendingVblankEvent {
-                event: QueuedVblankEvent::Vblank { user_data },
-                target_sequence: target,
-            }) {
-                return Err(VfsError::NoMemory);
+                self.queue_vblank_event(file, user_data, current_sequence)?;
+            } else {
+                file.queue_pending(PendingVblankEvent {
+                    event: QueuedVblankEvent::Vblank { user_data },
+                    target_sequence: target,
+                })?;
             }
             let reply_sequence = if fired { current_sequence } else { target };
             let mut reply = self.wait_vblank_reply(req.rep_type, current_sequence);
@@ -1893,13 +2071,13 @@ impl Card0 {
         // Blocking wait: sleep until the target edge. An already-passed
         // target returns immediately, matching Linux's passed check.
         if !vblank_passed(current_sequence, target) {
-            let edge_ns = self.vblank.clock().edge_ns_of(target);
+            let edge_ns = self.vblank.edge_ns_of(target);
             crate::task::sleep(core::time::Duration::from_nanos(
                 edge_ns.saturating_sub(monotonic_time_nanos()),
             ));
         }
         let after_ns = monotonic_time_nanos();
-        let sequence = self.vblank.clock().sequence_at(after_ns);
+        let sequence = self.vblank.sequence_at(after_ns);
         let reply = self.wait_vblank_reply(req.rep_type, sequence);
         ptr.vm_write(current, reply).map_err(|_| VfsError::BadAddress)?;
         Ok(0)
@@ -1909,7 +2087,7 @@ impl Card0 {
     /// mirroring `drm_wait_vblank_reply()`: the truncated counter plus
     /// the timestamp of the most recent vblank edge.
     fn wait_vblank_reply(&self, rep_type: u32, sequence: u64) -> DrmWaitVblank {
-        let edge_ns = self.vblank.clock().edge_ns_of(sequence) as i64;
+        let edge_ns = self.vblank.edge_ns_of(sequence) as i64;
         DrmWaitVblank {
             rep_type,
             sequence: sequence as u32,
@@ -1919,8 +2097,8 @@ impl Card0 {
     }
 
     /// Queues an immediate `DRM_EVENT_VBLANK` for a fired target.
-    fn queue_vblank_event(&self, user_data: u64, sequence: u64) {
-        let edge_ns = self.vblank.clock().edge_ns_of(sequence);
+    fn queue_vblank_event(&self, file: &Card0File, user_data: u64, sequence: u64) -> VfsResult<()> {
+        let edge_ns = self.vblank.edge_ns_of(sequence);
         let ev = DrmEventVblank {
             base: DrmEvent {
                 event_type: DRM_EVENT_VBLANK,
@@ -1932,12 +2110,12 @@ impl Card0 {
             sequence: sequence as u32,
             crtc_id: CRTC_ID,
         };
-        self.enqueue_event(&ev);
+        file.enqueue_event(&ev)
     }
 
     // ======== M4c: atomic commit + blob properties ========
 
-    fn handle_atomic(&self, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
+    fn handle_atomic(&self, file: &Card0File, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
         let ptr = arg as *const DrmModeAtomic;
         let a: DrmModeAtomic = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
 
@@ -1961,13 +2139,7 @@ impl Card0 {
             .map_err(|_| VfsError::BadAddress)?;
 
         let mut state = self.state.lock();
-        let mut proposed = *state;
-        // Outer Option: "the commit assigned MODE_ID at least once".
-        // Inner Option: the resolved Arc (None means clearing MODE_ID to 0).
-        // Only published into `mode_id_blob_ref` after the whole batch
-        // validates so a TEST_ONLY commit or a later property error
-        // leaves the committed mode blob ref untouched.
-        let mut new_mode_blob: Option<Option<Arc<Vec<u8>>>> = None;
+        let mut proposed = state.clone();
         let mut idx = 0;
         for (obj_i, &obj_id) in objs.iter().enumerate() {
             let obj_type = object_type_of(obj_id).ok_or(VfsError::NotFound)?;
@@ -1975,14 +2147,7 @@ impl Card0 {
                 let prop_id = props[idx];
                 let value = values[idx];
                 idx += 1;
-                if !self.apply_prop(
-                    obj_type,
-                    obj_id,
-                    prop_id,
-                    value,
-                    &mut proposed,
-                    &mut new_mode_blob,
-                )? {
+                if !self.apply_prop(obj_type, prop_id, value, &mut proposed)? {
                     return Err(VfsError::InvalidInput);
                 }
             }
@@ -1991,18 +2156,17 @@ impl Card0 {
         if a.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 {
             return Ok(0);
         }
-
+        if a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+            file.reserve_event()?;
+        }
         let current_fb = proposed.plane_fb_id;
         *state = proposed;
-        drop(state);
-        if let Some(new_ref) = new_mode_blob {
-            *self.mode_id_blob_ref.lock() = new_ref;
-        }
-        if current_fb != 0 {
+        if current_fb != 0 && state.crtc_active != 0 {
             self.present_fb(current_fb);
         }
+        drop(state);
         if a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            self.queue_flip_event(a.user_data);
+            self.queue_flip_event(file, a.user_data);
         }
         Ok(0)
     }
@@ -2013,11 +2177,9 @@ impl Card0 {
     fn apply_prop(
         &self,
         obj_type: u32,
-        _obj_id: u32,
         prop_id: u32,
         value: u64,
         s: &mut ModesetState,
-        new_mode_blob: &mut Option<Option<Arc<Vec<u8>>>>,
     ) -> VfsResult<bool> {
         match (obj_type, prop_id) {
             (DRM_MODE_OBJECT_PLANE, PROP_PLANE_TYPE) => {
@@ -2052,6 +2214,14 @@ impl Card0 {
             }
             (DRM_MODE_OBJECT_PLANE, PROP_PLANE_CRTC_W) => s.plane_crtc_w = value,
             (DRM_MODE_OBJECT_PLANE, PROP_PLANE_CRTC_H) => s.plane_crtc_h = value,
+            (DRM_MODE_OBJECT_PLANE, PROP_PLANE_IN_FENCE_FD) => {
+                // Linux borrows a sync-file fence and never closes the user's
+                // fd, including on TEST_ONLY or failure. No Starry file type
+                // provides a sync-file yet, so every non-sentinel is invalid.
+                if value != u64::MAX {
+                    return Err(VfsError::InvalidInput);
+                }
+            }
             (DRM_MODE_OBJECT_CRTC, PROP_CRTC_ACTIVE) => {
                 if value > 1 {
                     return Err(VfsError::InvalidInput);
@@ -2059,28 +2229,29 @@ impl Card0 {
                 s.crtc_active = value;
             }
             (DRM_MODE_OBJECT_CRTC, PROP_CRTC_MODE_ID) => {
-                let blob = value as u32;
-                let arc = if blob == 0 {
+                let id = u32::try_from(value).map_err(|_| VfsError::InvalidInput)?;
+                s.mode = if id == 0 {
                     None
                 } else {
-                    // Resolve the Arc backing in priority order:
-                    //   1. user-publish table — the normal case.
-                    //   2. the existing `mode_id_blob_ref` if the
-                    //      requested id matches the currently-committed
-                    //      MODE_ID — keeps a re-commit of the same id
-                    //      working even after the user destroyed their
-                    //      publish handle.
-                    let arc = self.blobs.lock().get(&blob).cloned().or_else(|| {
-                        if s.crtc_mode_id == blob {
-                            self.mode_id_blob_ref.lock().clone()
-                        } else {
-                            None
-                        }
-                    });
-                    Some(arc.ok_or(VfsError::InvalidInput)?)
+                    let bytes = self
+                        .blobs
+                        .lock()
+                        .get(&id)
+                        .cloned()
+                        .or_else(|| {
+                            s.mode
+                                .as_ref()
+                                .filter(|mode| mode.id == id)
+                                .map(|mode| mode.bytes.clone())
+                        })
+                        .ok_or(VfsError::InvalidInput)?;
+                    if bytes.len() != size_of::<DrmModeModeInfo>() {
+                        return Err(VfsError::InvalidInput);
+                    }
+                    let info = bytemuck::try_pod_read_unaligned(&bytes)
+                        .map_err(|_| VfsError::InvalidInput)?;
+                    Some(ModeBlob { id, info, bytes })
                 };
-                s.crtc_mode_id = blob;
-                *new_mode_blob = Some(arc);
             }
             (DRM_MODE_OBJECT_CONNECTOR, PROP_CONN_CRTC_ID) => {
                 let c = value as u32;
@@ -2126,9 +2297,9 @@ impl Card0 {
         if self.system_blobs.lock().contains_key(&d.blob_id) {
             return Err(VfsError::PermissionDenied);
         }
-        // Drop the user-publish reference. If `mode_id_blob_ref` still
-        // holds the same Arc (i.e. an atomic commit pinned this blob as
-        // the CRTC's `MODE_ID`), the blob data stays alive and
+        // Drop the user-publish reference. If `state.mode` still
+        // holds the same Arc (i.e. a commit pinned this blob as the CRTC's
+        // `MODE_ID`), the blob data stays alive and
         // `GETPROPBLOB` keeps succeeding via the committed-state lookup
         // below until a later atomic commit replaces `MODE_ID`.
         self.blobs
@@ -2141,26 +2312,20 @@ impl Card0 {
     fn handle_get_blob(&self, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
         let ptr = arg as *mut DrmModeGetBlob;
         let mut g: DrmModeGetBlob = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
-        // Clone the Arc backing out of the lock — `vm_write_slice` can
-        // page-fault and sleep, and we don't want to hold the blob
-        // map locked across that. Lookup order:
-        //   1. user-publish table (`blobs`)
-        //   2. committed `MODE_ID` ref, only when the requested id
-        //      matches `state.crtc_mode_id` — this is the lifeline that
-        //      keeps a user-destroyed-but-still-committed mode blob
-        //      visible.
-        //   3. system blobs (kernel-owned, e.g. `IN_FORMATS`).
-        let bytes = if let Some(b) = self.blobs.lock().get(&g.blob_id).cloned() {
-            b
-        } else if g.blob_id == self.state.lock().crtc_mode_id
-            && let Some(b) = self.mode_id_blob_ref.lock().clone()
-        {
-            b
-        } else if let Some(b) = self.system_blobs.lock().get(&g.blob_id).cloned() {
-            b
-        } else {
-            return Err(VfsError::NotFound);
-        };
+        // Never hold a registry/state lock across faultable output copies.
+        // Separate lookups also avoid nesting blobs -> state against commits.
+        let published = self.blobs.lock().get(&g.blob_id).cloned();
+        let bytes = published
+            .or_else(|| {
+                self.state
+                    .lock()
+                    .mode
+                    .as_ref()
+                    .filter(|mode| mode.id == g.blob_id)
+                    .map(|mode| mode.bytes.clone())
+            })
+            .or_else(|| self.system_blobs.lock().get(&g.blob_id).cloned())
+            .ok_or(VfsError::NotFound)?;
         if g.data != 0 && g.length > 0 {
             let n = (g.length as usize).min(bytes.len());
             vm_write_slice(current, g.data as *mut u8, &bytes[..n])

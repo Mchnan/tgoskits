@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3](https://github.com/rcore-os/tgoskits/compare/ax-task-v0.8.2...ax-task-v0.8.3) - 2026-09-18
+
+### Added
+
+- *(ax-task)* integrate capacity-aware Fair placement ([#2389](https://github.com/rcore-os/tgoskits/pull/2389))
+
+### Fixed
+
+- *(ax-task)* keep idle polling under preemption exclusion ([#2403](https://github.com/rcore-os/tgoskits/pull/2403))
+
+### Other
+
+- *(scheduler)* streamline wakeup paths and RT accounting ([#2435](https://github.com/rcore-os/tgoskits/pull/2435))
+- *(sched)* reduce scheduler and futex hot-path overhead ([#2399](https://github.com/rcore-os/tgoskits/pull/2399))
+
+## [0.8.2](https://github.com/rcore-os/tgoskits/compare/ax-task-v0.8.1...ax-task-v0.8.2) - 2026-09-13
+
+### Fixed
+
+- *(ax-task)* inspect offline timer state under one base lock ([#2385](https://github.com/rcore-os/tgoskits/pull/2385))
+
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/ax-task-v0.8.0...ax-task-v0.8.1) - 2026-09-12
+
+### Fixed
+
+- *(ax-task)* allow per-CPU timer wakes during CPU deactivation ([#2382](https://github.com/rcore-os/tgoskits/pull/2382))
+
+## [0.8.0](https://github.com/rcore-os/tgoskits/compare/ax-task-v0.7.1...ax-task-v0.8.0) - 2026-09-11
+
+### Fixed
+
+- *(ax-task)* drain idle scheduler work before offline probes ([#2377](https://github.com/rcore-os/tgoskits/pull/2377))
+
+### Other
+
+- *(ax-task)* unify thread lifecycle and PREEMPT_RT lock semantics ([#2357](https://github.com/rcore-os/tgoskits/pull/2357))
+
 ## [0.7.1](https://github.com/rcore-os/tgoskits/compare/ax-task-v0.7.0...ax-task-v0.7.1) - 2026-09-09
 
 ### Fixed

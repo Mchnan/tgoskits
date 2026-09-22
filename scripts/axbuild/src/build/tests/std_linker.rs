@@ -2,8 +2,10 @@ use super::*;
 
 #[test]
 fn std_linker_wrapper_filters_crt_and_replaces_fixed_libs() {
-    let fake_dir = std_fake_lib_dir("x86_64-unknown-linux-musl").unwrap();
-    let wrapper = std_linker_wrapper_path("x86_64-unknown-linux-musl", &fake_dir).unwrap();
+    let axbuild_dir = repo_axbuild_dir();
+    let fake_dir = std_fake_lib_dir(&axbuild_dir, "x86_64-unknown-linux-musl").unwrap();
+    let wrapper =
+        std_linker_wrapper_path(&axbuild_dir, "x86_64-unknown-linux-musl", &fake_dir).unwrap();
     let wrapper = fs::read_to_string(wrapper).unwrap();
 
     assert!(wrapper.contains("rust-lld"));
@@ -35,18 +37,4 @@ fn std_linker_wrapper_filters_crt_and_replaces_fixed_libs() {
     assert!(!wrapper.contains("--whole-archive"));
     assert!(!wrapper.contains("\"-u\""));
     assert!(!wrapper.contains("_start"));
-}
-
-#[test]
-fn std_linker_wrapper_uses_explicit_dynamic_platform_mode() {
-    let fake_dir = std_fake_lib_dir("aarch64-unknown-linux-musl").unwrap();
-    let wrapper = std_linker_wrapper_path("aarch64-unknown-linux-musl", &fake_dir).unwrap();
-    let wrapper = fs::read_to_string(wrapper).unwrap();
-
-    assert!(wrapper.contains("find_linker_script"));
-    assert!(!wrapper.contains("latest_build_output_script axplat.x"));
-    assert!(!wrapper.contains("entry_symbol="));
-    assert!(!wrapper.contains("link_mode_args="));
-    assert!(!wrapper.contains("dynamic_platform="));
-    assert!(!wrapper.contains("_head"));
 }

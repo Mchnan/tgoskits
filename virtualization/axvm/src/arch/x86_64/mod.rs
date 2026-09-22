@@ -1,7 +1,7 @@
 //! AxVM x86_64 adapter.
 //!
-//! This module owns the AxVM/ArceOS glue for the OS-neutral `x86_vcpu` and
-//! `x86_vlapic` cores.
+//! CPU mechanisms come from ax-cpu; this module owns VM policy, the ArceOS
+//! integration, and the x86_vlapic device model.
 
 use std::{
     arch::asm,
@@ -21,13 +21,18 @@ use ax_std::os::arceos::{
 use axdevice::*;
 use axdevice_base::*;
 use axvm_types::{VmBackendError as BackendError, VmBackendResult as BackendResult, *};
-use x86_vcpu::{
+use x86_vlapic::*;
+
+use crate::arch::x86_64::policy::{
     X86AccessWidth, X86GuestPhysAddr, X86HostPhysAddr, X86HostVirtAddr, X86MsrAddr, X86Port, *,
 };
-use x86_vlapic::*;
+
+mod control_memory;
+pub(crate) mod policy;
 
 use super::*;
 use crate::{
+    AsVCpuTask,
     host::*,
     irq::{
         deferred::*,
@@ -61,11 +66,10 @@ pub(crate) struct X86_64Arch;
 impl ArchOps for X86_64Arch {
     type VCpu = AxvmX86Vcpu;
     type PerCpu = AxvmX86PerCpu;
-    type DeferredRunWork = DeferredRunWork;
     type NestedPageTable = nested_paging::NestedPageTable<crate::HostPagingHandler>;
 
     fn has_hardware_support() -> bool {
-        x86_vcpu::initialize_hardware_support().is_ok()
+        crate::arch::x86_64::policy::initialize_hardware_support().is_ok()
     }
 
     fn enter_runtime(vm: &crate::AxVM) -> AxVmResult {
@@ -99,7 +103,7 @@ impl ArchOps for X86_64Arch {
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
         runtime: &crate::vm::VmRuntimeHandle,
     ) {
-        let wait_snapshot = runtime.vcpu_event_wait_snapshot();
+        let wait_snapshot = runtime.vcpu_event_wait_snapshot(vcpu.run_state());
         crate::vm::wait_for_vcpu_event_if_idle(
             runtime,
             &wait_snapshot,
@@ -118,7 +122,7 @@ impl ArchOps for X86_64Arch {
         vm: &crate::AxVMRef,
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
         exit: <Self::VCpu as VmArchVcpuOps>::Exit,
-    ) -> AxVmResult<BoundVcpuExit<Self::DeferredRunWork>> {
+    ) -> AxVmResult<VcpuExitAction> {
         trace!(
             "VM[{}] VCpu[{}] x86 exit={exit:?}, guest={:?}",
             vm.id(),
@@ -165,19 +169,19 @@ impl ArchOps for X86_64Arch {
                         crate::architecture::exit::read_mmio_value(vm, vcpu, ax_addr, ax_width)?;
                     let value = (raw & crate::vm::width_mask(ax_width)) as u8;
                     vcpu.get_arch_vcpu().set_gpr_byte(byte_reg, value);
-                    Ok(BoundVcpuExit::Continue)
+                    Ok(VcpuExitAction::Continue)
                 } else if reg == 4 {
                     let raw =
                         crate::architecture::exit::read_mmio_value(vm, vcpu, ax_addr, ax_width)?;
                     let value = raw & crate::vm::width_mask(ax_width);
                     vcpu.get_arch_vcpu().set_gpr_rsp(width, value as u64);
-                    Ok(BoundVcpuExit::Continue)
+                    Ok(VcpuExitAction::Continue)
                 } else if ax_width == AccessWidth::Word {
                     let raw =
                         crate::architecture::exit::read_mmio_value(vm, vcpu, ax_addr, ax_width)?;
                     let value = (raw & crate::vm::width_mask(ax_width)) as u16;
                     vcpu.get_arch_vcpu().set_gpr_word(reg, value);
-                    Ok(BoundVcpuExit::Continue)
+                    Ok(VcpuExitAction::Continue)
                 } else {
                     super::handle_mmio_read(
                         vm,
@@ -224,21 +228,20 @@ impl ArchOps for X86_64Arch {
                     access_flags: x86_access_flags_to_ax(access_flags),
                 },
             ),
-            X86VmExit::PreemptionTimer => {
-                Ok(BoundVcpuExit::Defer(DeferredRunWork::TimesliceExpired))
-            }
+            X86VmExit::PreemptionTimer => Ok(VcpuExitAction::Complete(VcpuRunAction::default())),
             X86VmExit::InterruptEnd { vector } => {
-                Ok(BoundVcpuExit::Defer(DeferredRunWork::InterruptEnd {
-                    vector,
-                }))
+                if let Some(vector) = vector {
+                    irq::inject_pending_ioapic_irq_after_eoi(vm, vcpu, vector);
+                }
+                Ok(VcpuExitAction::Complete(VcpuRunAction::default()))
             }
             X86VmExit::Halt => {
                 debug!("VM[{}] run VCpu[{}] Halt", vm.id(), vcpu.id());
-                Ok(BoundVcpuExit::Complete(x86_halt_action()))
+                Ok(VcpuExitAction::Complete(x86_halt_action()))
             }
             X86VmExit::SystemDown => {
                 warn!("VM[{}] run VCpu[{}] SystemDown", vm.id(), vcpu.id());
-                Ok(BoundVcpuExit::Complete(VcpuRunAction {
+                Ok(VcpuExitAction::Complete(VcpuRunAction {
                     waits_for_event: false,
                     stop_reason: Some(StopReason::SystemDown),
                     resets_vm: false,
@@ -253,27 +256,15 @@ impl ArchOps for X86_64Arch {
                     vm.id(),
                     vcpu.id()
                 );
-                Ok(BoundVcpuExit::Complete(VcpuRunAction {
+                Ok(VcpuExitAction::Complete(VcpuRunAction {
                     waits_for_event: false,
                     stop_reason: None,
                     resets_vm: false,
                     exits_vcpu: false,
                 }))
             }
-            X86VmExit::Nothing => Ok(BoundVcpuExit::Continue),
-            _ => Err(AxVmError::unsupported(
-                "handle x86 VM exit",
-                "unsupported VM exit reason",
-            )),
+            X86VmExit::Nothing => Ok(VcpuExitAction::Continue),
         }
-    }
-
-    fn finish_deferred_run_work(
-        vm: &crate::AxVMRef,
-        vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
-        work: Self::DeferredRunWork,
-    ) -> AxVmResult<VcpuRunAction> {
-        exit::finish(vm, vcpu, work)
     }
 }
 
@@ -376,9 +367,18 @@ impl X86VlapicHostOps for AxvmX86HostOps {
         deadline_nanos: u64,
         mut callback: X86TimerCallback,
     ) -> X86VlapicResult<Self::TimerHandle> {
-        let (vm_id, vcpu_id) =
-            with_current_vcpu::<AxvmX86Vcpu, _>(|vcpu| vcpu.map(|vcpu| (vcpu.vm_id(), vcpu.id())))
-                .ok_or(X86VlapicError::TimerUnavailable)?;
+        let bound_identity =
+            with_current_vcpu::<AxvmX86Vcpu, _>(|vcpu| vcpu.map(|vcpu| (vcpu.vm_id(), vcpu.id())));
+        // Local APIC exits are completed after the backend binding is released.
+        // The scheduler task remains the authoritative vCPU identity in that phase.
+        let task_identity = || {
+            let current = crate::host::task::current_thread();
+            let task = current.try_as_vcpu_task()?;
+            Some((task.vcpu.vm_id(), task.vcpu.id()))
+        };
+        let (vm_id, vcpu_id) = bound_identity
+            .or_else(task_identity)
+            .ok_or(X86VlapicError::TimerUnavailable)?;
         let (deferred_kick, vcpu_kick) = manager::with_vm(vm_id, |vm| {
             let deferred = irq::vcpu_kick_for_vm(vm)?;
             let runtime = vm.runtime_handle().ok()?;
@@ -557,34 +557,6 @@ fn dispatch_pit_interrupt(
 }
 
 impl X86HostOps for AxvmX86HostOps {
-    fn alloc_frame() -> Option<X86HostPhysAddr> {
-        default_host()
-            .alloc_frame()
-            .map(|addr| X86HostPhysAddr::from_usize(addr.as_usize()))
-    }
-
-    fn dealloc_frame(paddr: X86HostPhysAddr) {
-        default_host().dealloc_frame(axvm_types::HostPhysAddr::from(paddr.as_usize()));
-    }
-
-    fn alloc_contiguous_frames(frame_count: usize, frame_align: usize) -> Option<X86HostPhysAddr> {
-        default_host()
-            .alloc_contiguous_frames(frame_count, frame_align)
-            .map(|addr| X86HostPhysAddr::from_usize(addr.as_usize()))
-    }
-
-    fn dealloc_contiguous_frames(start_paddr: X86HostPhysAddr, frame_count: usize) {
-        default_host().dealloc_contiguous_frames(
-            axvm_types::HostPhysAddr::from(start_paddr.as_usize()),
-            frame_count,
-        );
-    }
-
-    fn phys_to_virt(paddr: X86HostPhysAddr) -> X86HostVirtAddr {
-        let vaddr = default_host().phys_to_virt(axvm_types::HostPhysAddr::from(paddr.as_usize()));
-        X86HostVirtAddr::from_usize(vaddr.as_usize())
-    }
-
     fn read_guest_u8(paddr: X86GuestPhysAddr) -> X86VcpuResult<u8> {
         let vm_id = with_current_vcpu::<AxvmX86Vcpu, _>(|vcpu| vcpu.map(|vcpu| vcpu.vm_id()))
             .ok_or(X86VcpuError::BadState)?;
@@ -643,7 +615,7 @@ impl<T> PendingCompletion<T> {
 }
 
 pub(crate) struct AxvmX86Vcpu(
-    X86Vcpu<AxvmX86HostOps>,
+    X86Vcpu<AxvmX86HostOps, control_memory::ControlPages>,
     PendingCompletion<X86PortIoStringExit>,
 );
 
@@ -692,8 +664,37 @@ impl VmArchVcpuOps for AxvmX86Vcpu {
     type Exit = X86VmExit;
 
     fn new(vm_id: VMId, vcpu_id: VCpuId, config: Self::CreateConfig) -> BackendResult<Self> {
-        x86_result(X86Vcpu::new_with_config(vm_id, vcpu_id, config))
-            .map(|vcpu| Self(vcpu, PendingCompletion::default()))
+        use ax_cpu::virtualization::{SvmControlMemory, VcpuControlMemory, VmxControlMemory};
+        use control_memory::ControlPages;
+        let memory = match x86_result(crate::arch::x86_64::policy::selected_nested_paging_format())?
+        {
+            X86NestedPagingFormat::Ept => VcpuControlMemory::Vmx(VmxControlMemory {
+                vmcs: ControlPages::allocate(1)?,
+                io_bitmap_a: ControlPages::allocate(1)?,
+                io_bitmap_b: ControlPages::allocate(1)?,
+                msr_bitmap: ControlPages::allocate(1)?,
+            }),
+            X86NestedPagingFormat::Npt => VcpuControlMemory::Svm(SvmControlMemory {
+                guest: ControlPages::allocate(1)?,
+                host: ControlPages::allocate(1)?,
+                io_permissions: ControlPages::allocate(3)?,
+                msr_permissions: ControlPages::allocate(2)?,
+            }),
+        };
+        // SAFETY: VM construction executes at ring 0 on an initialized CPU.
+        // The CPU backend revalidates this layout on every pinned binding.
+        let layout = unsafe { ax_cpu::virtualization::XstateLayout::current() };
+        let pages = layout.byte_len().div_ceil(4096);
+        let xstate = ax_cpu::virtualization::GuestXstate::new(
+            layout,
+            ControlPages::allocate(pages)?,
+            ControlPages::allocate(pages)?,
+        )
+        .map_err(|_| VmBackendError::InvalidInput)?;
+        x86_result(X86Vcpu::new_with_config(
+            vm_id, vcpu_id, config, memory, xstate,
+        ))
+        .map(|vcpu| Self(vcpu, PendingCompletion::default()))
     }
 
     fn set_entry(&mut self, entry: GuestPhysAddr) -> BackendResult {
@@ -717,10 +718,12 @@ impl VmArchVcpuOps for AxvmX86Vcpu {
     }
 
     fn bind(&mut self) -> BackendResult {
+        let _irqs = IrqSaveGuard::new();
         x86_result(self.0.bind())
     }
 
     fn unbind(&mut self) -> BackendResult {
+        let _irqs = IrqSaveGuard::new();
         x86_result(self.0.unbind())
     }
 
@@ -759,11 +762,27 @@ const fn x86_interrupt_is_level_triggered(trigger: InterruptTriggerMode) -> bool
     }
 }
 
-pub(crate) struct AxvmX86PerCpu(X86PerCpuState<AxvmX86HostOps>);
+pub(crate) struct AxvmX86PerCpu(ax_cpu::virtualization::PerCpu<control_memory::ControlPages>);
 
 impl VmArchPerCpuOps for AxvmX86PerCpu {
-    fn new(cpu_id: usize) -> BackendResult<Self> {
-        x86_result(X86PerCpuState::new(cpu_id)).map(Self)
+    fn new(_cpu_id: usize) -> BackendResult<Self> {
+        let memory = control_memory::ControlPages::allocate(1)?;
+        let cpu =
+            ax_cpu::virtualization::PerCpu::new(memory).map_err(|_| BackendError::Unsupported)?;
+        let format = x86_result(crate::arch::x86_64::policy::selected_nested_paging_format())?;
+        if !matches!(
+            (cpu.backend(), format),
+            (
+                ax_cpu::virtualization::Backend::Vmx,
+                X86NestedPagingFormat::Ept
+            ) | (
+                ax_cpu::virtualization::Backend::Svm,
+                X86NestedPagingFormat::Npt
+            )
+        ) {
+            return Err(BackendError::Unsupported);
+        }
+        Ok(Self(cpu))
     }
 
     fn is_enabled(&self) -> bool {
@@ -771,11 +790,22 @@ impl VmArchPerCpuOps for AxvmX86PerCpu {
     }
 
     fn hardware_enable(&mut self) -> BackendResult {
-        x86_result(self.0.hardware_enable())
+        let _irqs = IrqSaveGuard::new();
+        // SAFETY: AxVM's per-CPU initialization owns this physical CPU before
+        // guests can be scheduled. Its prepared control lease stays with self.
+        unsafe {
+            if self.0.backend() == ax_cpu::virtualization::Backend::Vmx {
+                ax_cpu::boot::authorize_vmx().map_err(|_| BackendError::Unsupported)?;
+            }
+            self.0.enable().map_err(|_| BackendError::InvalidState)
+        }
     }
 
     fn hardware_disable(&mut self) -> BackendResult {
-        x86_result(self.0.hardware_disable())
+        let _irqs = IrqSaveGuard::new();
+        // SAFETY: AxVM retires every guest binding on this CPU before teardown.
+        // A failure keeps the hardware owner and its memory lease active.
+        unsafe { self.0.disable() }.map_err(|_| BackendError::InvalidState)
     }
 }
 
@@ -788,12 +818,21 @@ pub(crate) fn ioapic_model(vm_id: usize, base: usize, length: usize) -> Arc<dyn 
     })
 }
 
+pub(crate) fn unassigned_mmio_model(base: usize, length: usize) -> Arc<dyn DeviceModel> {
+    Arc::new(X86UnassignedMmioModel { base, length })
+}
+
 pub(crate) fn pit_model(vm_id: usize) -> Arc<dyn DeviceModel> {
     Arc::new(X86PitModel { vm_id })
 }
 
 struct X86IoApicModel {
     vm_id: usize,
+    base: usize,
+    length: usize,
+}
+
+struct X86UnassignedMmioModel {
     base: usize,
     length: usize,
 }
@@ -1027,6 +1066,29 @@ impl DeviceModel for X86IoApicModel {
     }
 }
 
+impl DeviceModel for X86UnassignedMmioModel {
+    fn requirements(&self) -> DeviceManagerResult<DeviceRequirements> {
+        fixed_mmio_declaration(self.base, self.length, "declare x86 unassigned MMIO window")
+    }
+
+    fn firmware(&self) -> DeviceFirmwareSpec {
+        DeviceFirmwareSpec::None
+    }
+
+    fn build(&self, context: &mut DeviceBuildContext<'_>) -> DeviceManagerResult<DeviceBundle> {
+        let (base, length) = consume_mmio_config(
+            context,
+            self.base,
+            self.length,
+            "build x86 unassigned MMIO window",
+        )?;
+        let device = axdevice::X86UnassignedMmioDevice::new(base as u64, length as u64)?;
+        Ok(DeviceBundle::from_registration(DeviceRegistration::Device(
+            Arc::new(device),
+        )))
+    }
+}
+
 struct X86PitModel {
     vm_id: usize,
 }
@@ -1136,28 +1198,30 @@ fn declaration_range_error(operation: &'static str) -> DeviceManagerError {
 }
 
 pub(crate) fn x86_apic_access_page_addr() -> AxVmResult<axvm_types::HostPhysAddr> {
-    x86_result(x86_vcpu::apic_access_page_addr::<AxvmX86HostOps>())
-        .map(|addr| axvm_types::HostPhysAddr::from(addr.as_usize()))
-        .map_err(|error| AxVmError::vcpu("get x86 APIC access page", error))
+    x86_result(crate::arch::x86_64::policy::apic_access_page_addr::<
+        AxvmX86HostOps,
+    >())
+    .map(|addr| axvm_types::HostPhysAddr::from(addr.as_usize()))
+    .map_err(|error| AxVmError::vcpu("get x86 APIC access page", error))
 }
 
 pub(crate) fn x86_apic_access_page_gpa() -> AxVmResult<axvm_types::GuestPhysAddr> {
-    x86_result(x86_vcpu::apic_access_page_gpa())
+    x86_result(crate::arch::x86_64::policy::apic_access_page_gpa())
         .map(|addr| axvm_types::GuestPhysAddr::from(addr.as_usize()))
         .map_err(|error| AxVmError::vcpu("get x86 APIC access page", error))
 }
 
 pub(crate) fn x86_requires_apic_access_page() -> AxVmResult<bool> {
-    x86_result(x86_vcpu::requires_apic_access_page())
+    x86_result(crate::arch::x86_64::policy::requires_apic_access_page())
         .map_err(|error| AxVmError::vcpu("check x86 APIC access page", error))
 }
 
 fn handle_x86_nested_page_fault(
     vm: &crate::AxVMRef,
     exit: NestedPageFaultExit,
-) -> AxVmResult<BoundVcpuExit<DeferredRunWork>> {
+) -> AxVmResult<VcpuExitAction> {
     if vm.handle_nested_page_fault(exit.addr, exit.access_flags) {
-        Ok(BoundVcpuExit::Continue)
+        Ok(VcpuExitAction::Continue)
     } else {
         warn!(
             "VM[{}] unhandled x86 nested page fault at {:#x}, access={:?}",
@@ -1165,7 +1229,7 @@ fn handle_x86_nested_page_fault(
             exit.addr.as_usize(),
             exit.access_flags
         );
-        Ok(BoundVcpuExit::Complete(VcpuRunAction {
+        Ok(VcpuExitAction::Complete(VcpuRunAction {
             waits_for_event: false,
             stop_reason: None,
             resets_vm: false,

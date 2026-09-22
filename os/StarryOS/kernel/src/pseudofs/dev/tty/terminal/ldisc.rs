@@ -446,7 +446,6 @@ enum Processor<R, W> {
 pub struct LineDiscipline<R, W> {
     terminal: Arc<Terminal>,
     buf_rx: CachingCons<ReadBuf>,
-    injected_input: VecDeque<u8>,
     input_ready: Arc<PollSet>,
     worker_source: Arc<PollSet>,
     eof_ready: Arc<AtomicBool>,
@@ -475,8 +474,8 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         input_ready: Arc<PollSet>,
         worker_source: Arc<PollSet>,
     ) {
-        crate::task::spawn_kernel_thread(
-            move || {
+        crate::task::kernel_thread_builder("tty-reader".into())
+            .spawn(move || {
                 let mut registrar = None::<PollRegistrar<ExclusiveConsumer>>;
                 block_on(poll_fn(|cx| {
                     if let Some(registrar) = registrar.as_mut() {
@@ -495,9 +494,8 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                     Self::drive_input(&reader, input_ready.as_ref());
                     Poll::<()>::Pending
                 }))
-            },
-            "tty-reader".into(),
-        );
+            })
+            .expect("failed to spawn kernel thread");
     }
 
     pub fn new(terminal: Arc<Terminal>, config: TtyConfig<R, W>) -> Self {
@@ -549,7 +547,6 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         Self {
             terminal,
             buf_rx,
-            injected_input: VecDeque::new(),
             input_ready,
             worker_source,
             eof_ready,
@@ -569,7 +566,6 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                 self.buf_rx.clear();
             }
         }
-        self.injected_input.clear();
         self.eof_ready.store(false, Ordering::Release);
         Ok(())
     }
@@ -583,12 +579,6 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         writer.discard_output()
     }
 
-    pub fn inject_input(&mut self, input: &[u8]) {
-        self.injected_input.extend(input);
-        // Injected bytes are visible before waking readers.
-        unsafe { self.input_ready.wake(IoEvents::IN) };
-    }
-
     pub fn poll_read(&mut self) -> bool {
         // Peer writer fully closed (Passive mode) → report readable so poll()
         // wakes and the caller's read() observes EOF / POLLHUP instead of
@@ -600,7 +590,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         if let Processor::Passive(reader, _) = &mut self.processor {
             reader.poll();
         }
-        if writer_closed || !self.injected_input.is_empty() {
+        if writer_closed {
             return true;
         }
         let term = self.terminal.termios.lock().clone();
@@ -625,18 +615,6 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
     pub fn read(&mut self, buf: &mut [u8]) -> StarryResult<usize> {
         if buf.is_empty() {
             return Ok(0);
-        }
-        if !self.injected_input.is_empty() {
-            let mut read = 0;
-            for slot in buf.iter_mut() {
-                if let Some(byte) = self.injected_input.pop_front() {
-                    *slot = byte;
-                    read += 1;
-                } else {
-                    break;
-                }
-            }
-            return Ok(read);
         }
         if let Processor::Passive(reader, _) = &mut self.processor {
             reader.poll();
@@ -1070,26 +1048,6 @@ mod tests {
         assert_eq!(bytes.load(Ordering::Relaxed), 6);
         assert!(echo.queue.lock().is_empty());
         assert!(calls.load(Ordering::Relaxed) >= 2);
-    }
-
-    #[test]
-    fn injected_input_is_readable_immediately() {
-        let mut ldisc = LineDiscipline::new(
-            Arc::new(Terminal::default()),
-            TtyConfig {
-                reader: MockReader::new(Vec::new()),
-                writer: MockWriter,
-                process_mode: ProcessMode::Passive(Arc::new(PollSet::new())),
-            },
-        );
-
-        ldisc.inject_input(b"\x1b[1;1R");
-
-        assert!(ldisc.poll_read(), "injected bytes must make tty readable");
-
-        let mut buf = [0; 6];
-        assert_eq!(ldisc.read(&mut buf).unwrap(), 6);
-        assert_eq!(&buf, b"\x1b[1;1R");
     }
 
     #[test]

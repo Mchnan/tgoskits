@@ -9,13 +9,10 @@ use anyhow::{Context, bail, ensure};
 use crate::{
     starry::test::starry_case_asset_config,
     test::{
-        build::prepare_c_case_overlay_sync,
-        case::{TestQemuCase, board_case_asset_layout},
+        build::{prepare_c_case_overlay_sync, prepare_rust_case_overlay_sync},
+        case::{CasePipeline, TestQemuCase, board_case_asset_layout, resolve_case_pipeline},
     },
 };
-
-const C_SOURCE_DIR: &str = "c";
-const CMAKE_PROJECT_FILE: &str = "CMakeLists.txt";
 
 #[derive(Debug)]
 pub(in crate::starry) struct PreparedBoardSessionAssets {
@@ -23,52 +20,65 @@ pub(in crate::starry) struct PreparedBoardSessionAssets {
     pub(crate) relative_paths: Vec<PathBuf>,
 }
 
+pub(in crate::starry) struct BoardSessionAssetRequest<'a> {
+    pub(crate) workspace_root: &'a Path,
+    pub(crate) target_dir: &'a Path,
+    pub(crate) arch: &'a str,
+    pub(crate) target: &'a str,
+    pub(crate) case_name: &'a str,
+    pub(crate) case_dir: &'a Path,
+    pub(crate) board_config_path: &'a Path,
+    pub(crate) declared_session_files: &'a [PathBuf],
+}
+
 pub(crate) async fn prepare_board_session_assets(
-    workspace_root: &Path,
-    arch: &str,
-    target: &str,
-    case_name: &str,
-    case_dir: &Path,
-    board_config_path: &Path,
-    declared_session_files: &[PathBuf],
+    request: BoardSessionAssetRequest<'_>,
 ) -> anyhow::Result<Option<PreparedBoardSessionAssets>> {
-    let cmake_project = case_dir.join(C_SOURCE_DIR).join(CMAKE_PROJECT_FILE);
-    if !cmake_project.is_file() {
-        return Ok(None);
-    }
-    for unsupported_dir in ["sh", "python"] {
-        ensure!(
-            !case_dir.join(unsupported_dir).exists(),
-            "board case `{case_name}` combines C assets with unsupported `{unsupported_dir}` \
-             assets"
-        );
-    }
+    let BoardSessionAssetRequest {
+        workspace_root,
+        target_dir,
+        arch,
+        target,
+        case_name,
+        case_dir,
+        board_config_path,
+        declared_session_files,
+    } = request;
+    let case = TestQemuCase {
+        name: case_name.to_string(),
+        display_name: case_name.to_string(),
+        case_dir: case_dir.to_path_buf(),
+        qemu_config_path: board_config_path.to_path_buf(),
+        test_commands: Vec::new(),
+        grouped_command_selection: Default::default(),
+        host_symbolize_success_regex: Vec::new(),
+        host_http_server: None,
+        subcases: Vec::new(),
+        grouped_subcase_filter: None,
+    };
+    let prepare_overlay = match resolve_case_pipeline(&case)? {
+        CasePipeline::Plain => return Ok(None),
+        CasePipeline::C => prepare_c_case_overlay_sync,
+        CasePipeline::Rust => prepare_rust_case_overlay_sync,
+        pipeline => bail!(
+            "board case `{case_name}` does not support {} assets",
+            pipeline.as_str()
+        ),
+    };
 
     let rootfs =
-        crate::starry::rootfs::ensure_rootfs_in_tmp_dir(workspace_root, arch, target).await?;
-    let workspace_root = workspace_root.to_path_buf();
+        crate::starry::rootfs::ensure_rootfs_in_tmp_dir(workspace_root, target_dir, arch, target)
+            .await?;
+    let target_dir = target_dir.to_path_buf();
     let arch = arch.to_string();
     let target = target.to_string();
     let case_name = case_name.to_string();
     let case_dir = case_dir.to_path_buf();
-    let board_config_path = board_config_path.to_path_buf();
     let declared_session_files = declared_session_files.to_vec();
 
     let assets = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let layout = board_case_asset_layout(&workspace_root, &target, &case_name)?;
-        let case = TestQemuCase {
-            name: case_name.clone(),
-            display_name: case_name,
-            case_dir: case_dir.clone(),
-            qemu_config_path: board_config_path,
-            test_commands: Vec::new(),
-            grouped_command_selection: Default::default(),
-            host_symbolize_success_regex: Vec::new(),
-            host_http_server: None,
-            subcases: Vec::new(),
-            grouped_subcase_filter: None,
-        };
-        prepare_c_case_overlay_sync(&arch, &case, &rootfs, &layout, &starry_case_asset_config())?;
+        let layout = board_case_asset_layout(&target_dir, &target, &case_name)?;
+        prepare_overlay(&arch, &case, &rootfs, &layout, &starry_case_asset_config())?;
         copy_declared_session_files(&case_dir, &layout.overlay_dir, &declared_session_files)?;
         let relative_paths = collect_upload_paths(&layout.overlay_dir)?;
         Ok(PreparedBoardSessionAssets {
@@ -133,7 +143,7 @@ pub(in crate::starry) fn copy_declared_session_files(
         let destination = upload_root.join(relative_path);
         match fs::symlink_metadata(&destination) {
             Ok(_) => bail!(
-                "declared session file `{}` conflicts with a CMake install product",
+                "declared session file `{}` conflicts with a built asset",
                 relative_path.display()
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -201,7 +211,7 @@ pub(in crate::starry) fn collect_upload_paths(upload_root: &Path) -> anyhow::Res
     relative_paths.sort();
     ensure!(
         !relative_paths.is_empty(),
-        "board CMake install produced no files in upload root `{}`",
+        "board asset preparation produced no files in upload root `{}`",
         upload_root.display()
     );
     Ok(relative_paths)

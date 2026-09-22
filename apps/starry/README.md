@@ -46,6 +46,21 @@ cargo xtask starry app board -t iperf3 -b OrangePi-5-Plus
 
 See `iperf3/README.md` for the fixed T01--T07 profile.
 
+## AArch64 Linux perf
+
+`linux-perf` 应用在 AArch64 QEMU 和 OrangePi 5 Plus 的 StarryOS 客户机内运行
+Alpine 上游 `perf 6.19.14`，验证 `perf_event_open`、采样 ring、用户 FP 调用链、
+system-wide record，以及实体板卡的 PMUv3 事件。宿主机的 `tools/qperf` 则分析
+QEMU translation blocks，两者的计数来源和验收目标不同。
+
+```bash
+cargo xtask starry app qemu -t linux-perf --arch aarch64
+cargo xtask starry app board -t linux-perf -b OrangePi-5-Plus
+```
+
+锁定的 Alpine 依赖闭包及 QEMU、实体板卡各自的验收边界见
+`linux-perf/README.md`。
+
 ## Resource Monitor
 
 The `resource-monitor` case provides an offline user-space collector and a static
@@ -67,14 +82,14 @@ The `picoclaw-cli` case is an opt-in StarryOS x86_64 QEMU workflow for checking
 PicoClaw compatibility in three stages: offline CLI smoke, online agent request,
 and gateway service smoke. It also provides an interactive StarryOS shell for
 manual PicoClaw use. It prepares local-only release assets and rootfs images
-under `target/picoclaw/` and `tmp/axbuild/rootfs/`.
+under `target/picoclaw/` and `target/axbuild/rootfs/`.
 
 ```bash
 apps/starry/picoclaw-cli/prepare_picoclaw_rootfs.sh
 cargo xtask starry qemu \
   --arch x86_64 \
   --qemu-config apps/starry/picoclaw-cli/qemu-x86_64-picoclaw-offline.toml \
-  --rootfs tmp/axbuild/rootfs/rootfs-x86_64-picoclaw.img
+  --rootfs target/axbuild/rootfs/rootfs-x86_64-picoclaw.img
 ```
 
 See `picoclaw-cli/README.md` for the online agent, gateway, and interactive
@@ -115,7 +130,7 @@ qemu-system-aarch64 \
   -m 512M \
   -smp 1 \
   -device nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65 \
-  -drive id=disk0,if=none,format=raw,file=tmp/axbuild/rootfs/rootfs-aarch64-alpine.img,file.locking=off \
+  -drive id=disk0,if=none,format=raw,file=target/axbuild/rootfs/rootfs-aarch64-alpine.img,file.locking=off \
   -kernel target/starry-macos-selfbuild/uploaded/starryos-aarch64-unknown-none-softfloat.bin \
   -netdev user,id=net0
 ```
@@ -204,7 +219,7 @@ apps/starry/jcode/prepare_jcode_rootfs.sh
 cargo xtask starry qemu \
   --arch x86_64 \
   --qemu-config apps/starry/jcode/qemu-x86_64.toml \
-  --rootfs tmp/axbuild/rootfs/rootfs-x86_64-jcode.img
+  --rootfs target/axbuild/rootfs/rootfs-x86_64-jcode.img
 ```
 
 See `jcode/README.md` for interactive usage and troubleshooting.

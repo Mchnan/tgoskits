@@ -5,7 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::{
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -17,7 +17,7 @@ use strum::FromRepr;
 
 use super::PidIdentity;
 use crate::{
-    sync::{Mutex, SpinLock},
+    sync::{Mutex, RawSpinLock},
     task::poll_process_timer_for_alarm,
 };
 
@@ -34,8 +34,7 @@ pub use alarm::{AlarmTarget, notify_realtime_clock_changed, spawn_alarm_task};
 use common::time_value_from_nanos;
 pub(crate) use itimer::{ITimerSetting, PendingTimerActions, SetITimerOutcome};
 pub use itimer::{ITimerType, ProcessTimerManager};
-pub(crate) use rttime::RttimeLimitAction;
-pub use rttime::RttimeWatchdog;
+pub(crate) use rttime::{RttimeLimitAction, check_realtime_tick_limit};
 
 #[cfg(all(test, axtest))]
 mod axtest;

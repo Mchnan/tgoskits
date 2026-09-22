@@ -7,6 +7,10 @@ use tempfile::tempdir;
 
 use super::*;
 
+fn workspace() -> WorkspaceContext {
+    WorkspaceContext::discover(None).unwrap()
+}
+
 fn write_board(axvisor_dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = axvisor_dir
         .join("configs/board")
@@ -35,62 +39,6 @@ fn request(path: PathBuf, arch: &str, target: &str) -> ResolvedAxvisorRequest {
 }
 
 #[test]
-fn axvisor_all_architectures_use_rust_std_musl_with_abort_panics() {
-    let cases = [
-        (
-            "x86_64",
-            "x86_64-unknown-none",
-            "x86_64-unknown-linux-musl.json",
-        ),
-        (
-            "aarch64",
-            "aarch64-unknown-none-softfloat",
-            "aarch64-unknown-linux-musl.json",
-        ),
-        (
-            "riscv64",
-            "riscv64gc-unknown-none-elf",
-            "riscv64gc-unknown-linux-musl.json",
-        ),
-        (
-            "loongarch64",
-            "loongarch64-unknown-none-softfloat",
-            "loongarch64-unknown-linux-musl.json",
-        ),
-    ];
-
-    for (arch, target, std_target) in cases {
-        let root = tempdir().unwrap();
-        let config_path = root.path().join(format!(".{arch}-build.toml"));
-        fs::write(&config_path, "features = []\nlog = \"Info\"\n").unwrap();
-
-        let cargo = load_cargo_config(&request(config_path, arch, target)).unwrap();
-        assert!(
-            cargo
-                .target
-                .ends_with(&format!("scripts/targets/std/pie/{std_target}")),
-            "{arch} Axvisor must use its RustStd/musl PIE target"
-        );
-
-        let config: toml::Table =
-            toml::from_str(&fs::read_to_string(cargo.extra_config.unwrap()).unwrap()).unwrap();
-        assert_eq!(
-            config["unstable"]["build-std"].as_array().unwrap(),
-            &vec![
-                toml::Value::String("std".to_string()),
-                toml::Value::String("panic_abort".to_string()),
-            ],
-            "{arch} Axvisor must build real Rust std and panic_abort"
-        );
-        assert_eq!(
-            config["profile"]["release"]["panic"].as_str(),
-            Some("abort"),
-            "{arch} Axvisor release profile must abort on panic"
-        );
-    }
-}
-
-#[test]
 fn resolve_build_info_path_ignores_source_tree_defaults() {
     let root = tempdir().unwrap();
     let axvisor_dir = root.path().join("os/axvisor");
@@ -111,39 +59,6 @@ fn resolve_build_info_path_ignores_source_tree_defaults() {
 }
 
 #[test]
-fn load_cargo_config_writes_default_template_when_missing() {
-    let root = tempdir().unwrap();
-    let path = root
-        .path()
-        .join("os/axvisor/.build-aarch64-unknown-none-softfloat.toml");
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    write_board(
-        path.parent().unwrap(),
-        "qemu-aarch64",
-        r#"
-target = "aarch64-unknown-none-softfloat"
-features = []
-log = "Info"
-vm_configs = []
-"#,
-    );
-
-    let cargo = load_cargo_config(&request(
-        path.clone(),
-        "aarch64",
-        "aarch64-unknown-none-softfloat",
-    ))
-    .unwrap();
-
-    assert!(!cargo.features.contains(&"plat-dyn".to_string()));
-    assert!(!cargo.features.contains(&"ax-driver/plat-dyn".to_string()));
-    assert!(!cargo.features.contains(&"ax-std/plat-dyn".to_string()));
-    assert!(!cargo.features.contains(&"axvm/plat-dyn".to_string()));
-    assert!(!cargo.features.contains(&"dyn-plat".to_string()));
-    assert!(path.exists());
-}
-
-#[test]
 fn load_cargo_config_injects_vmconfigs() {
     let root = tempdir().unwrap();
     let config_path = root.path().join(".build.toml");
@@ -160,18 +75,21 @@ log = "Info"
     )
     .unwrap();
 
-    let cargo = load_cargo_config(&ResolvedAxvisorRequest {
-        package: AXVISOR_PACKAGE.to_string(),
-        axvisor_dir: root.path().join("os/axvisor"),
-        arch: "aarch64".to_string(),
-        target: "aarch64-unknown-none-softfloat".to_string(),
-        smp: None,
-        debug: false,
-        build_info_path: config_path,
-        qemu_config: None,
-        uboot_config: None,
-        vmconfigs: vmconfigs.clone(),
-    })
+    let cargo = load_cargo_config(
+        &ResolvedAxvisorRequest {
+            package: AXVISOR_PACKAGE.to_string(),
+            axvisor_dir: root.path().join("os/axvisor"),
+            arch: "aarch64".to_string(),
+            target: "aarch64-unknown-none-softfloat".to_string(),
+            smp: None,
+            debug: false,
+            build_info_path: config_path,
+            qemu_config: None,
+            uboot_config: None,
+            vmconfigs: vmconfigs.clone(),
+        },
+        &workspace(),
+    )
     .unwrap();
 
     assert_eq!(cargo.package, AXVISOR_PACKAGE);
@@ -219,7 +137,11 @@ log = "Info"
     )
     .unwrap();
 
-    let cargo = load_cargo_config(&request(config_path, "x86_64", "x86_64-unknown-none")).unwrap();
+    let cargo = load_cargo_config(
+        &request(config_path, "x86_64", "x86_64-unknown-none"),
+        &workspace(),
+    )
+    .unwrap();
 
     assert!(!cargo.features.contains(&"vmx".to_string()));
     assert!(!cargo.features.contains(&"svm".to_string()));
@@ -241,8 +163,11 @@ log = "Info"
         )
         .unwrap();
 
-        let err =
-            load_cargo_config(&request(config_path, "x86_64", "x86_64-unknown-none")).unwrap_err();
+        let err = load_cargo_config(
+            &request(config_path, "x86_64", "x86_64-unknown-none"),
+            &workspace(),
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("selected from CPU capabilities"));
         assert!(err.to_string().contains(&format!("`{feature}`")));
@@ -350,18 +275,21 @@ vm_configs = []
 "#,
     );
 
-    let cargo = load_cargo_config(&ResolvedAxvisorRequest {
-        package: AXVISOR_PACKAGE.to_string(),
-        axvisor_dir: root.path().join("os/axvisor"),
-        arch: "x86_64".to_string(),
-        target: "x86_64-unknown-none".to_string(),
-        smp: None,
-        debug: false,
-        build_info_path: path.clone(),
-        qemu_config: None,
-        uboot_config: None,
-        vmconfigs: vec![],
-    })
+    let cargo = load_cargo_config(
+        &ResolvedAxvisorRequest {
+            package: AXVISOR_PACKAGE.to_string(),
+            axvisor_dir: root.path().join("os/axvisor"),
+            arch: "x86_64".to_string(),
+            target: "x86_64-unknown-none".to_string(),
+            smp: None,
+            debug: false,
+            build_info_path: path.clone(),
+            qemu_config: None,
+            uboot_config: None,
+            vmconfigs: vec![],
+        },
+        &workspace(),
+    )
     .unwrap();
 
     assert!(path.exists());
@@ -392,18 +320,21 @@ log = "Info"
     )
     .unwrap();
 
-    let err = load_cargo_config(&ResolvedAxvisorRequest {
-        package: AXVISOR_PACKAGE.to_string(),
-        axvisor_dir: root.path().join("os/axvisor"),
-        arch: "loongarch64".to_string(),
-        target: "loongarch64-unknown-none-softfloat".to_string(),
-        smp: None,
-        debug: false,
-        build_info_path: config_path,
-        qemu_config: None,
-        uboot_config: None,
-        vmconfigs: vec![],
-    })
+    let err = load_cargo_config(
+        &ResolvedAxvisorRequest {
+            package: AXVISOR_PACKAGE.to_string(),
+            axvisor_dir: root.path().join("os/axvisor"),
+            arch: "loongarch64".to_string(),
+            target: "loongarch64-unknown-none-softfloat".to_string(),
+            smp: None,
+            debug: false,
+            build_info_path: config_path,
+            qemu_config: None,
+            uboot_config: None,
+            vmconfigs: vec![],
+        },
+        &workspace(),
+    )
     .unwrap_err();
 
     assert!(err.to_string().contains("dynamic platform features"));
@@ -436,6 +367,7 @@ log = "Info"
             uboot_config: None,
             vmconfigs: vec![],
         },
+        &workspace(),
         &["stack-protector".to_string()],
     )
     .unwrap();

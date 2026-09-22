@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::io::prelude::*;
-use std::string::ToString;
+use std::string::{String, ToString};
 
 #[cfg(feature = "browser-console")]
 use core::cell::Cell;
@@ -23,13 +23,28 @@ std::thread_local! {
     static NETWORK_OUTPUT_SELECTED: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Formats a text fragment submitted by the Axvisor shell.
+fn format_fragment(args: core::fmt::Arguments<'_>) -> String {
+    alloc::fmt::format(args)
+}
+
+/// Formats a complete text line submitted by the Axvisor shell.
+///
+/// The shared host-output queue preserves raw bytes because it also carries
+/// guest output. Shell-owned lines must therefore provide their own CRLF.
+fn format_line(args: core::fmt::Arguments<'_>) -> String {
+    let mut output = format_fragment(args);
+    output.push_str("\r\n");
+    output
+}
+
 fn submit_shell_fragment(args: core::fmt::Arguments<'_>) {
-    let output = axvisor::shell_support::format_fragment(args);
+    let output = format_fragment(args);
     submit_shell_bytes(output.as_bytes());
 }
 
 fn submit_shell_line(args: core::fmt::Arguments<'_>) {
-    let output = axvisor::shell_support::format_line(args);
+    let output = format_line(args);
     submit_shell_bytes(output.as_bytes());
 }
 
@@ -58,6 +73,9 @@ macro_rules! println {
 }
 
 mod command;
+mod completion;
+
+use completion::complete_line;
 
 use crate::guest_console::ConsoleInputEvent;
 use crate::shell::command::{
@@ -76,7 +94,7 @@ const MAX_LINE_LEN: usize = 256;
 enum InputState {
     Normal,
     Escape,
-    EscapeSeq,
+    EscapeSeq { parameter: u16, plain: bool },
 }
 
 fn print_shell_intro() {
@@ -192,6 +210,11 @@ pub fn console_init() {
 
         let dropped = crate::guest_console::take_host_log_drops();
         if let Some(record) = crate::guest_console::read_host_log() {
+            // Both branches route the consumed record back through the mux, which
+            // publishes a device-poll request for every backend whose ordered
+            // submission was rejected with `WouldBlock`. Keep them on the mux
+            // entry points so releasing one record's capacity always wakes the
+            // blocked VM, which is not necessarily the record's owner.
             if let Some(tag) = record.output_tag() {
                 if dropped.records != 0 {
                     route_pending_host_log(
@@ -273,6 +296,16 @@ pub fn console_init() {
             }
         };
 
+        // Cancellation also recovers from a truncated terminal sequence.
+        if ch == 3 {
+            input_state = InputState::Normal;
+            cursor = 0;
+            line_len = 0;
+            println!("^C");
+            print_prompt();
+            continue;
+        }
+
         match input_state {
             InputState::Normal => {
                 match ch {
@@ -299,7 +332,7 @@ pub fn console_init() {
                         }
                     }
                     BS | DL => {
-                        // backspace: delete character before cursor / DEL key: delete character at cursor
+                        // Both terminal backspace encodings delete before the cursor.
                         if cursor > 0 {
                             // move characters after cursor forward
                             for i in cursor..line_len {
@@ -316,6 +349,34 @@ pub fn console_init() {
                             let prompt = prompt_string();
                             redraw_shell_line(&prompt, current_content, cursor);
                         }
+                    }
+                    1 | 5 | 11 | 21 | 23 => {
+                        match ch {
+                            1 => cursor = 0,
+                            5 => cursor = line_len,
+                            11 => line_len = cursor,
+                            21 => {
+                                cursor = 0;
+                                line_len = 0;
+                            }
+                            23 => {
+                                let end = cursor;
+                                while cursor > 0 && buf[cursor - 1].is_ascii_whitespace() {
+                                    cursor -= 1;
+                                }
+                                while cursor > 0 && !buf[cursor - 1].is_ascii_whitespace() {
+                                    cursor -= 1;
+                                }
+                                buf.copy_within(end..line_len, cursor);
+                                line_len -= end - cursor;
+                            }
+                            _ => unreachable!(),
+                        }
+                        let content = std::str::from_utf8(&buf[..line_len]).unwrap_or("");
+                        redraw_shell_line(&prompt_string(), content, cursor);
+                    }
+                    b'\t' => {
+                        complete_line(&mut buf, &mut line_len, &mut cursor);
                     }
                     ESC => {
                         input_state = InputState::Escape;
@@ -343,15 +404,53 @@ pub fn console_init() {
                 }
             }
             InputState::Escape => match ch {
-                b'[' => {
-                    input_state = InputState::EscapeSeq;
+                b'[' | b'O' => {
+                    input_state = InputState::EscapeSeq {
+                        parameter: 0,
+                        plain: true,
+                    };
                 }
                 _ => {
                     input_state = InputState::Normal;
                 }
             },
-            InputState::EscapeSeq => {
-                match ch {
+            InputState::EscapeSeq {
+                mut parameter,
+                mut plain,
+            } => {
+                // Consume the entire CSI, including unsupported mouse reports and
+                // overlong parameters, before accepting printable input again.
+                if (0x20..=0x3f).contains(&ch) {
+                    if ch.is_ascii_digit() && plain {
+                        match parameter
+                            .checked_mul(10)
+                            .and_then(|n| n.checked_add((ch - b'0') as u16))
+                        {
+                            Some(value) => parameter = value,
+                            None => plain = false,
+                        }
+                    } else {
+                        plain = false;
+                    }
+                    input_state = InputState::EscapeSeq { parameter, plain };
+                    continue;
+                }
+                input_state = if ch == ESC {
+                    InputState::Escape
+                } else {
+                    InputState::Normal
+                };
+                if !plain || !(0x40..=0x7e).contains(&ch) {
+                    continue;
+                }
+                let key = match (ch, parameter) {
+                    (b'~', 1 | 7) => b'H',
+                    (b'~', 4 | 8) => b'F',
+                    (b'~', 3) => b'~',
+                    (b'A' | b'B' | b'C' | b'D' | b'H' | b'F', 0 | 1) => ch,
+                    _ => continue,
+                };
+                match key {
                     b'A' => {
                         // UP arrow - previous command
                         if let Some(prev_cmd) = history.previous() {
@@ -411,11 +510,18 @@ pub fn console_init() {
                         }
                         input_state = InputState::Normal;
                     }
-                    b'3' => {
-                        // check if this is Delete key sequence (ESC[3~)
-                        // need to read next character to confirm
-                        input_state = InputState::Normal;
-                        // can add additional state to handle complete Delete sequence
+                    b'H' | b'F' | b'~' => {
+                        match key {
+                            b'H' => cursor = 0,
+                            b'F' => cursor = line_len,
+                            _ if cursor < line_len => {
+                                buf.copy_within(cursor + 1..line_len, cursor);
+                                line_len -= 1;
+                            }
+                            _ => {}
+                        }
+                        let content = std::str::from_utf8(&buf[..line_len]).unwrap_or("");
+                        redraw_shell_line(&prompt_string(), content, cursor);
                     }
                     _ => {
                         // ignore other escape sequences

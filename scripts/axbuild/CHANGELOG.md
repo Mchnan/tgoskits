@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.8.1...axbuild-v0.9.0) - 2026-09-21
+
+### Fixed
+
+- *(ci)* stabilize qemu and app test semantics ([#2461](https://github.com/rcore-os/tgoskits/pull/2461))
+
+### Other
+
+- *(axbuild)* move generated artifacts into Cargo target ([#2460](https://github.com/rcore-os/tgoskits/pull/2460))
+
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.8.0...axbuild-v0.8.1) - 2026-09-18
+
+### Added
+
+- *(vfs)* implement mutation credentials for directory operations an… ([#2287](https://github.com/rcore-os/tgoskits/pull/2287))
+- *(sysbench)* unify reproducible QEMU and board benchmarks ([#2395](https://github.com/rcore-os/tgoskits/pull/2395))
+- *(axvm)* support x86 virtio-blk file backends ([#2390](https://github.com/rcore-os/tgoskits/pull/2390))
+
+### Fixed
+
+- *(ax-net)* allow sleeping in Unix pathname socket operations ([#2443](https://github.com/rcore-os/tgoskits/pull/2443))
+- *(ax-fs-ng)* bound page-cache writeback ([#2427](https://github.com/rcore-os/tgoskits/pull/2427))
+- *(axvm)* reduce redundant vCPU scheduling and add board perf CI ([#2362](https://github.com/rcore-os/tgoskits/pull/2362))
+- *(axbuild)* retry image downloads on fresh connections ([#2410](https://github.com/rcore-os/tgoskits/pull/2410))
+- *(ci)* fix debugfs test execution and virtio input startup ([#2396](https://github.com/rcore-os/tgoskits/pull/2396))
+- *(starry)* align syscall and Unix socket semantics with Linux ([#2270](https://github.com/rcore-os/tgoskits/pull/2270))
+
+### Other
+
+- *(repo)* remove nonfunctional and redundant test assertions ([#2440](https://github.com/rcore-os/tgoskits/pull/2440))
+- *(starry)* simplify feature selection ([#2436](https://github.com/rcore-os/tgoskits/pull/2436))
+- *(sched)* reduce scheduler and futex hot-path overhead ([#2399](https://github.com/rcore-os/tgoskits/pull/2399))
+
+## [0.8.0](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.7.1...axbuild-v0.8.0) - 2026-09-13
+
+### Added
+
+- *(starry)* add AArch64 Linux perf support ([#2274](https://github.com/rcore-os/tgoskits/pull/2274))
+
+### Other
+
+- *(someboot)* publish Linux-style CPU capacity through topology ([#2386](https://github.com/rcore-os/tgoskits/pull/2386))
+
+## [0.7.1](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.7.0...axbuild-v0.7.1) - 2026-09-12
+
+### Fixed
+
+- *(ax-task)* allow per-CPU timer wakes during CPU deactivation ([#2382](https://github.com/rcore-os/tgoskits/pull/2382))
+
+## [0.7.0](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.6.1...axbuild-v0.7.0) - 2026-09-11
+
+### Added
+
+- *(axbuild)* reuse cross-tool wrappers for native binutils ([#2280](https://github.com/rcore-os/tgoskits/pull/2280))
+- *(virtio)* add synchronized VirtIO block PCI ramdisk ([#2070](https://github.com/rcore-os/tgoskits/pull/2070))
+- *(axloader)* move boot control to UEFI networking ([#2354](https://github.com/rcore-os/tgoskits/pull/2354))
+- *(axbuild)* support to_bin in ArceOS build configs and log bin path ([#2336](https://github.com/rcore-os/tgoskits/pull/2336))
+
+### Fixed
+
+- *(some-serial)* preserve PL011 RX interrupts and add a real QEMU regression ([#2328](https://github.com/rcore-os/tgoskits/pull/2328))
+- *(axbuild)* validate rootfs extraction and drop broken fakeroot wrap on non-Linux hosts ([#2279](https://github.com/rcore-os/tgoskits/pull/2279))
+- *(rknpu)* add timeout error handling and update ioctl error mapping ([#2324](https://github.com/rcore-os/tgoskits/pull/2324))
+
+### Other
+
+- Merge pull request #2374 from rcore-os/arm-blk
+- *(ax-task)* unify thread lifecycle and PREEMPT_RT lock semantics ([#2357](https://github.com/rcore-os/tgoskits/pull/2357))
+- *(axbuild)* drop non-functional tests that pin instance parameters ([#2371](https://github.com/rcore-os/tgoskits/pull/2371))
+- *(ax-cpu)* [**breaking**] centralize CPU mechanisms and architecture backends ([#2363](https://github.com/rcore-os/tgoskits/pull/2363))
+- *(axbuild)* migrate test execution to shell check steps ([#2361](https://github.com/rcore-os/tgoskits/pull/2361))
+
 ## [0.6.1](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.5.3...axbuild-v0.6.1) - 2026-09-09
 
 ### Added

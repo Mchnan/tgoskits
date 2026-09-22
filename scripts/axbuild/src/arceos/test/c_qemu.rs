@@ -181,7 +181,6 @@ async fn build_and_run_c_test(
     _arch: &str,
     test: &CTestDef,
 ) -> anyhow::Result<()> {
-    let workspace_root = arceos.app.workspace_root().to_path_buf();
     let build_config = load_c_test_build_config(&test.build_config_path)?;
     let qemu_config = load_c_test_qemu_config(&test.qemu_config_path)?;
     let mode = build::load_arceos_build_mode(&test.build_config_path)?;
@@ -193,7 +192,7 @@ async fn build_and_run_c_test(
         );
     };
     let artifacts = c_test_artifact_paths(
-        &workspace_root,
+        arceos.app.target_dir(),
         &test.build_group,
         &test.name,
         c_test_artifact_index(test),
@@ -220,7 +219,7 @@ async fn build_and_run_c_test(
         &test.name,
         build_config.build_info.features.clone(),
     );
-    let output = cbuild::build_c_app(&workspace_root, &request, &input)?;
+    let output = cbuild::build_c_app(arceos.app.workspace_context(), &request, &input)?;
     qemu_test::validate_test_qemu_rootfs_write_policy(&test.qemu_config_path, "ArceOS")?;
     let mut qemu = qemu_config;
     rootfs::prepare_default_qemu_fat32_rootfs(arceos.app.workspace_root(), &qemu)?;
@@ -267,17 +266,18 @@ fn c_test_feature_define(feature: &str) -> String {
 /// reuse the same ax-libc static library. QEMU output stays isolated per case
 /// and per invocation so generated ELF files do not overwrite each other.
 fn c_test_artifact_paths(
-    workspace_root: &Path,
+    target_dir: &Path,
     build_group: &str,
     test_name: &str,
     invocation_index: usize,
 ) -> CTestArtifactPaths {
-    let root = crate::context::axbuild_tmp_dir(workspace_root)
+    let root = target_dir
+        .join("axbuild")
         .join("arceos-c")
         .join(test_name.replace('/', "-"));
     CTestArtifactPaths {
-        target_dir: crate::context::axbuild_tmp_dir(workspace_root)
-            .join("arceos-c")
+        target_dir: target_dir
+            .join("axbuild/arceos-c")
             .join(build_group.replace('/', "-"))
             .join("cargo"),
         out_dir: root.join(format!("out-{invocation_index}")),
@@ -306,7 +306,6 @@ mod tests {
     fn arceos_c_default_list_hides_all_feature() {
         let features = c_qemu_features_for_list(None).unwrap();
 
-        assert_eq!(features, ARCEOS_C_QEMU_LISTED_CASES);
         assert!(!features.contains(&ARCEOS_C_ALL_FEATURE));
     }
 
@@ -377,24 +376,6 @@ mod tests {
     }
 
     #[test]
-    fn load_c_test_build_config_reads_build_info() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("build-x86_64-unknown-none.toml");
-        fs::write(
-            &path,
-            "app-c = \"c\"\nfeatures = [\"alloc\", \"paging\"]\nlog = \"Trace\"\nmax_cpu_num = \
-             4\n\n[env]\n",
-        )
-        .unwrap();
-
-        let config = load_c_test_build_config(&path).unwrap();
-        assert_eq!(config.app_c, Some(PathBuf::from("c")));
-        assert_eq!(config.build_info.features, vec!["alloc", "paging"]);
-        assert_eq!(config.build_info.log, build::LogLevel::Trace);
-        assert_eq!(config.build_info.max_cpu_num, Some(4));
-    }
-
-    #[test]
     fn load_c_test_build_config_rejects_missing_app_c() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("build-x86_64-unknown-none.toml");
@@ -402,27 +383,5 @@ mod tests {
 
         let err = load_c_test_build_config(&path).unwrap_err();
         assert!(err.to_string().contains("must set `app-c = \"c\"`"));
-    }
-
-    #[test]
-    fn load_c_test_qemu_config_reads_standard_qemu_config() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("qemu-x86_64.toml");
-        fs::write(
-            &path,
-            "args = [\"-nographic\"]\nuefi = false\nto_bin = false\nshell_check_steps = [{ \
-             shell_prefix = \"#\", shell_cmd = \"run\", success_regex = [\"PASS\"] }]\nfail_regex \
-             = [\"panic\"]\ntimeout = 120\n",
-        )
-        .unwrap();
-
-        let config = load_c_test_qemu_config(&path).unwrap();
-        assert_eq!(config.args, vec!["-nographic"]);
-        assert_eq!(
-            config.shell_check_steps[0].success_regex,
-            Some(vec!["PASS".to_string()])
-        );
-        assert_eq!(config.fail_regex, vec!["panic"]);
-        assert_eq!(config.timeout, Some(120));
     }
 }

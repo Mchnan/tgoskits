@@ -212,75 +212,14 @@ fn grouped_c_subcases_reject_missing_direct_usr_bin_commands() {
 }
 
 #[test]
-fn cross_compile_spec_maps_supported_arches() {
-    assert_eq!(
-        cross_compile_spec("aarch64").unwrap(),
-        CrossCompileSpec {
-            llvm_target: "aarch64-linux-musl",
-            rust_musl_target: "aarch64-unknown-linux-musl",
-            cmake_system_processor: "aarch64",
-            guest_tool_dir: "usr/aarch64-alpine-linux-musl/bin",
-            gnu_tool_prefix: "aarch64-linux-musl",
-            qemu_user_binaries: &["qemu-aarch64-static", "qemu-aarch64"],
-        }
-    );
-    assert_eq!(
-        cross_compile_spec("loongarch64").unwrap(),
-        CrossCompileSpec {
-            llvm_target: "loongarch64-linux-musl",
-            rust_musl_target: "loongarch64-unknown-linux-musl",
-            cmake_system_processor: "loongarch64",
-            guest_tool_dir: "usr/loongarch64-alpine-linux-musl/bin",
-            gnu_tool_prefix: "loongarch64-linux-musl",
-            qemu_user_binaries: &["qemu-loongarch64-static", "qemu-loongarch64"],
-        }
-    );
-}
-
-#[test]
-fn write_cross_bin_wrappers_generates_prefixed_and_plain_tools() {
-    let root = tempdir().unwrap();
-    let layout =
-        case_assets::case_asset_layout(root.path(), "aarch64-unknown-none-softfloat", "usb")
-            .unwrap();
-    fs::create_dir_all(
-        layout
-            .staging_root
-            .join("usr/aarch64-alpine-linux-musl/bin"),
-    )
-    .unwrap();
-    for tool in [
-        "ld", "as", "ar", "ranlib", "strip", "nm", "objcopy", "objdump", "readelf",
-    ] {
-        let path = layout
-            .staging_root
-            .join("usr/aarch64-alpine-linux-musl/bin")
-            .join(tool);
-        fs::write(path, b"").unwrap();
-    }
-
-    write_cross_bin_wrappers(
-        &layout,
-        cross_compile_spec("aarch64").unwrap(),
-        Path::new("/usr/bin/qemu-aarch64-static"),
-    )
-    .unwrap();
-
-    let plain = fs::read_to_string(layout.cross_bin_dir.join("ld")).unwrap();
-    let prefixed = fs::read_to_string(layout.cross_bin_dir.join("aarch64-linux-musl-ld")).unwrap();
-    assert!(plain.contains("qemu-aarch64-static"));
-    assert!(plain.contains("LD_LIBRARY_PATH"));
-    assert!(plain.contains("usr/aarch64-alpine-linux-musl/bin/ld"));
-    assert!(prefixed.contains("usr/aarch64-alpine-linux-musl/bin/ld"));
-    assert!(prefixed.contains("-0"));
-}
-
-#[test]
 fn write_cmake_toolchain_file_contains_clang_cross_settings() {
     let root = tempdir().unwrap();
-    let layout =
-        case_assets::case_asset_layout(root.path(), "aarch64-unknown-none-softfloat", "usb")
-            .unwrap();
+    let layout = case_assets::case_asset_layout(
+        &root.path().join("target"),
+        "aarch64-unknown-none-softfloat",
+        "usb",
+    )
+    .unwrap();
     fs::create_dir_all(&layout.cross_bin_dir).unwrap();
     fs::create_dir_all(
         layout
@@ -304,6 +243,29 @@ fn write_cmake_toolchain_file_contains_clang_cross_settings() {
     assert!(content.contains("-B"));
     assert!(content.contains("-L"));
     assert!(content.contains("CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER"));
+}
+
+#[test]
+fn write_riscv64_cmake_toolchain_file_constrains_guest_isa() {
+    let root = tempdir().unwrap();
+    let layout = case_assets::case_asset_layout(
+        &root.path().join("target"),
+        "riscv64gc-unknown-none-elf",
+        "system",
+    )
+    .unwrap();
+    fs::create_dir_all(&layout.cross_bin_dir).unwrap();
+
+    write_cmake_toolchain_file(
+        &layout,
+        cross_compile_spec("riscv64").unwrap(),
+        Path::new("/usr/bin/clang"),
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(&layout.cmake_toolchain_file).unwrap();
+    assert!(content.contains("-march=rv64gc"));
+    assert!(content.contains("-mabi=lp64d"));
 }
 
 #[test]

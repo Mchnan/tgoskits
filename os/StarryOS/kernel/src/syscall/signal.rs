@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::{future::poll_fn, task::Poll};
 
-use ax_runtime::hal::cpu::uspace::UserContext;
+use ax_runtime::hal::cpu::user::UserContext;
 use linux_raw_sys::general::{
     MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_DISABLE, SS_FLAG_BITS,
     SS_ONSTACK, kernel_sigaction, siginfo, timespec,
@@ -94,8 +94,16 @@ pub fn sys_rt_sigpending(
     set: *mut SignalSet,
     sigsetsize: usize,
 ) -> crate::StarryResult<isize> {
-    check_sigset_size(sigsetsize)?;
-    set.vm_write(current, current.as_thread().signal().pending())?;
+    if sigsetsize > size_of::<SignalSet>() {
+        return Err(StarryError::InvalidInput);
+    }
+
+    if sigsetsize != 0 {
+        let pending = current.as_thread().signal().pending();
+        let bytes = bytemuck::bytes_of(&pending);
+        crate::mm::vm_write_slice(current, set.cast::<u8>(), &bytes[..sigsetsize])?;
+    }
+
     Ok(0)
 }
 
@@ -352,10 +360,7 @@ pub fn sys_rt_sigqueueinfo(
     tgid: u32,
     signo: u32,
     sig: *const SignalInfo,
-    sigsetsize: usize,
 ) -> StarryResult<isize> {
-    check_sigset_size(sigsetsize)?;
-
     let tgid = TgidNumber::try_from(tgid)?;
     let sig = make_queue_signal_info(current, tgid, signo, sig)?;
     let process = current_pid_view().resolve_process(tgid)?;
@@ -369,10 +374,7 @@ pub fn sys_rt_tgsigqueueinfo(
     tid: u32,
     signo: u32,
     sig: *const SignalInfo,
-    sigsetsize: usize,
 ) -> StarryResult<isize> {
-    check_sigset_size(sigsetsize)?;
-
     let tgid = TgidNumber::try_from(tgid)?;
     let sig = make_queue_signal_info(current, tgid, signo, sig)?;
     let process = current_pid_view().resolve_process(tgid)?;

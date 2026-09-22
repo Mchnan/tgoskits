@@ -200,6 +200,7 @@ impl StarryError {
             Self::Errno(errno) => *errno,
             Self::Vm(error) => vm_errno(*error),
             Self::Signal(SignalError::UserMemory(error)) => vm_errno(*error),
+            Self::Signal(SignalError::NoMemory) => Errno::ENOMEM,
             Self::Mm(error) => mm_errno(*error),
             Self::Vfs(error) => vfs_errno(*error),
             Self::Mapping(error) => mapping_errno(error),
@@ -333,6 +334,11 @@ fn task_errno(error: TaskError) -> Errno {
         | TaskError::ThreadBusy => Errno::EBUSY,
         TaskError::StaleThreadId => Errno::ESRCH,
         TaskError::TimerCapacity => Errno::ENOMEM,
+        TaskError::RuntimeFailure(status)
+            if status == ax_runtime::task::runtime::RuntimeStatus::NoMemory as u32 =>
+        {
+            Errno::ENOMEM
+        }
         TaskError::UnsafeContext => Errno::EPERM,
         TaskError::CpuOwnerMismatch { .. }
         | TaskError::CpuOwnerBorrowed
@@ -384,6 +390,7 @@ fn vfs_error_from_errno(errno: Errno) -> VfsError {
         Errno::EACCES => VfsError::PermissionDenied,
         Errno::EDQUOT => VfsError::QuotaExceeded,
         Errno::EROFS => VfsError::ReadOnlyFilesystem,
+        Errno::ETXTBSY => VfsError::TextFileBusy,
         Errno::EBUSY => VfsError::ResourceBusy,
         Errno::ENOSPC => VfsError::StorageFull,
         Errno::ETIMEDOUT => VfsError::TimedOut,
@@ -549,6 +556,7 @@ fn vfs_errno(error: VfsError) -> Errno {
         VfsError::PermissionDenied => Errno::EACCES,
         VfsError::QuotaExceeded => Errno::EDQUOT,
         VfsError::ReadOnlyFilesystem => Errno::EROFS,
+        VfsError::TextFileBusy => Errno::ETXTBSY,
         VfsError::ResourceBusy => Errno::EBUSY,
         VfsError::StorageFull => Errno::ENOSPC,
         VfsError::TimedOut => Errno::ETIMEDOUT,

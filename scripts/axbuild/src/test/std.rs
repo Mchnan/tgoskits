@@ -37,12 +37,12 @@ const AX_HAL_FEATURE_PROFILES: &[PackageFeatureProfile] = &[PackageFeatureProfil
     no_default_features: false,
     features: &["host-test"],
     name_filter: None,
+    // Local CPU invalidation is exercised by test-suit/arceos/cpu. This
+    // profile retains runtime shootdown, publication and IRQ completion tests.
     expected_tests: &[
         "cache::tests::all_cpu_tlb_shootdown_propagates_remote_failure",
         "cache::tests::cpu_ready_publication_reflushes_a_racing_generation",
         "cache::tests::cpu_ready_publication_rejects_unrepresentable_cpu_ids",
-        "cache::tests::large_tlb_ranges_switch_to_one_full_invalidation",
-        "cache::tests::local_mmu_cache_update_aligns_the_fault_address_once",
         "cache::tests::selected_offline_cpu_cannot_be_silently_acknowledged",
         "cache::tests::targeted_tlb_shootdown_skips_unselected_remote_and_local_cpus",
         "irq::tests::acknowledged_irq_completion_precedes_preempt_release",
@@ -138,6 +138,15 @@ const AX_FS_NG_FEATURE_PROFILES: &[PackageFeatureProfile] = &[
         features: &["host-test", "vfs", "fat", "ext4"],
         name_filter: None,
         expected_tests: &["block::cache::registry::tests::reclaim_capability_does_not_defer_last_endpoint_drop"],
+    },
+    PackageFeatureProfile {
+        name: "host-test-non-vfs-writeback-discovery",
+        no_default_features: false,
+        features: &["host-test"],
+        name_filter: Some("non_vfs_background_watermark_stays_synchronous"),
+        expected_tests: &[
+            "file::cache::tests::non_vfs_background_watermark_stays_synchronous",
+        ],
     },
     PackageFeatureProfile {
         name: "host-test-resource-rollback-discovery",

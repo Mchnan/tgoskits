@@ -4,7 +4,6 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ax_alloc::{UsageKind, global_allocator};
 use ax_fs_ng::{file::CachedFileIdentity, vfs::CachedFile};
@@ -12,9 +11,8 @@ use ax_memory_addr::{DynPageIter, MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, 
 use ax_memory_set::MappingBackend;
 use ax_runtime::hal::{
     mem::{phys_to_virt, virt_to_phys},
-    paging::{MappingFlags, PageTable},
+    paging::{DeferredPageTableFrames, MappingFlags, PageTable},
 };
-use scope_local::scope_local;
 
 use crate::{StarryError, StarryResult};
 
@@ -46,39 +44,211 @@ fn mincore_file_visible(location: &axfs_ng_vfs::Location, cred: &crate::task::Cr
         })
 }
 
-scope_local! {
-    static DEFER_TLB_RETIRE: AtomicUsize = AtomicUsize::new(0);
-}
-
-/// Marks one backend-unmap scope as owned by an outer address-space receipt.
+/// Intermediate page-table frames detached by one logical mapping mutation.
 ///
-/// The guard is scope-local rather than global: another CPU or a nested
-/// rollback must never inherit a decision to skip its immediate invalidation.
-/// The outer caller has already reserved and retained every affected mapping
-/// owner before entering this scope.
-pub(crate) struct DeferredTlbRetireGuard {
-    previous: usize,
-    _not_send: core::marker::PhantomData<*mut ()>,
+/// Capacity is reserved before the first PTE is changed. One leaf removal can
+/// return at most one token, even when that token owns multiple intermediate
+/// frames, and can defer at most one backend owner. Therefore the number of
+/// affected leaves is an upper bound for both vectors. New mutation paths must
+/// preserve that reservation rule.
+///
+/// The address-space owner then either attaches this context to a published
+/// TLB receipt or reclaims it after a separate quiescence/shootdown proof.
+pub(super) struct MappingMutationContext {
+    deferred_page_tables: Vec<DeferredPageTableFrames>,
+    rollback_cleanups: Vec<RollbackCleanup>,
+    backend_owners_deferred: bool,
+    pte_changed: bool,
 }
 
-impl DeferredTlbRetireGuard {
-    pub(crate) fn enter() -> Self {
-        let previous = DEFER_TLB_RETIRE.with(|state| state.swap(1, Ordering::AcqRel));
-        Self {
-            previous,
-            _not_send: core::marker::PhantomData,
+enum RollbackCleanup {
+    Cow(cow::CowRollbackOwner),
+    File(file::FileRollbackOwner),
+}
+
+impl RollbackCleanup {
+    fn complete(self) -> StarryResult {
+        match self {
+            Self::Cow(owner) => owner.complete(),
+            Self::File(owner) => owner.complete(),
         }
     }
 }
 
-impl Drop for DeferredTlbRetireGuard {
-    fn drop(&mut self) {
-        DEFER_TLB_RETIRE.with(|state| state.store(self.previous, Ordering::Release));
+impl MappingMutationContext {
+    fn with_capacity(capacity: usize, backend_owners_deferred: bool) -> StarryResult<Self> {
+        let mut deferred_page_tables = Vec::new();
+        deferred_page_tables
+            .try_reserve(capacity)
+            .map_err(|_| StarryError::NoMemory)?;
+        let mut rollback_cleanups = Vec::new();
+        if !backend_owners_deferred {
+            rollback_cleanups
+                .try_reserve(capacity)
+                .map_err(|_| StarryError::NoMemory)?;
+        }
+        Ok(Self {
+            deferred_page_tables,
+            rollback_cleanups,
+            backend_owners_deferred,
+            pte_changed: false,
+        })
+    }
+
+    pub(super) fn for_published_mutation(capacity: usize) -> StarryResult<Self> {
+        Self::with_capacity(capacity, true)
+    }
+
+    pub(super) fn for_rollback(capacity: usize) -> StarryResult<Self> {
+        Self::with_capacity(capacity, false)
+    }
+
+    pub(super) const fn backend_owners_deferred(&self) -> bool {
+        self.backend_owners_deferred
+    }
+
+    pub(super) fn record_unmap(&mut self, tables: DeferredPageTableFrames) {
+        self.pte_changed = true;
+        if tables.is_empty() {
+            return;
+        }
+        let slot_reserved = self.deferred_page_tables.len() < self.deferred_page_tables.capacity();
+        debug_assert!(
+            slot_reserved,
+            "page-table reclaim ownership must be reserved before PTE mutation"
+        );
+        if !slot_reserved && let Err(error) = self.deferred_page_tables.try_reserve(1) {
+            warn!(
+                "cannot retain detached page-table ownership after PTE mutation; leaking the \
+                 frames: {error}"
+            );
+            core::mem::forget(tables);
+            return;
+        }
+        self.deferred_page_tables.push(tables);
+    }
+
+    pub(in crate::mm::aspace::backend) fn defer_cow_cleanup(
+        &mut self,
+        owner: cow::CowRollbackOwner,
+    ) {
+        debug_assert!(!self.backend_owners_deferred);
+        self.defer_rollback_cleanup(RollbackCleanup::Cow(owner));
+    }
+
+    pub(in crate::mm::aspace::backend) fn defer_file_cleanup(
+        &mut self,
+        owner: file::FileRollbackOwner,
+    ) {
+        debug_assert!(!self.backend_owners_deferred);
+        self.defer_rollback_cleanup(RollbackCleanup::File(owner));
+    }
+
+    fn defer_rollback_cleanup(&mut self, cleanup: RollbackCleanup) {
+        let slot_reserved = self.rollback_cleanups.len() < self.rollback_cleanups.capacity();
+        debug_assert!(
+            slot_reserved,
+            "backend rollback ownership must be reserved before PTE mutation"
+        );
+        if !slot_reserved && let Err(error) = self.rollback_cleanups.try_reserve(1) {
+            warn!(
+                "cannot retain backend rollback ownership after PTE mutation; leaking the owner: \
+                 {error}"
+            );
+            core::mem::forget(cleanup);
+            return;
+        }
+        self.rollback_cleanups.push(cleanup);
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.deferred_page_tables.is_empty()
+    }
+
+    pub(super) const fn pte_changed(&self) -> bool {
+        self.pte_changed
+    }
+
+    pub(super) fn into_page_tables(mut self) -> Vec<DeferredPageTableFrames> {
+        debug_assert!(self.rollback_cleanups.is_empty());
+        core::mem::take(&mut self.deferred_page_tables)
+    }
+
+    /// Reclaims every detached table after the caller proves no hardware
+    /// walker can retain the removed hierarchy.
+    ///
+    /// # Safety
+    ///
+    /// All CPUs that could use the page table must have completed a matching
+    /// invalidation, or the address space must be lifecycle-quiescent.
+    pub(super) unsafe fn reclaim(mut self) {
+        for tables in core::mem::take(&mut self.deferred_page_tables) {
+            // SAFETY: upheld by this method's caller.
+            unsafe { tables.reclaim() };
+        }
+        for cleanup in core::mem::take(&mut self.rollback_cleanups) {
+            if let Err(error) = cleanup.complete() {
+                warn!("failed to finish mapping rollback ownership: {error}");
+            }
+        }
     }
 }
 
-pub(super) fn tlb_retire_is_deferred() -> bool {
-    DEFER_TLB_RETIRE.with(|state| state.load(Ordering::Acquire) != 0)
+impl Drop for MappingMutationContext {
+    fn drop(&mut self) {
+        if self.pte_changed && !self.rollback_cleanups.is_empty() {
+            // The caller did not provide a shootdown proof. Leaking these rare
+            // failure-path owners is safer than releasing a frame still
+            // reachable through a stale translation.
+            core::mem::forget(core::mem::take(&mut self.rollback_cleanups));
+        }
+    }
+}
+
+/// Rolls back PTEs installed into a live address space.
+///
+/// The reclaim context is allocated before the first map attempt.  Cleared
+/// leaves are invalidated on every CPU before detached intermediate tables are
+/// returned to the allocator.  A failure intentionally leaks the detached
+/// tables; callers must likewise retain any backing-page owners.
+pub(super) fn rollback_live_mapped_pages<I>(
+    pt: &mut PageTable,
+    pages: I,
+    range: VirtAddrRange,
+    mut context: MappingMutationContext,
+) -> bool
+where
+    I: IntoIterator<Item = (VirtAddr, PhysAddr, usize)>,
+{
+    let mut complete = true;
+    for (vaddr, expected_paddr, expected_size) in pages {
+        match pt.unmap_page_deferred(vaddr) {
+            Ok((paddr, _, page_size, deferred)) => {
+                context.record_unmap(deferred);
+                if paddr != expected_paddr || page_size != expected_size {
+                    complete = false;
+                    warn!(
+                        "mapping rollback found {paddr:?}/{page_size:#x} instead of \
+                         {expected_paddr:?}/{expected_size:#x} at {vaddr:?}"
+                    );
+                }
+            }
+            Err(error) => {
+                complete = false;
+                warn!("mapping rollback could not unmap {vaddr:?}: {error}");
+            }
+        }
+    }
+    if !context.pte_changed() {
+        return complete;
+    }
+    if let Err(error) = crate::mm::flush_tlb_range_sync(range.start, range.size()) {
+        warn!("mapping rollback could not invalidate {range:?}: {error}");
+        return false;
+    }
+    // SAFETY: synchronous invalidation completed for the full rollback range.
+    unsafe { context.reclaim() };
+    complete
 }
 
 fn divide_page(size: usize, page_size: usize) -> usize {
@@ -553,7 +723,12 @@ pub(super) trait MappingExecution {
     }
 
     /// Unmap a memory region.
-    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTable) -> StarryResult;
+    fn unmap(
+        &self,
+        range: VirtAddrRange,
+        context: &mut MappingMutationContext,
+        pt: &mut PageTable,
+    ) -> StarryResult;
 
     /// Read-only unmap preflight. `NotMapped` is valid for lazy mappings;
     /// malformed page-table walks are rejected before any leaf is detached.
@@ -650,6 +825,14 @@ pub(super) trait MappingExecution {
 #[derive(Clone)]
 pub struct MappingOperation {
     kind: MappingOperationKind,
+    /// A mapping keeps its writable open description busy after close(fd).
+    write_access: Option<Arc<MappingWriteAccess>>,
+}
+
+// VMA fragments and rollback snapshots within one MM share this token. Fork
+// creates a separate token so retiring one MM cannot release another's lease.
+struct MappingWriteAccess {
+    lease: crate::sync::Mutex<Option<Arc<ax_fs_ng::file::WriteAccess>>>,
 }
 
 #[derive(Clone)]
@@ -763,27 +946,50 @@ pub(crate) struct ResidentLeafRestore<'a> {
 }
 
 impl MappingOperation {
+    /// Retains the source open's exclusion lease across every VMA fragment.
+    pub(crate) fn with_write_access(
+        mut self,
+        access: Option<Arc<ax_fs_ng::file::WriteAccess>>,
+    ) -> Self {
+        self.write_access = access.map(|lease| {
+            Arc::new(MappingWriteAccess {
+                lease: crate::sync::Mutex::new(Some(lease)),
+            })
+        });
+        self
+    }
+
+    /// Detaches this MM's VMA lease; duplicate fragments return `None`.
+    /// The caller must drop the returned inode lease outside MM metadata locks.
+    pub(super) fn take_write_access(&self) -> Option<Arc<ax_fs_ng::file::WriteAccess>> {
+        self.write_access.as_ref()?.lease.lock().take()
+    }
+
     fn from_linear(backend: linear::LinearBackend) -> Self {
         Self {
             kind: MappingOperationKind::Linear(backend),
+            write_access: None,
         }
     }
 
     fn from_cow(backend: cow::CowBackend) -> Self {
         Self {
             kind: MappingOperationKind::Cow(backend),
+            write_access: None,
         }
     }
 
     fn from_shared(backend: shared::SharedBackend) -> Self {
         Self {
             kind: MappingOperationKind::Shared(backend),
+            write_access: None,
         }
     }
 
     fn from_file(backend: file::FileBackend) -> Self {
         Self {
             kind: MappingOperationKind::File(backend),
+            write_access: None,
         }
     }
 
@@ -1001,8 +1207,13 @@ impl MappingOperation {
         MappingExecution::validate_unmap(self, range, pt)
     }
 
-    pub(crate) fn unmap_range(&self, range: VirtAddrRange, pt: &mut PageTable) -> StarryResult {
-        MappingExecution::unmap(self, range, pt)
+    pub(super) fn unmap_range(
+        &self,
+        range: VirtAddrRange,
+        context: &mut MappingMutationContext,
+        pt: &mut PageTable,
+    ) -> StarryResult {
+        MappingExecution::unmap(self, range, context, pt)
     }
 
     /// Resolve a process-shared futex against its backing object rather than
@@ -1164,12 +1375,14 @@ impl MappingOperation {
             .checked_sub(src_offset)
             .map(VirtAddr::from)
             .ok_or(StarryError::InvalidInput)?;
-        Ok(match &self.kind {
+        let mut operation = match &self.kind {
             MappingOperationKind::Cow(cb) => Self::from_cow(cb.with_start(adjusted)),
             MappingOperationKind::Shared(sb) => Self::from_shared(sb.with_start(adjusted)),
             MappingOperationKind::Linear(_) => return Err(StarryError::OperationNotSupported),
             MappingOperationKind::File(fb) => Self::from_file(fb.with_start(adjusted)?),
-        })
+        };
+        operation.write_access = self.write_access.clone();
+        Ok(operation)
     }
 
     /// Adjusts the logical extent for an `mremap` destination.  The operation
@@ -1180,12 +1393,14 @@ impl MappingOperation {
         if size == 0 {
             return Err(StarryError::InvalidInput);
         }
-        Ok(match &self.kind {
+        let mut operation = match &self.kind {
             MappingOperationKind::Cow(cow) => Self::from_cow(cow.for_extent(size)?),
             MappingOperationKind::Shared(shared) => Self::from_shared(shared.with_size(size)?),
             MappingOperationKind::Linear(_) => return Err(StarryError::OperationNotSupported),
             MappingOperationKind::File(file) => Self::from_file(file.clone()),
-        })
+        };
+        operation.write_access = self.write_access.clone();
+        Ok(operation)
     }
 }
 
@@ -1251,12 +1466,25 @@ impl MappingExecution for MappingOperation {
         }
     }
 
-    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTable) -> StarryResult {
+    fn unmap(
+        &self,
+        range: VirtAddrRange,
+        context: &mut MappingMutationContext,
+        pt: &mut PageTable,
+    ) -> StarryResult {
         match &self.kind {
-            MappingOperationKind::Linear(backend) => MappingExecution::unmap(backend, range, pt),
-            MappingOperationKind::Cow(backend) => MappingExecution::unmap(backend, range, pt),
-            MappingOperationKind::Shared(backend) => MappingExecution::unmap(backend, range, pt),
-            MappingOperationKind::File(backend) => MappingExecution::unmap(backend, range, pt),
+            MappingOperationKind::Linear(backend) => {
+                MappingExecution::unmap(backend, range, context, pt)
+            }
+            MappingOperationKind::Cow(backend) => {
+                MappingExecution::unmap(backend, range, context, pt)
+            }
+            MappingOperationKind::Shared(backend) => {
+                MappingExecution::unmap(backend, range, context, pt)
+            }
+            MappingOperationKind::File(backend) => {
+                MappingExecution::unmap(backend, range, context, pt)
+            }
         }
     }
 
@@ -1391,7 +1619,7 @@ impl MappingExecution for MappingOperation {
         old_pt: &mut PageTable,
         new_pt: &mut PageTable,
     ) -> StarryResult<(MappingOperation, PteMaterialization)> {
-        match &self.kind {
+        let (operation, materialization) = match &self.kind {
             MappingOperationKind::Linear(backend) => {
                 MappingExecution::clone_map(backend, range, flags, old_pt, new_pt)
             }
@@ -1404,16 +1632,23 @@ impl MappingExecution for MappingOperation {
             MappingOperationKind::File(backend) => {
                 MappingExecution::clone_map(backend, range, flags, old_pt, new_pt)
             }
-        }
+        }?;
+        let write_access = self
+            .write_access
+            .as_ref()
+            .and_then(|access| access.lease.lock().clone());
+        Ok((operation.with_write_access(write_access), materialization))
     }
 
     fn split(&mut self, align_diff: usize) -> Option<MappingOperation> {
-        match &mut self.kind {
+        let mut operation = match &mut self.kind {
             MappingOperationKind::Linear(backend) => MappingExecution::split(backend, align_diff),
             MappingOperationKind::Cow(backend) => MappingExecution::split(backend, align_diff),
             MappingOperationKind::Shared(backend) => MappingExecution::split(backend, align_diff),
             MappingOperationKind::File(backend) => MappingExecution::split(backend, align_diff),
-        }
+        }?;
+        operation.write_access = self.write_access.clone();
+        Some(operation)
     }
 
     fn shrink_left(&mut self, shrink_size: usize) -> bool {
@@ -1487,9 +1722,39 @@ impl MappingBackend for MappingOperation {
         MappingExecution::validate_map(self, range, pt)
     }
 
-    fn unmap(&self, start: VirtAddr, size: usize, _context: &mut (), pt: &mut PageTable) -> bool {
+    fn unmap(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        _context: &mut (),
+        pt: &mut PageTable,
+    ) -> bool {
         let range = VirtAddrRange::from_start_size(start, size);
-        if let Err(err) = MappingExecution::unmap(self, range, pt) {
+        let capacity = match occupied_leaf_ranges(range, pt) {
+            Ok(leaves) => leaves.len(),
+            Err(err) => {
+                warn!("Failed to prepare area unmap: {err:?}");
+                return false;
+            }
+        };
+        let mut context = match MappingMutationContext::for_rollback(capacity) {
+            Ok(context) => context,
+            Err(err) => {
+                warn!("Failed to reserve area-unmap ownership: {err:?}");
+                return false;
+            }
+        };
+        let result = MappingExecution::unmap(self, range, &mut context, pt);
+        if context.pte_changed() {
+            if let Err(err) = crate::mm::flush_tlb_range_sync(start, size) {
+                warn!("Failed to confirm area unmap: {err:?}");
+                return false;
+            }
+            // SAFETY: synchronous invalidation completed for the complete
+            // range before MemorySet can release its backend metadata.
+            unsafe { context.reclaim() };
+        }
+        if let Err(err) = result {
             warn!("Failed to unmap area: {:?}", err);
             false
         } else {

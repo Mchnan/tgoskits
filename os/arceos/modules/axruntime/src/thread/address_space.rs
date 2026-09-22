@@ -263,8 +263,10 @@ impl TaskAddressSpace {
     pub fn new(root: PhysAddr, owner: impl Send + Sync + 'static) -> Result<Self, TaskError> {
         Self::new_with_owner(
             root,
-            Arc::new(AddressSpaceCpuState::new(root)),
-            Box::new(RetainedTaskAddressSpaceOwner(owner)),
+            super::allocation::try_arc(AddressSpaceCpuState::new(root))
+                .map_err(|status| TaskError::RuntimeFailure(status as u32))?,
+            super::allocation::try_box(RetainedTaskAddressSpaceOwner(owner))
+                .map_err(|status| TaskError::RuntimeFailure(status as u32))?,
         )
     }
 
@@ -283,11 +285,12 @@ impl TaskAddressSpace {
         Self::new_with_owner(
             root,
             cpu_state,
-            Box::new(DetachableTaskAddressSpaceOwner {
+            super::allocation::try_box(DetachableTaskAddressSpaceOwner {
                 owner,
                 detached: core::sync::atomic::AtomicBool::new(false),
                 detach,
-            }),
+            })
+            .map_err(|status| TaskError::RuntimeFailure(status as u32))?,
         )
     }
 
@@ -301,7 +304,8 @@ impl TaskAddressSpace {
         Self::new_with_owner(
             root,
             cpu_state,
-            Box::new(ManagedTaskAddressSpaceOwner(owner)),
+            super::allocation::try_box(ManagedTaskAddressSpaceOwner(owner))
+                .map_err(|status| TaskError::RuntimeFailure(status as u32))?,
         )
     }
 
@@ -310,21 +314,27 @@ impl TaskAddressSpace {
         cpu_state: Arc<AddressSpaceCpuState>,
         owner: Box<dyn TaskAddressSpaceOwner>,
     ) -> Result<Self, TaskError> {
+        #[cfg(feature = "fault-injection")]
+        if super::creation_probe::record(super::creation_probe::CreationEvent::Mm) {
+            return Err(TaskError::RuntimeFailure(RuntimeStatus::NoMemory as u32));
+        }
         if root.as_usize() == 0 || !cpu_state.matches_root(root) {
             return Err(TaskError::InvalidRuntimeHandle);
         }
-        let address_space = Box::new(RuntimeAddressSpace {
+        let address_space = super::allocation::try_box(RuntimeAddressSpace {
             active_leases: AtomicUsize::new(0),
             reclaim_waiting: AtomicUsize::new(0),
             cpu_state,
             _owner: owner,
-        });
+        })
+        .map_err(|status| TaskError::RuntimeFailure(status as u32))?;
         let raw = Box::into_raw(address_space).expose_provenance();
         // SAFETY: the fresh allocation transfers its unique destruction right
         // into this move-only token.
         Ok(Self(Some(unsafe { AddressSpaceToken::from_raw(raw) })))
     }
 
+    #[cfg(any(feature = "uspace", test))]
     pub(super) fn handle(&self) -> AddressSpaceHandle {
         self.0
             .as_ref()
@@ -385,7 +395,7 @@ fn replace_active_activation(
     pin: &CpuPin<'_>,
     next: Option<SchedulerAddressSpaceActivation>,
 ) -> Option<SchedulerAddressSpaceActivation> {
-    debug_assert!(!ax_hal::asm::irqs_enabled());
+    debug_assert!(!ax_cpu::interrupt::irqs_enabled());
     // SAFETY: the root-switch transaction holds local IRQ exclusion. This
     // CPU-only slot has no remote readers, and the mutable borrow cannot escape.
     unsafe {
@@ -397,10 +407,54 @@ fn replace_active_activation(
 }
 
 #[cfg(feature = "uspace")]
-fn install_mm_identity(installed: ax_hal::context::InstalledAddressSpace) {
-    // SAFETY: the prepared/active lease owns the root, and the caller keeps IRQs
-    // disabled from CPU-footprint publication through active-lease publication.
-    unsafe { ax_hal::asm::install_user_address_space(installed) };
+fn install_mm_identity(
+    installed: ax_hal::context::InstalledAddressSpace,
+    current_root: usize,
+    transition: HardwareAddressSpaceTransition,
+) {
+    #[cfg(target_arch = "aarch64")]
+    let restore_lazy = transition == HardwareAddressSpaceTransition::SameAddressSpace
+        && current_root == 0
+        && installed.hardware_tag() != 0
+        && u32::from(installed.hardware_tag()) < ax_cpu::mmu::address_space_tag_capacity();
+    #[cfg(not(target_arch = "aarch64"))]
+    let restore_lazy = {
+        let _ = (current_root, transition);
+        false
+    };
+    if restore_lazy {
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: the retained activation owns this same logical mm. The
+            // runtime's lazy entry installed reserved ASID zero. User leaves
+            // are non-global; retained entries still belong to this same mm,
+            // and no different user mm has run here since. Its active target
+            // bit stayed published for synchronous mapping shootdowns.
+            // A lease alone does not reserve a numeric ASID: different-mm
+            // installations must still invalidate the incoming tag below.
+            ax_cpu::barrier::synchronize_page_table_writes();
+            // SAFETY: the retained-root proof above excludes accesses through
+            // a retired lower mapping; the lease and local IRQ exclusion persist.
+            unsafe { ax_cpu::mmu::El1::write_user_address_space(installed.hardware()) };
+            ax_cpu::barrier::instruction_sync();
+        }
+    } else {
+        #[cfg(target_arch = "aarch64")]
+        if current_root != 0
+            && ax_cpu::mmu::El1::read_user_address_space().hardware_tag() == 0
+            && installed.hardware_tag() != 0
+        {
+            // A direct FullFlush-to-tagged switch leaves the old non-global
+            // ASID-zero entries behind: invalidating only the incoming tag
+            // would let a later lazy kernel thread reuse those translations
+            // with the reserved lower root. This mixed-mode transition is
+            // uncommon; invalidate before installing the tagged identity.
+            ax_cpu::mmu::flush_tlb(None);
+        }
+        // SAFETY: the prepared/active lease owns the root, and the caller keeps IRQs
+        // disabled from CPU-footprint publication through active-lease publication.
+        unsafe { ax_cpu::mmu::install_user_address_space(installed.hardware()) };
+    }
     #[cfg(feature = "qperf-metrics")]
     ACTIVE_MM_HARDWARE_ROOT_WRITES.fetch_add(1, Ordering::Relaxed);
 }
@@ -442,7 +496,7 @@ fn offline_kernel_root() -> usize {
 
 #[cfg(feature = "uspace")]
 pub(super) fn current_hardware_root() -> usize {
-    ax_hal::asm::read_user_page_table().as_usize()
+    ax_cpu::mmu::read_user_page_table().as_usize()
 }
 
 #[cfg(feature = "uspace")]
@@ -494,7 +548,7 @@ fn install_hardware_root(root: usize, transition: HardwareAddressSpaceTransition
         let root = ax_memory_addr::PhysAddr::from(root);
         // SAFETY: callers retain local IRQ exclusion for the complete active-mm
         // transaction.
-        unsafe { ax_hal::asm::write_user_page_table(root) };
+        unsafe { ax_cpu::mmu::write_user_page_table(root) };
         #[cfg(feature = "qperf-metrics")]
         ACTIVE_MM_HARDWARE_ROOT_WRITES.fetch_add(1, Ordering::Relaxed);
         // Linux reloads CR3 when the logical mm changes even if a reclaimed
@@ -503,18 +557,38 @@ fn install_hardware_root(root: usize, transition: HardwareAddressSpaceTransition
         // architecture backends only update their root register and require an
         // explicit invalidation for the same identity transition.
         #[cfg(not(target_arch = "x86_64"))]
-        ax_hal::asm::flush_tlb(None);
+        ax_cpu::mmu::flush_tlb(None);
     }
 }
 
 #[cfg(feature = "uspace")]
-fn enter_lazy_kernel_address_space() {
-    // Linux's current x86, RISC-V and LoongArch enter_lazy_tlb paths retain the
-    // loaded user root and only change scheduler/ASID bookkeeping. AArch64
-    // installs its reserved lower root so a kernel thread cannot use the
-    // previous task's user mappings.
+fn enter_lazy_kernel_address_space(has_active_mm: bool) {
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = has_active_mm;
+    // The other architectures retain the loaded root during kernel execution.
     #[cfg(target_arch = "aarch64")]
-    install_hardware_root(0, HardwareAddressSpaceTransition::DifferentAddressSpace);
+    {
+        let current = ax_cpu::mmu::El1::read_user_address_space();
+        if has_active_mm {
+            if current.root().as_usize() == 0 && current.hardware_tag() == 0 {
+                return;
+            }
+            if current.hardware_tag() != 0 {
+                // SAFETY: IRQ exclusion covers this transition. All user leaves
+                // are non-global, so reserved ASID zero excludes their cached
+                // translations. The active-mm lease and shootdown target remain
+                // published until a different user mm is installed or CPU offline.
+                unsafe { ax_cpu::mmu::write_user_page_table(PhysAddr::from_usize(0)) };
+                ax_cpu::barrier::instruction_sync();
+                #[cfg(feature = "qperf-metrics")]
+                ACTIVE_MM_HARDWARE_ROOT_WRITES.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        // Untagged users need a real flush before kernel execution. Keep the
+        // initial no-active-mm flush as well, including any boot translations.
+        install_hardware_root(0, HardwareAddressSpaceTransition::DifferentAddressSpace);
+    }
 }
 
 #[cfg(feature = "uspace")]
@@ -621,7 +695,7 @@ impl PreparedAddressSpaceSwitch<'_, '_> {
         match self.phase {
             #[cfg(feature = "uspace")]
             AddressSpaceTransitionPhase::CurrentTask => assert!(
-                !ax_hal::asm::irqs_enabled(),
+                !ax_cpu::interrupt::irqs_enabled(),
                 "current-task address-space commit requires local IRQ exclusion"
             ),
             AddressSpaceTransitionPhase::ContextSwitch => {}
@@ -645,7 +719,7 @@ impl PreparedAddressSpaceSwitch<'_, '_> {
                 {
                     #[cfg(feature = "qperf-metrics")]
                     ACTIVE_MM_KERNEL_LAZY_ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
-                    enter_lazy_kernel_address_space();
+                    enter_lazy_kernel_address_space(self.previous_raw != 0);
                 }
             }
             #[cfg(all(feature = "uspace", not(target_arch = "aarch64")))]
@@ -681,12 +755,9 @@ impl PreparedAddressSpaceSwitch<'_, '_> {
                     next,
                     |root, transition| {
                         if let Some(installed) = installed {
-                            if hardware_root_install_required(
-                                current_hardware_root(),
-                                root,
-                                transition,
-                            ) {
-                                install_mm_identity(installed);
+                            let current_root = current_hardware_root();
+                            if hardware_root_install_required(current_root, root, transition) {
+                                install_mm_identity(installed, current_root, transition);
                             }
                         } else {
                             install_hardware_root(root, transition);
@@ -730,6 +801,8 @@ pub(super) fn prepare_runtime_address_space_switch<'pin, 'cpu>(
     same_address_space: bool,
     phase: AddressSpaceTransitionPhase,
 ) -> Result<PreparedAddressSpaceSwitch<'pin, 'cpu>, RuntimeStatus> {
+    #[cfg(feature = "fault-injection")]
+    super::creation_probe::record_mm_switch(!previous_selected.is_none(), !next_selected.is_none());
     #[cfg(feature = "uspace")]
     let pin = _pin;
     #[cfg(feature = "uspace")]
@@ -890,7 +963,7 @@ pub(super) fn release_current_active_address_space() {
                 HardwareAddressSpaceTransition::DifferentAddressSpace,
             );
             // CPU offline invalidates every local tag before retiring its MM.
-            ax_hal::asm::flush_tlb(None);
+            ax_cpu::mmu::flush_tlb(None);
             if let Some(activation) = replace_active_activation(pin, None) {
                 activation.release(AddressSpaceSwitchProof::new(
                     pin.area().cpu_index().as_usize(),

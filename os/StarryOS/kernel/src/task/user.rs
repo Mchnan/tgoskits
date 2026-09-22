@@ -2,7 +2,7 @@ use ax_memory_addr::VirtAddr;
 use ax_runtime::{
     hal::cpu::{
         trap::PageFaultFlags,
-        uspace::{ExceptionKind, ReturnReason, UserContext},
+        user::{ExceptionKind, ReturnReason, UserContext},
     },
     thread::UserExecutionContext,
 };
@@ -12,7 +12,7 @@ use syscalls::Sysno;
 #[cfg(target_arch = "loongarch64")]
 use super::unaligned::{UnalignedEmulationResult, emulate_user_unaligned};
 use super::{
-    SignalCheckOutcome, SyscallRestartInfo, SyscallTraceState, Thread, TidNumber, check_signals,
+    FutexContext, SignalCheckOutcome, SyscallRestartInfo, SyscallTraceState, Thread, TidNumber, check_signals,
     check_signals_with_outcome, current_user_task, ptrace_stop_current,
     ptrace_syscall_stop_current, raise_signal_fatal, wait_existing_ptrace_stop_current,
 };
@@ -74,6 +74,7 @@ pub fn new_user_task(
         let curr = current_user_task();
         let mut uctx = UserExecutionContext::bind(uctx)
             .expect("user register image must bind to its current runtime context");
+        let mut futex_context = FutexContext::new(&curr);
 
         if let Some(tid) = (set_child_tid as *mut u32).nullable() {
             tid.vm_write(&curr, child_tid.get()).ok();
@@ -167,10 +168,11 @@ pub fn new_user_task(
                         let _ = ptrace_stop_current(thr, Signo::SIGTRAP, &mut uctx);
                     }
 
-                    syscall_restart = handle_syscall(&curr, &mut uctx);
+                    syscall_restart = handle_syscall(&curr, &mut uctx, &futex_context);
                     if address_space_replaced {
                         uctx.refresh_address_space()
                             .expect("execve must leave a valid current address space");
+                        futex_context = FutexContext::new(&curr);
                     }
                     if let Some((tid, _)) = ptrace_trace {
                         if stop_for_pending_ptrace_event(thr, &mut uctx) {
@@ -200,6 +202,7 @@ pub fn new_user_task(
                     }
                 }
                 ReturnReason::PageFault(addr, flags) => {
+                    crate::perf::sw::on_page_fault(thr, true);
                     handle_user_page_fault(thr, addr, flags, &uctx);
                 }
                 ReturnReason::Interrupt => {}
@@ -300,7 +303,7 @@ pub fn new_user_task(
 fn handle_user_exception(
     current: &super::UserTaskRef,
     uctx: &mut UserContext,
-    exc_info: ax_runtime::hal::cpu::uspace::ExceptionInfo,
+    exc_info: ax_runtime::hal::cpu::user::ExceptionInfo,
 ) {
     let thr = current.as_thread();
     let kind = exc_info.kind();
@@ -413,7 +416,7 @@ fn handle_user_exception(
             // IllegalInstruction. Emulate them like Linux
             // instead of killing the program with SIGILL.
             #[cfg(target_arch = "aarch64")]
-            if unsafe { uctx.emulate_mrs_id_reg() } {
+            if super::user_cpu_features::emulate_mrs_id_reg(current, uctx) {
                 return;
             }
             SignalInfo::new_kernel(Signo::SIGILL)
@@ -460,5 +463,5 @@ fn enqueue_ptrace_syscall_resume_signal(thr: &super::Thread, resume_signo: Optio
     // A PTRACE_SYSCALL resume signal is delivered after the matching syscall
     // exit stop. Do not arm the ptrace bypass: the tracer must observe its
     // subsequent signal-delivery stop.
-    let _ = thr.signal().send_signal(SignalInfo::new_kernel(signo));
+    super::queue_thread_signal(thr, SignalInfo::new_kernel(signo));
 }

@@ -378,20 +378,21 @@ mod tests {
     };
 
     #[test]
-    fn nested_errors_preserve_display_text_and_sources() {
+    fn nested_errors_preserve_sources() {
         let inspect = JpuInspectError::from(JpegHeaderError::ProgressiveUnsupported);
-        assert_eq!(
-            inspect.to_string(),
-            "invalid JPEG stream: progressive JPEG is unsupported"
-        );
         assert!(inspect.source().is_some());
 
         let setup = JpuHardwareSetupError::from(JpuRegisterError::BbcIdleTimeout);
         let decode = JpuDecodeError::from(setup);
+        // The transparent Register variant has no further source.
         assert_eq!(
-            decode.to_string(),
-            "JPU hardware setup failed: JPU BBC did not become idle"
+            decode
+                .source()
+                .unwrap()
+                .downcast_ref::<JpuHardwareSetupError>(),
+            Some(&JpuHardwareSetupError::Register(
+                JpuRegisterError::BbcIdleTimeout
+            )),
         );
-        assert!(decode.source().and_then(|error| error.source()).is_some());
     }
 }

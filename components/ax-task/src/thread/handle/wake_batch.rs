@@ -1,7 +1,12 @@
 //! Allocation-free task-context wake batching.
 
 use alloc::{rc::Rc, sync::Arc};
-use core::{marker::PhantomData, mem::ManuallyDrop, ptr, sync::atomic::Ordering};
+use core::{
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ptr,
+    sync::atomic::{Ordering, fence},
+};
 
 use super::{ThreadCore, ThreadWakeHandle};
 
@@ -38,6 +43,9 @@ impl ThreadWakeBatch {
     /// live batch.
     pub fn push(&mut self, wake: ThreadWakeHandle) -> bool {
         let core = &wake.core;
+        // Linux __wake_q_add publishes preceding domain state even when the
+        // node is already queued. An acquire-only failed CAS cannot do this.
+        fence(Ordering::SeqCst);
         if core
             .wake_batch_linked
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -81,6 +89,10 @@ impl ThreadWakeBatch {
     pub fn wake_all(mut self) -> usize {
         let count = self.len;
         while let Some(wake) = self.pop() {
+            // Pair node release with a full barrier before scheduler wakeup,
+            // as wake_up_q relies on wake_up_process to do in Linux. A racing
+            // coalesced insertion must not lose its preceding domain state.
+            fence(Ordering::SeqCst);
             let _result = wake.wake();
         }
         count
@@ -99,17 +111,31 @@ impl ThreadWakeBatch {
             // the reconstructed handle is dropped.
             ptr::read(&wake.reap_signal)
         };
-        drop(reap_signal);
+        // Every wake handle carries the core's immutable reap-signal allocation.
+        // Keep this strong reference owned by the linked node, alongside its
+        // external lease. `from_raw` recovers that same allocation through core.
+        debug_assert!(Arc::ptr_eq(&reap_signal, &core.reap_signal));
+        let _signal = Arc::into_raw(reap_signal);
         Arc::into_raw(core)
     }
 
+    /// # Safety
+    /// `raw` must be an unconsumed node produced by this type's `into_raw`.
+    /// The caller must own its core and reap-signal strong references and its
+    /// external lease, and must reconstruct them exactly once.
     unsafe fn from_raw(raw: *const ThreadCore) -> ThreadWakeHandle {
         let core = unsafe {
             // SAFETY: every pointer placed in the batch came from one
             // `Arc::into_raw`, and `pop` removes it exactly once.
             Arc::from_raw(raw)
         };
-        let reap_signal = Arc::clone(&core.reap_signal);
+        let reap_signal = unsafe {
+            // SAFETY: `into_raw` retained exactly one strong reference to this
+            // immutable allocation for this node. The live core preserves its
+            // address; exclusive pop consumes that retained reference once,
+            // including when an undrained batch is dropped.
+            Arc::from_raw(Arc::as_ptr(&core.reap_signal))
+        };
         ThreadWakeHandle {
             core: ManuallyDrop::new(core),
             reap_signal,

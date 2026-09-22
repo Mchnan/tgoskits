@@ -10,20 +10,15 @@ use std::{
 
 use ax_std::os::arceos::{
     api::task::{AxCpuMask, ax_set_current_affinity},
-    modules::{
-        ax_hal,
-        ax_runtime::{
-            diagnostics::qperf_runtime_scheduler_metrics_snapshot,
-            task::{
-                runtime::config::DEFAULT_BATCH_LIMIT,
-                sched::{
-                    CpuId, CpuSet, FairMode, Nice, RtPriority, SchedulePolicy, cpu_topology_len,
-                },
-                thread::{ThreadState, current::current_thread_id},
-            },
+    modules::ax_runtime::{
+        diagnostics::qperf_runtime_scheduler_metrics_snapshot,
+        task::{
+            runtime::config::DEFAULT_BATCH_LIMIT,
+            sched::{CpuId, CpuSet, FairMode, Nice, RtPriority, SchedulePolicy, cpu_topology_len},
+            thread::{ThreadState, current::current_thread_id},
         },
     },
-    thread::{default_task_stack_size, join_thread, spawn_raw_with_affinity},
+    thread::{builder, default_task_stack_size},
 };
 
 const OWNER_BACKLOG: usize = DEFAULT_BATCH_LIMIT + 1;
@@ -61,17 +56,15 @@ pub fn run() -> crate::TestResult {
     for index in 0..OWNER_BACKLOG {
         let stop_workers = Arc::clone(&stop_workers);
         workers.push(
-            spawn_raw_with_affinity(
-                move || {
+            builder(format!("irq-window-worker-{index}"))
+                .stack_size(default_task_stack_size())
+                .affinity(cpu0.clone())
+                .spawn(move || {
                     while !stop_workers.load(Ordering::Acquire) {
                         hint::spin_loop();
                     }
-                },
-                format!("irq-window-worker-{index}"),
-                default_task_stack_size(),
-                cpu0.clone(),
-            )
-            .expect("failed to publish the kernel scheduler backlog"),
+                })
+                .expect("failed to publish the kernel scheduler backlog"),
         );
     }
     let worker_ids = workers.iter().map(|worker| worker.id()).collect::<Vec<_>>();
@@ -90,8 +83,10 @@ pub fn run() -> crate::TestResult {
         let controller_ready = Arc::clone(&controller_ready);
         let publish_owner_work = Arc::clone(&publish_owner_work);
         let owner_work_published = Arc::clone(&owner_work_published);
-        spawn_raw_with_affinity(
-            move || {
+        builder("irq-window-controller".into())
+            .stack_size(default_task_stack_size())
+            .affinity(cpu1)
+            .spawn(move || {
                 let mut cpu1 = CpuSet::empty(cpu_count);
                 assert!(cpu1.insert(CpuId::new(1)));
                 controller_ready.store(true, Ordering::Release);
@@ -109,12 +104,8 @@ pub fn run() -> crate::TestResult {
                 );
                 }
                 owner_work_published.store(true, Ordering::Release);
-            },
-            "irq-window-controller".into(),
-            default_task_stack_size(),
-            cpu1,
-        )
-        .expect("failed to create the kernel affinity controller")
+            })
+            .expect("failed to create the kernel affinity controller")
     };
     wait_until(
         || controller_ready.load(Ordering::Acquire),
@@ -123,15 +114,15 @@ pub fn run() -> crate::TestResult {
 
     let before = qperf_runtime_scheduler_metrics_snapshot();
 
-    assert!(ax_hal::asm::irqs_enabled());
-    ax_hal::asm::disable_irqs();
+    assert!(ax_cpu::interrupt::irqs_enabled());
+    ax_cpu::interrupt::disable_irqs();
     publish_owner_work.store(true, Ordering::Release);
     let started = Instant::now();
     while !owner_work_published.load(Ordering::Acquire) && started.elapsed() < PROGRESS_TIMEOUT {
         hint::spin_loop();
     }
     let publication_completed = owner_work_published.load(Ordering::Acquire);
-    ax_hal::asm::enable_irqs();
+    ax_cpu::interrupt::enable_irqs();
     assert!(
         publication_completed,
         "CPU1 did not publish the bounded owner-work backlog"
@@ -154,9 +145,11 @@ pub fn run() -> crate::TestResult {
     controller_handle
         .set_policy(SchedulePolicy::fair(Nice::ZERO, FairMode::Normal))
         .expect("CPU0 controller must restore Fair policy");
-    join_thread(controller).expect("affinity controller must exit cleanly");
+    controller
+        .join()
+        .expect("affinity controller must exit cleanly");
     for worker in workers {
-        join_thread(worker).expect("CPU0 worker must exit cleanly");
+        worker.join().expect("CPU0 worker must exit cleanly");
     }
     Ok(())
 }

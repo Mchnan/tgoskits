@@ -37,6 +37,18 @@ class ReleasePrerequisiteTests(unittest.TestCase):
 
 
 class RunnerTrustTests(unittest.TestCase):
+    def test_public_job_images_do_not_require_registry_login(self) -> None:
+        workflow = REUSABLE_CHECK_MATRIX.read_text(encoding="utf-8")
+        job = mapping_block(workflow, "run", 2)
+        container = mapping_block(job, "container", 4)
+        credentials = mapping_block(container, "credentials", 6)
+
+        # A nonempty username prevents the runner's implicit GITHUB_TOKEN
+        # fallback; an omitted password makes ContainerRegistryLogin skip login.
+        self.assertIn("        username: anonymous", credentials.splitlines())
+        # Actions rejects an explicitly empty password before any job starts.
+        self.assertNotRegex(credentials, r"(?m)^\s*password:")
+
     def test_cleanup_reuses_planning_runner(self) -> None:
         self.assertFalse(
             PR_CLEANUP_WORKFLOW.exists(),
@@ -53,24 +65,25 @@ class RunnerTrustTests(unittest.TestCase):
         )
         self.assertNotIn("steps.route.outputs.should_run", cleanup)
 
-    def test_cross_repository_pr_can_enter_planning_and_matrix_allocation(
-        self,
-    ) -> None:
-        for workflow_path, job_name, scheduled in (
-            (CI_WORKFLOW, "plan_ci", False),
-            (REUSABLE_CHECK_MATRIX, "run", True),
-        ):
-            with self.subTest(workflow=workflow_path.name):
-                workflow = workflow_path.read_text(encoding="utf-8")
-                job = mapping_block(workflow, job_name, 2)
-                condition = mapping_block(job.replace("if: >-", "if:"), "if", 4)
-                expected = (
-                    "github.event_name == 'push' || "
-                    "github.event_name == 'workflow_dispatch' || "
-                    + ("github.event_name == 'schedule' || " if scheduled else "")
-                    + "github.event_name == 'pull_request'"
-                )
-                self.assertEqual(" ".join(condition.split()), expected)
+    def test_cross_repository_pr_can_enter_hosted_planning(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        job = mapping_block(workflow, "plan_ci", 2)
+        condition = mapping_block(job.replace("if: >-", "if:"), "if", 4)
+        self.assertIn("github.event_name == 'pull_request'", condition)
+
+    def test_fork_pr_matrix_is_forced_onto_github_hosted_runner(self) -> None:
+        workflow = REUSABLE_CHECK_MATRIX.read_text(encoding="utf-8")
+        job = mapping_block(workflow, "run", 2)
+
+        self.assertIn(
+            "github.event_name == 'pull_request'",
+            job,
+        )
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name != github.repository",
+            job,
+        )
+        self.assertIn("'ubuntu-latest' || matrix.runs_on", job)
 
     def test_fork_push_keeps_its_own_workflow_entry(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")

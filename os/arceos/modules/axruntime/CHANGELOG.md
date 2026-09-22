@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.4](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.13.3...ax-runtime-v0.13.4) - 2026-09-21
+
+### Other
+
+- updated the following local packages: ax-driver, ax-hal
+
+## [0.13.3](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.13.2...ax-runtime-v0.13.3) - 2026-09-18
+
+### Added
+
+- *(vfs)* implement mutation credentials for directory operations an… ([#2287](https://github.com/rcore-os/tgoskits/pull/2287))
+- *(ax-task)* integrate capacity-aware Fair placement ([#2389](https://github.com/rcore-os/tgoskits/pull/2389))
+
+### Fixed
+
+- *(starry-kernel)* enforce executable inode write exclusion ([#2375](https://github.com/rcore-os/tgoskits/pull/2375))
+
+### Other
+
+- *(scheduler)* streamline wakeup paths and RT accounting ([#2435](https://github.com/rcore-os/tgoskits/pull/2435))
+- *(sched)* reduce scheduler and futex hot-path overhead ([#2399](https://github.com/rcore-os/tgoskits/pull/2399))
+
+## [0.13.2](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.13.1...ax-runtime-v0.13.2) - 2026-09-13
+
+### Other
+
+- updated the following local packages: ax-cpu, rdrive, ax-plat, ax-driver, ax-hal, cpu-local
+
+## [0.13.1](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.13.0...ax-runtime-v0.13.1) - 2026-09-12
+
+### Fixed
+
+- *(ax-task)* allow per-CPU timer wakes during CPU deactivation ([#2382](https://github.com/rcore-os/tgoskits/pull/2382))
+
+## [0.13.0](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.12.1...ax-runtime-v0.13.0) - 2026-09-11
+
+### Fixed
+
+- *(ax-task)* drain idle scheduler work before offline probes ([#2377](https://github.com/rcore-os/tgoskits/pull/2377))
+- *(axvm)* prepare host GIC before CPU enable and centralize fatal traps ([#2356](https://github.com/rcore-os/tgoskits/pull/2356))
+- *(axvisor)* restore COM1 console and preserve guest output order ([#2311](https://github.com/rcore-os/tgoskits/pull/2311))
+
+### Other
+
+- *(ax-task)* unify thread lifecycle and PREEMPT_RT lock semantics ([#2357](https://github.com/rcore-os/tgoskits/pull/2357))
+- *(ax-cpu)* [**breaking**] centralize CPU mechanisms and architecture backends ([#2363](https://github.com/rcore-os/tgoskits/pull/2363))
+
 ## [0.12.1](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.12.0...ax-runtime-v0.12.1) - 2026-09-09
 
 ### Fixed

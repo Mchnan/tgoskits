@@ -23,11 +23,15 @@ use linux_raw_sys::{
 
 use crate::{
     Errno, StarryError, StarryResult,
-    file::{Directory, FileLike, current_fd_table, fd_is_path, get_file_like, resolve_at, with_fs},
+    file::{
+        Directory, FileLike, current_fd_table, fd_is_path, get_file_like, resolve_at,
+        resolve_at_with_boundary_checked, with_fs,
+    },
     mm::{VmMutPtr, VmPtr, vm_load_path_string, vm_load_string, vm_write_slice},
     task::UserTaskRef,
     time::TimeValueLike,
 };
+use super::mutation_credentials;
 
 /// `FIOCLEX` / `FIONCLEX`: set / clear the close-on-exec flag on a file descriptor
 /// via `ioctl` (the ioctl spelling of `fcntl(fd, F_SETFD, ...)`). libc/musl and CPython
@@ -341,11 +345,17 @@ pub fn sys_mkdirat(
     let cred = thread.cred();
     let uid = cred.fsuid;
     let gid = cred.fsgid;
+    let mutation_cred = mutation_credentials(&cred);
 
     // call tp:trace_sys_mkdirat
     trace_sys_mkdirat(&path, mode.bits());
 
-    let result = with_fs(dirfd, |fs| match fs.create_dir(&path, mode, uid, gid) {
+    let resolve_dirfd = if path.starts_with('/') {
+        AT_FDCWD
+    } else {
+        dirfd
+    };
+    let result = with_fs(resolve_dirfd, |fs| match fs.create_dir(&path, mode, uid, gid, &mutation_cred) {
         Ok(_) => Ok(0),
         // mkdir on an existing path should report EEXIST.
         // Use no-follow lookup so dangling symlinks are treated as existing
@@ -397,14 +407,20 @@ pub fn sys_mknodat(
     let cred = thread.cred();
     let uid = cred.fsuid;
     let gid = cred.fsgid;
-    let res = with_fs(dirfd, |fs| {
-        let (dir, name) = fs.resolve_nonexistent(Path::new(&path))?;
-        let loc = dir.create(
-            name,
+    let mutation_cred = mutation_credentials(&cred);
+    let resolve_dirfd = if path.starts_with('/') {
+        AT_FDCWD
+    } else {
+        dirfd
+    };
+    let res = with_fs(resolve_dirfd, |fs| {
+        let loc = fs.create_node(
+            Path::new(&path),
             node_type,
             NodePermission::from_bits_truncate(perm as u16),
             uid,
             gid,
+            &mutation_cred,
         )?;
 
         // If device node, set rdev via update_metadata
@@ -559,17 +575,64 @@ pub fn sys_linkat(
         (flags & AT_EMPTY_PATH) | AT_SYMLINK_NOFOLLOW
     };
 
-    let old = resolve_at(old_dirfd, old_path.as_deref(), resolve_flags)?
+    let cred = current.as_thread().cred();
+    let mutation_cred = mutation_credentials(&cred);
+    // AT_EMPTY_PATH changes `olddirfd` into an object fd only for the
+    // genuinely empty pathname. With a non-empty pathname it is ignored by
+    // linkat(), so ordinary path-based linking remains unprivileged.
+    if flags & AT_EMPTY_PATH != 0
+        && old_path.as_deref().is_none_or(|path| path.is_empty())
+    {
+        // Linux requires CAP_DAC_READ_SEARCH for AT_EMPTY_PATH and reports
+        // ENOENT when the caller does not have it.
+        if !mutation_cred.cap_dac_read_search {
+            return Err(StarryError::NotFound);
+        }
+    }
+    let (old, old_boundary, old_search) = resolve_at_with_boundary_checked(
+        old_dirfd,
+        old_path.as_deref(),
+        resolve_flags,
+        |fs, directory| fs.check_search_path(directory, fs.permission_boundary(), &mutation_cred),
+    )?;
+    let old = old
         .into_file()
         .ok_or(StarryError::BadFileDescriptor)?;
+    // Linux rejects hard links to directories before checking the source
+    // parent or the destination. Keep this check at the syscall boundary as
+    // well as in the VFS helper, because dirfd/`.` resolution is allowed to
+    // return an already-open directory without a normal parent walk.
     if old.is_dir() {
         return Err(StarryError::OperationNotPermitted);
     }
-    let (new_dir, new_name) = with_fs(new_dirfd, |fs| {
-        Ok(fs.resolve_nonexistent(Path::new(&new_path))?)
+    // An absolute destination path is rooted at the process filesystem and
+    // ignores new_dirfd, including an invalid or non-directory descriptor.
+    let new_dirfd = if new_path.starts_with('/') {
+        AT_FDCWD
+    } else {
+        new_dirfd
+    };
+    let (new_dir, new_name, new_boundary, new_search) = with_fs(new_dirfd, |fs| {
+        let (new_dir, new_name, searched) =
+            fs.resolve_parent_with_search_checked(Path::new(&new_path), |directory| {
+                fs.check_search_path(directory, fs.permission_boundary(), &mutation_cred)
+            })?;
+        Ok((
+            new_dir,
+            new_name,
+            fs.permission_boundary().cloned(),
+            searched,
+        ))
     })?;
-
-    new_dir.link(new_name, &old)?;
+    with_fs(AT_FDCWD, |fs| {
+        fs.link_locations_with_boundaries_and_search(
+            (&old, &old_search),
+            (&new_dir, &new_name, &new_search),
+            (old_boundary.as_ref(), new_boundary.as_ref()),
+            &mutation_cred,
+        )?;
+        Ok(())
+    })?;
     Ok(0)
 }
 
@@ -594,6 +657,8 @@ pub fn sys_unlinkat(
     flags: i32,
 ) -> StarryResult<isize> {
     let path = vm_load_path_string(current, path)?;
+    let cred = current.as_thread().cred();
+    let mutation_cred = mutation_credentials(&cred);
 
     debug!("sys_unlinkat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
@@ -605,11 +670,16 @@ pub fn sys_unlinkat(
     }
 
     let deleted = path_info_at(dirfd, &path).ok();
-    let result = with_fs(dirfd, |fs| {
+    let resolve_dirfd = if path.starts_with('/') {
+        AT_FDCWD
+    } else {
+        dirfd
+    };
+    let result = with_fs(resolve_dirfd, |fs| {
         if flags & AT_REMOVEDIR as i32 != 0 {
-            fs.remove_dir(&path)?;
+            fs.remove_dir(&path, &mutation_cred)?;
         } else {
-            fs.remove_file(&path)?;
+            fs.remove_file(&path, &mutation_cred)?;
         }
         Ok(0)
     });
@@ -669,30 +739,14 @@ pub fn sys_symlinkat(
     let cred = current.as_thread().cred();
     let uid = cred.fsuid;
     let gid = cred.fsgid;
-    with_fs(new_dirfd, |fs| {
-        let (parent, name) = fs.resolve_parent(Path::new(&linkpath))?;
-        match parent.lookup_no_follow(&name) {
-            Ok(_) => return Err(StarryError::AlreadyExists),
-            Err(VfsError::NotFound) => {}
-            Err(err) => return Err(err.into()),
-        }
-        let meta = parent.metadata()?;
-        if !cred.has_cap_dac_override() {
-            let can_create = if cred.fsuid == meta.uid {
-                meta.mode
-                    .contains(NodePermission::OWNER_WRITE | NodePermission::OWNER_EXEC)
-            } else if cred.in_group(meta.gid) {
-                meta.mode
-                    .contains(NodePermission::GROUP_WRITE | NodePermission::GROUP_EXEC)
-            } else {
-                meta.mode
-                    .contains(NodePermission::OTHER_WRITE | NodePermission::OTHER_EXEC)
-            };
-            if !can_create {
-                return Err(StarryError::PermissionDenied);
-            }
-        }
-        fs.symlink(target, linkpath, uid, gid)?;
+    let mutation_cred = mutation_credentials(&cred);
+    let resolve_dirfd = if linkpath.starts_with('/') {
+        AT_FDCWD
+    } else {
+        new_dirfd
+    };
+    with_fs(resolve_dirfd, |fs| {
+        fs.symlink(target, linkpath, uid, gid, &mutation_cred)?;
         Ok(0)
     })
 }
@@ -1112,24 +1166,56 @@ pub fn sys_renameat2(
          new_path: {new_path}, flags: {flags}"
     );
 
-    let (old_dir, old_name) =
-        with_fs(old_dirfd, |fs| Ok(fs.resolve_parent(Path::new(&old_path))?))?;
-    let (new_dir, new_name) =
-        with_fs(new_dirfd, |fs| Ok(fs.resolve_parent(Path::new(&new_path))?))?;
-
-    if flags & RENAME_NOREPLACE != 0 {
-        // Linux reports a missing source leaf before checking whether the
-        // no-replace destination already exists.
-        old_dir.lookup_no_follow(&old_name)?;
-        match new_dir.lookup_no_follow(&new_name) {
-            Ok(_) => return Err(StarryError::AlreadyExists),
-            Err(VfsError::NotFound) => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
+    let old_dirfd = if old_path.starts_with('/') {
+        AT_FDCWD
+    } else {
+        old_dirfd
+    };
+    let new_dirfd = if new_path.starts_with('/') {
+        AT_FDCWD
+    } else {
+        new_dirfd
+    };
+    // Check search permissions while resolving each parent, before a missing
+    // entry or dangling symlink target can mask EACCES.
+    let cred = current.as_thread().cred();
+    let mutation_cred = mutation_credentials(&cred);
+    let (old_dir, old_name, old_boundary, old_search) = with_fs(old_dirfd, |fs| {
+        let (old_dir, old_name, searched) =
+            fs.resolve_parent_with_search_checked(Path::new(&old_path), |directory| {
+                fs.check_search_path(directory, fs.permission_boundary(), &mutation_cred)
+            })?;
+        Ok((
+            old_dir,
+            old_name,
+            fs.permission_boundary().cloned(),
+            searched,
+        ))
+    })?;
+    let (new_dir, new_name, new_boundary, new_search) = with_fs(new_dirfd, |fs| {
+        let (new_dir, new_name, searched) =
+            fs.resolve_parent_with_search_checked(Path::new(&new_path), |directory| {
+                fs.check_search_path(directory, fs.permission_boundary(), &mutation_cred)
+            })?;
+        Ok((
+            new_dir,
+            new_name,
+            fs.permission_boundary().cloned(),
+            searched,
+        ))
+    })?;
 
     // Propagate the filesystem errno directly to match renameat2 callers.
-    old_dir.rename_with_options(&old_name, &new_dir, &new_name, options)?;
+    with_fs(AT_FDCWD, |fs| {
+        Ok(fs.rename_locations_with_boundaries_and_search(
+            (&old_dir, &old_name),
+            (&new_dir, &new_name),
+            options,
+            (old_boundary.as_ref(), new_boundary.as_ref()),
+            (&old_search, &new_search),
+            &mutation_cred,
+        )?)
+    })?;
     Ok(0)
 }
 

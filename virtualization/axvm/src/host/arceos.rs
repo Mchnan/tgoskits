@@ -1,10 +1,9 @@
 //! Default private ArceOS host adapter for AxVM.
 
+#[cfg(any(not(target_arch = "loongarch64"), test))]
+use std::sync::OnceLock;
 use std::{
-    sync::{
-        OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
     thread,
     time::Duration,
 };
@@ -178,6 +177,7 @@ impl HostTimer for ArceOsHost {
             .map_err(|error| crate::AxVmError::host("disarm hard host timer", error))
     }
 
+    #[cfg(not(target_arch = "riscv64"))]
     fn cancel_timer(&self, handle: Self::TimerHandle) -> AxVmResult<super::HostTimerCancelOutcome> {
         runtime_task::time::timer::cancel_kernel_timer(handle)
             .map(|outcome| match outcome {
@@ -196,10 +196,12 @@ impl HostTimer for ArceOsHost {
 }
 
 /// Returns the platform IRQ reserved for the physical host console.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn host_console_irq() -> Option<modules::ax_hal::irq::IrqId> {
     modules::ax_hal::console::irq_num()
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn dispatch_host_irq(vector: usize) {
     modules::ax_hal::irq::handle_irq(vector, modules::ax_hal::irq::TrapOrigin::Kernel);
 }
@@ -224,28 +226,31 @@ pub(crate) type ArceOsWaitQueue = runtime_task::sync::WaitQueue;
 #[cfg(target_arch = "aarch64")]
 pub(crate) type ArceOsIrqError = modules::ax_hal::irq::IrqError;
 pub(crate) type ArceOsWaitQueueHandle = api::task::AxWaitQueueHandle;
+#[cfg(any(not(target_arch = "loongarch64"), test))]
+use runtime_task::time::MonotonicDeadline as ArceOsMonotonicDeadline;
 pub(crate) use runtime_task::{
     sched::{CpuId as ArceOsCpuId, CpuSet as ArceOsCpuSet, SchedulePolicy as ArceOsSchedulePolicy},
     thread::{
-        SwitchReason as ArceOsSwitchReason, TaskError as ArceOsTaskError,
-        ThreadExtension as ArceOsThreadExtension, ThreadExtensionOps as ArceOsThreadExtensionOps,
-        ThreadId as ArceOsThreadId,
+        SwitchReason as ArceOsSwitchReason, ThreadExtension as ArceOsThreadExtension,
+        ThreadExtensionOps as ArceOsThreadExtensionOps, ThreadId as ArceOsThreadId,
     },
-    time::MonotonicDeadline as ArceOsMonotonicDeadline,
 };
 
 /// Hard-IRQ-safe event consumed by one fixed ArceOS service thread.
+#[cfg(any(not(target_arch = "loongarch64"), test))]
 pub(crate) struct ArceOsIrqNotification {
     event: runtime_task::sync::irq::IrqWaitCell,
     waiter: OnceLock<ArceOsIrqWaiter>,
 }
 
+#[cfg(any(not(target_arch = "loongarch64"), test))]
 struct ArceOsIrqWaiter {
     owner: ArceOsThreadId,
     registration: runtime_task::sync::irq::IrqWaitRegistration,
     park: runtime_task::sync::WaitQueue,
 }
 
+#[cfg(any(not(target_arch = "loongarch64"), test))]
 impl ArceOsIrqNotification {
     pub(crate) const fn new() -> Self {
         Self {
@@ -306,35 +311,6 @@ impl ArceOsIrqNotification {
 pub(crate) fn current_thread() -> ArceOsThreadHandle {
     runtime_task::thread::current::current_thread_handle()
         .unwrap_or_else(|error| panic!("AxVM requires a current scheduler thread: {error}"))
-}
-
-pub(crate) unsafe fn spawn_thread_with_extension_and_affinity<F>(
-    entry: F,
-    name: std::string::String,
-    stack_size: usize,
-    extension: Option<ArceOsThreadExtension>,
-    affinity: Option<ArceOsCpuSet>,
-) -> Result<ArceOsThreadHandle, ArceOsTaskError>
-where
-    F: FnOnce() + Send + 'static,
-{
-    // SAFETY: the caller transfers unique ownership of `extension`; this
-    // adapter forwards it exactly once to the ArceOS runtime.
-    unsafe {
-        ax_std::os::arceos::thread::spawn_raw_with_extension_and_affinity(
-            entry, name, stack_size, extension, affinity,
-        )
-    }
-}
-
-pub(crate) fn join_thread(thread: ArceOsThreadHandle) -> Result<i32, ArceOsTaskError> {
-    ax_std::os::arceos::thread::join_thread(thread)
-}
-
-pub(crate) fn thread_extension(
-    thread: &ArceOsThreadHandle,
-) -> Result<Option<ax_std::os::arceos::thread::ThreadOsExtensionBorrow<'_>>, ArceOsTaskError> {
-    ax_std::os::arceos::thread::thread_os_extension(thread)
 }
 
 pub(crate) fn cpu_set_from_raw_bits(bits: usize) -> ArceOsCpuSet {
@@ -548,6 +524,7 @@ impl HostPlatform for ArceOsHost {
     }
 
     fn enable_virtualization_on_current_cpu(&self) -> AxVmResult {
+        crate::arch::current::prepare_host_virtualization()?;
         crate::percpu::init_current_cpu()?;
         crate::percpu::enable_current_cpu()?;
         crate::percpu::mark_cpu_enabled(self.this_cpu_id());
@@ -557,6 +534,7 @@ impl HostPlatform for ArceOsHost {
     fn enable_virtualization_on_all_cpus(&self) -> AxVmResult {
         static CORES: AtomicUsize = AtomicUsize::new(0);
 
+        crate::arch::current::prepare_host_virtualization()?;
         info!("Enabling hardware virtualization support on all cores...");
         CORES.store(0, Ordering::Release);
         crate::percpu::reset_enabled_cpu_mask();
@@ -575,21 +553,18 @@ impl HostPlatform for ArceOsHost {
             let affinity = cpu_set_one(cpu_id);
             // SAFETY: no OS extension is transferred and the affinity is
             // validated against the current runtime topology above.
-            let _task = unsafe {
-                spawn_thread_with_extension_and_affinity(
-                    move || {
+            let _task = {
+                ax_std::os::arceos::thread::builder(std::format!("axvm-hv-init-{cpu_id}"))
+                    .stack_size(AXVM_KERNEL_STACK_SIZE)
+                    .affinity(affinity)
+                    .spawn(move || {
                         let host = arceos_host();
                         info!("Core {cpu_id} is initializing hardware virtualization support...");
                         host.enable_virtualization_on_current_cpu()
                             .expect("failed to enable hardware virtualization");
                         info!("Hardware virtualization support enabled on core {cpu_id}");
                         let _ = CORES.fetch_add(1, Ordering::Release);
-                    },
-                    std::format!("axvm-hv-init-{cpu_id}"),
-                    AXVM_KERNEL_STACK_SIZE,
-                    None,
-                    Some(affinity),
-                )
+                    })
             }
             .unwrap_or_else(|error| {
                 panic!("failed to spawn AxVM CPU {cpu_id} initialization task: {error}")

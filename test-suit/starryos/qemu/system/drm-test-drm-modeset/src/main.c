@@ -22,6 +22,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 struct drm_mode_create_dumb {
@@ -83,6 +84,11 @@ struct drm_mode_crtc_page_flip {
     uint32_t crtc_id; uint32_t fb_id; uint32_t flags; uint32_t reserved;
     uint64_t user_data;
 };
+struct drm_mode_atomic {
+    uint32_t flags, count_objs;
+    uint64_t objs_ptr, count_props_ptr, props_ptr, prop_values_ptr;
+    uint64_t reserved, user_data;
+};
 struct drm_wait_vblank_reply {
     uint32_t type; uint32_t sequence; int64_t tv_sec; int64_t tv_usec;
 };
@@ -108,12 +114,14 @@ struct drm_event_vblank {
 #define DRM_IOCTL_MODE_GETPLANERESOURCES _IOWR('d', 0xB5, struct drm_mode_get_plane_res)
 #define DRM_IOCTL_MODE_GETPLANE          _IOWR('d', 0xB6, struct drm_mode_get_plane)
 #define DRM_IOCTL_MODE_ADDFB2            _IOWR('d', 0xB8, struct drm_mode_fb_cmd2)
+#define DRM_IOCTL_MODE_ATOMIC            _IOWR('d', 0xBC, struct drm_mode_atomic)
 #define DRM_IOCTL_MODE_OBJ_GETPROPERTIES _IOWR('d', 0xB9, struct drm_mode_obj_get_properties)
 #define DRM_IOCTL_WAIT_VBLANK            _IOWR('d', 0x3A, union drm_wait_vblank)
 #define DRM_IOCTL_CRTC_GET_SEQUENCE      _IOWR('d', 0x3B, struct drm_crtc_get_sequence)
 #define DRM_IOCTL_CRTC_QUEUE_SEQUENCE    _IOWR('d', 0x3C, struct drm_crtc_queue_sequence)
 
 #define DRM_MODE_OBJECT_PLANE       0xeeeeeeee
+#define PROP_PLANE_SRC_X            0x103
 #define DRM_PLANE_TYPE_PRIMARY      1
 #define DRM_MODE_PAGE_FLIP_EVENT    0x01
 #define DRM_MODE_PROP_ENUM          (1 << 3)
@@ -139,6 +147,18 @@ struct drm_event_crtc_sequence {
 #define DRM_EVENT_CRTC_SEQUENCE        0x03
 #define _DRM_VBLANK_RELATIVE           0x0000001
 #define _DRM_VBLANK_EVENT              0x4000000
+
+/* Both query APIs must observe the same committed binding. */
+static void check_binding(int fd, uint32_t plane, uint32_t crtc, uint32_t fb)
+{
+    struct drm_mode_get_plane p = { .plane_id = plane };
+    struct drm_mode_crtc c = { .crtc_id = crtc };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_GETPLANE, &p), 0, "GETPLANE binding");
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_GETCRTC, &c), 0, "GETCRTC binding");
+    CHECK(p.fb_id == fb && c.fb_id == fb, "plane and CRTC report committed framebuffer");
+    CHECK(p.crtc_id == (fb ? crtc : 0), "plane reports committed CRTC binding");
+    CHECK(c.mode_valid == (fb ? 1u : 0u), "CRTC mode validity follows enable/disable");
+}
 
 int main(void)
 {
@@ -250,14 +270,23 @@ int main(void)
     };
     CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &setcrtc), 0, "SETCRTC");
 
+    check_binding(fd, plane_ids[0], crtc_ids[0], fb.fb_id);
+
+    /* A different FB ID is essential: flipping to the original buffer cannot
+     * detect stale bindings. Both framebuffers may share the same GEM pages. */
+    struct drm_mode_fb_cmd2 next_fb = fb;
+    next_fb.fb_id = 0;
+    CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &next_fb), 0, "ADDFB2 flip target");
+
     /* --- page flip with event --- */
     struct drm_mode_crtc_page_flip flip = {
-        .crtc_id = crtc_ids[0], .fb_id = fb.fb_id,
+        .crtc_id = crtc_ids[0], .fb_id = next_fb.fb_id,
         .flags = DRM_MODE_PAGE_FLIP_EVENT,
         .user_data = 0xdeadbeefcafebabeULL,
     };
     CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &flip), 0,
               "PAGE_FLIP (with event)");
+    check_binding(fd, plane_ids[0], crtc_ids[0], next_fb.fb_id);
 
     struct pollfd pfd = { .fd = fd, .events = POLLIN };
     int pr = poll(&pfd, 1, 2000);
@@ -295,6 +324,12 @@ int main(void)
     CHECK(gseq1.active == 1, "GET_SEQUENCE active == 1 after SETCRTC");
     CHECK(gseq1.sequence_ns > 0, "GET_SEQUENCE timestamp positive");
     CHECK(gseq1.sequence >= seq1, "GET_SEQUENCE sequence >= flip seq");
+    int64_t flip_edge_ns = (int64_t)ev.tv_sec * 1000000000LL
+                         + (int64_t)ev.tv_usec * 1000;
+    int64_t expected_edge_ns = gseq1.sequence_ns
+                             - (int64_t)(gseq1.sequence - seq1) * (1000000000LL / 60);
+    CHECK(expected_edge_ns >= flip_edge_ns && expected_edge_ns - flip_edge_ns < 1000,
+          "flip timestamp identifies its sequence's vblank edge");
 
     usleep(120000); /* 约 7 个 vblank 周期 */
     struct drm_crtc_get_sequence gseq2 = { .crtc_id = crtc_ids[0] };
@@ -364,6 +399,32 @@ int main(void)
           "vblank event user_data == request.signal");
     CHECK(vev.crtc_id == crtc_ids[0], "vblank event crtc_id matches");
 
+    /* Each fresh open owns its event space; close cancels unexpired events. */
+    int other = open("/dev/dri/card0", O_RDWR | O_CLOEXEC | O_NONBLOCK);
+    CHECK(other >= 0, "open independent card0 file");
+    struct drm_crtc_queue_sequence immediate = {
+        .crtc_id = crtc_ids[0], .user_data = 0xace0, .sequence = 0,
+    };
+    CHECK_RET(ioctl(other, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &immediate), 0,
+              "queue immediate event on other open");
+    CHECK_ERR(read(fd, buf, sizeof(buf)), EAGAIN, "other open's event is isolated");
+    n = read(other, &seq_ev, sizeof(seq_ev));
+    CHECK(n == (ssize_t)sizeof(seq_ev) && seq_ev.user_data == 0xace0,
+          "event belongs to originating open");
+    for (unsigned i = 0; i < 128; i++) {
+        struct drm_crtc_queue_sequence future = {
+            .crtc_id = crtc_ids[0], .flags = DRM_CRTC_SEQUENCE_RELATIVE,
+            .sequence = i == 0 ? 2 : 100000, .user_data = i,
+        };
+        CHECK_RET(ioctl(other, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &future), 0,
+                  "reserve future event space");
+    }
+    CHECK_ERR(ioctl(other, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &immediate), ENOMEM,
+              "ready and future events share a per-open budget");
+    close(other);
+    struct pollfd isolated = { .fd = fd, .events = POLLIN };
+    CHECK(poll(&isolated, 1, 100) == 0, "closing other open cancels its events");
+
     /* --- 相对阻塞等待按周期睡眠 --- */
     union drm_wait_vblank wblock = {0};
     wblock.req.type = _DRM_VBLANK_RELATIVE;
@@ -393,7 +454,7 @@ int main(void)
         .count_connectors = 4,
     };
     CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &getc), 0, "GETCRTC readback");
-    CHECK(getc.fb_id == fb.fb_id, "GETCRTC fb_id matches SETCRTC");
+    CHECK(getc.fb_id == next_fb.fb_id, "GETCRTC fb_id follows PAGE_FLIP");
     CHECK(getc.count_connectors == 1, "GETCRTC count_connectors == 1");
     CHECK(readback_conns[0] == conn_ids[0],
           "GETCRTC reports the connector we set");
@@ -417,11 +478,44 @@ int main(void)
     getc.count_connectors = 4;
     CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &getc), 0,
               "GETCRTC after failed SETCRTC");
-    CHECK(getc.fb_id == fb.fb_id,
+    CHECK(getc.fb_id == next_fb.fb_id,
           "GETCRTC fb_id unchanged after failed SETCRTC");
+    check_binding(fd, plane_ids[0], crtc_ids[0], next_fb.fb_id);
+
+    /* Linux rejects a disable request that still names connectors and leaves
+     * the previously committed state intact. */
+    struct drm_mode_crtc bad_disable = {
+        .crtc_id = crtc_ids[0],
+        .set_connectors_ptr = (uint64_t)(uintptr_t)conn_ids,
+        .count_connectors = 1,
+    };
+    CHECK_ERR(ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &bad_disable), EINVAL,
+              "disable CRTC rejects connectors");
+    check_binding(fd, plane_ids[0], crtc_ids[0], next_fb.fb_id);
+
+    struct drm_mode_crtc disable = { .crtc_id = crtc_ids[0] };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_SETCRTC, &disable), 0, "disable CRTC");
+    check_binding(fd, plane_ids[0], crtc_ids[0], 0);
+    uint32_t plane = plane_ids[0], count = 1, src_x_prop = PROP_PLANE_SRC_X;
+    uint64_t src_x = 1;
+    struct drm_mode_atomic plane_only = {
+        .count_objs = 1,
+        .objs_ptr = (uint64_t)(uintptr_t)&plane,
+        .count_props_ptr = (uint64_t)(uintptr_t)&count,
+        .props_ptr = (uint64_t)(uintptr_t)&src_x_prop,
+        .prop_values_ptr = (uint64_t)(uintptr_t)&src_x,
+    };
+    CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &plane_only), 0,
+              "inactive plane property update");
+    struct drm_crtc_get_sequence inactive = { .crtc_id = crtc_ids[0] };
+    CHECK_ERR(ioctl(fd, DRM_IOCTL_CRTC_GET_SEQUENCE, &inactive), EINVAL,
+              "plane-only update does not activate CRTC");
+    setcrtc.fb_id = next_fb.fb_id;
+    CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &setcrtc), 0, "re-enable CRTC");
+    check_binding(fd, plane_ids[0], crtc_ids[0], next_fb.fb_id);
 
     /* --- SETCRTC referencing a removed fb must fail with EINVAL --- */
-    uint32_t old_fb_id = fb.fb_id;
+    uint32_t old_fb_id = next_fb.fb_id;
     CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_RMFB, &old_fb_id), 0, "RMFB");
     /* The legacy binding pointed at this fb; GETCRTC must reflect the
      * unbinding so userspace doesn't keep seeing a dangling fb_id. */
@@ -431,6 +525,7 @@ int main(void)
     CHECK(getc.fb_id == 0, "GETCRTC fb_id == 0 after RMFB clears binding");
     CHECK(getc.count_connectors == 0,
           "GETCRTC count_connectors == 0 after RMFB");
+    check_binding(fd, plane_ids[0], crtc_ids[0], 0);
 
     /* CRTC 失活后 vblank 时钟应拒绝服务（Linux drm_vblank_get 失败 → EINVAL）。 */
     struct drm_crtc_get_sequence gseq_off = { .crtc_id = crtc_ids[0] };

@@ -8,8 +8,7 @@ use object::{Object, ObjectSymbol};
 
 use super::{
     BacktraceBlockCapture, BacktraceSymbolizeSession, SymbolizeAfterQemuOutcome,
-    apply_qemu_log_retention, arceos_rust_elf_path, flush_pending_stream_symbolize,
-    maybe_symbolize_after_qemu,
+    apply_qemu_log_retention, flush_pending_stream_symbolize, maybe_symbolize_after_qemu,
     parser::{infer_kind_filter, parse_blocks},
     should_delete_qemu_log_after_symbolize, should_persist_qemu_capture_log, std_test_elf_path,
     symbolize::{
@@ -177,15 +176,6 @@ BACKTRACE_END
 }
 
 #[test]
-fn arceos_rust_elf_path_uses_release_profile() {
-    let path = arceos_rust_elf_path(Path::new("/ws"), "x86_64-unknown-none", "app", false);
-    assert_eq!(
-        path,
-        PathBuf::from("/ws/target/x86_64-unknown-none/release/app")
-    );
-}
-
-#[test]
 fn std_test_elf_path_uses_release_profile() {
     let path = std_test_elf_path(
         Path::new("/ws"),
@@ -195,7 +185,7 @@ fn std_test_elf_path_uses_release_profile() {
     );
     assert_eq!(
         path,
-        PathBuf::from("/ws/target/x86_64-unknown-linux-musl/release/arceos-test-suit")
+        PathBuf::from("/ws/x86_64-unknown-linux-musl/release/arceos-test-suit")
     );
 }
 

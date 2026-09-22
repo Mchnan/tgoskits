@@ -31,7 +31,9 @@ use std::{
 use ax_cpumask::CpuMask;
 use ax_memory_addr::align_up_4k;
 use ax_std::os::arceos::sync::IrqSafeMutex;
-use axaddrspace::{AddrSpace, NestedPageTableOps};
+use axaddrspace::AddrSpace;
+#[cfg(not(target_arch = "aarch64"))]
+use axaddrspace::NestedPageTableOps;
 use axdevice::*;
 use axdevice_base::*;
 use axvm_types::*;
@@ -237,6 +239,7 @@ struct VcpuThreadRuntime {
 
 pub(crate) struct VcpuEventWaitSnapshot {
     notification_generation: usize,
+    target: Arc<crate::vcpu::VcpuRunState>,
 }
 
 pub(crate) fn wait_for_vcpu_event_if_idle(
@@ -263,7 +266,7 @@ pub(crate) fn wait_for_vcpu_event_if_idle_with(
     wait_until: impl FnOnce(&dyn Fn() -> bool),
 ) {
     let wake_condition =
-        || !vm_running() || wait_snapshot.has_pending_event(runtime) || additional_ready();
+        || !vm_running() || wait_snapshot.take_pending_event(runtime) || additional_ready();
     if wake_condition() {
         return;
     }
@@ -403,7 +406,9 @@ impl VmRuntimeHandle {
     pub(crate) fn reap_retired_vcpu_task(&self, vcpu_id: usize) -> AxVmResult {
         let retired = self.vcpu_threads.lock().retired.remove(&vcpu_id);
         if let Some(runtime) = retired {
-            crate::host::task::join_thread(runtime.thread)
+            runtime
+                .thread
+                .join()
                 .map(|_exit_code| ())
                 .map_err(|error| AxVmError::host("join retired vCPU thread", error))?;
         }
@@ -487,11 +492,7 @@ impl VmRuntimeHandle {
 
     pub(crate) fn kick_vcpu(&self, vcpu_id: usize) -> AxVmResult {
         let kick = self.vcpu_kick_handle(vcpu_id)?;
-        self.notify_all();
-        let exit_cpu = kick.kick_from_task(crate::host::task::current_cpu_id());
-        if let Some(cpu_id) = exit_cpu {
-            crate::host::task::send_ipi(cpu_id);
-        }
+        kick.kick_from_task();
         Ok(())
     }
 
@@ -499,11 +500,20 @@ impl VmRuntimeHandle {
     pub(crate) fn request_vcpu(&self, vcpu_id: usize) -> AxVmResult {
         let kick = self.vcpu_kick_handle(vcpu_id)?;
         kick.publish_entry_request();
+        kick.kick_from_task();
+        Ok(())
+    }
+
+    /// Publishes VM-wide work before waking the vCPU that owns its poll loop.
+    ///
+    /// The entry request must be visible before advancing the shared wait
+    /// generation. This closes the same predicate-to-park window as the KVM
+    /// request path while keeping ordinary target kicks isolated.
+    pub(crate) fn request_vcpu_for_vm_work(&self, vcpu_id: usize) -> AxVmResult {
+        let kick = self.vcpu_kick_handle(vcpu_id)?;
+        kick.publish_entry_request();
         self.notify_all();
-        let exit_cpu = kick.kick_from_task(crate::host::task::current_cpu_id());
-        if let Some(cpu_id) = exit_cpu {
-            crate::host::task::send_ipi(cpu_id);
-        }
+        kick.kick_from_task();
         Ok(())
     }
 
@@ -518,14 +528,8 @@ impl VmRuntimeHandle {
 
     fn deliver_kicks(&self, kicks: Vec<crate::runtime::VcpuKickHandle>) {
         self.notify_all();
-        if kicks.is_empty() {
-            return;
-        }
-        let current_cpu = crate::host::task::current_cpu_id();
         for kick in kicks {
-            if let Some(cpu_id) = kick.kick_from_task(current_cpu) {
-                crate::host::task::send_ipi(cpu_id);
-            }
+            kick.kick_from_task();
         }
     }
 
@@ -581,11 +585,7 @@ impl VmRuntimeHandle {
                 Ok(needs_kick)
             },
             || {
-                self.notify_all();
-                let exit_cpu = kick.kick_from_task(crate::host::task::current_cpu_id());
-                if let Some(cpu_id) = exit_cpu {
-                    crate::host::task::send_ipi(cpu_id);
-                }
+                kick.kick_from_task();
                 Ok(())
             },
         )
@@ -613,11 +613,34 @@ impl VmRuntimeHandle {
                 Ok(needs_kick)
             },
             || {
-                self.notify_all();
-                let exit_cpu = kick.kick_from_task(crate::host::task::current_cpu_id());
-                if let Some(cpu_id) = exit_cpu {
-                    crate::host::task::send_ipi(cpu_id);
-                }
+                kick.kick_from_task();
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub(crate) fn dispatch_external_vcpu_interrupt(
+        &self,
+        vcpu_id: usize,
+        vector: usize,
+    ) -> AxVmResult {
+        let (owner, kick) = self.vcpu_dispatch_target(vcpu_id)?;
+        dispatch_vcpu_interrupt_with(
+            || {
+                let needs_kick = self
+                    .irq_dispatcher
+                    .enqueue_external(vcpu_id, owner, vector)
+                    .ok_or_else(|| {
+                        AxVmError::invalid_state(
+                            "dispatch external vCPU interrupt",
+                            format_args!("vCPU {vcpu_id} task generation changed"),
+                        )
+                    })?;
+                Ok(needs_kick)
+            },
+            || {
+                kick.kick_from_task();
                 Ok(())
             },
         )
@@ -642,9 +665,13 @@ impl VmRuntimeHandle {
         self.notification_generation.load(Ordering::Acquire)
     }
 
-    pub(crate) fn vcpu_event_wait_snapshot(&self) -> VcpuEventWaitSnapshot {
+    pub(crate) fn vcpu_event_wait_snapshot(
+        &self,
+        target: Arc<crate::vcpu::VcpuRunState>,
+    ) -> VcpuEventWaitSnapshot {
         VcpuEventWaitSnapshot {
             notification_generation: self.notification_generation(),
+            target,
         }
     }
 
@@ -768,7 +795,7 @@ impl VmRuntimeHandle {
         for (vcpu_id, thread) in threads {
             let thread_id = thread.id().as_u64();
             debug!("VM[{vm_id}] joining vCPU[{vcpu_id}] thread {thread_id}");
-            match crate::host::task::join_thread(thread) {
+            match thread.join() {
                 Ok(exit_code) => debug!(
                     "VM[{vm_id}] vCPU[{vcpu_id}] thread {thread_id} exited with code {exit_code}"
                 ),
@@ -788,9 +815,10 @@ impl VmRuntimeHandle {
 }
 
 impl VcpuEventWaitSnapshot {
-    pub(crate) fn has_pending_event(&self, runtime: &VmRuntimeHandle) -> bool {
+    pub(crate) fn take_pending_event(&self, runtime: &VmRuntimeHandle) -> bool {
         runtime.device_poll_requested()
             || runtime.notification_generation() != self.notification_generation
+            || self.target.take_unblock_request()
     }
 }
 
@@ -1359,6 +1387,9 @@ impl VMMemoryRegion {
     }
 }
 
+#[cfg(not(target_arch = "aarch64"))]
+mod translation;
+
 const TEMP_MAX_VCPU_NUM: usize = 64;
 
 /// A Virtual Machine.
@@ -1369,12 +1400,16 @@ pub struct AxVM {
     config: StdMutex<AxVMConfig>,
     /// Lifecycle and runtime state reached from both task and interrupt context.
     machine: IrqSafeMutex<Machine<AxVMResources, Arc<VmRuntimeHandle>>>,
+    #[cfg(not(target_arch = "aarch64"))]
+    translations: translation::TranslationGate,
     fw_cfg_payload: Arc<FwCfgPayloadSlot>,
 }
 
 impl AxVM {
     /// Creates a ready VM with eagerly initialized architecture resources.
     ///
+    /// Initialize the host with [`crate::AxvmRuntime::new`] before creating VMs;
+    /// resource planning uses the host capabilities recorded during CPU enable.
     /// The VM is not started until [`Self::start`] is called.
     ///
     /// # Errors
@@ -1394,6 +1429,8 @@ impl AxVM {
             name,
             config: StdMutex::new(config),
             machine: IrqSafeMutex::new(Machine::Ready(resources)),
+            #[cfg(not(target_arch = "aarch64"))]
+            translations: translation::TranslationGate::new(),
             fw_cfg_payload,
         });
 
@@ -1434,10 +1471,42 @@ impl AxVM {
         f(resources)
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
+    pub(crate) fn enter_translations(&self) -> Option<translation::GuestTranslation<'_>> {
+        self.translations.enter()
+    }
+
     fn with_resources_mut<F, R>(&self, f: F) -> AxVmResult<R>
     where
         F: FnOnce(&mut AxVMResources) -> AxVmResult<R>,
     {
+        #[cfg(not(target_arch = "aarch64"))]
+        let _translation_update = {
+            let update = self.translations.begin_update().ok_or_else(|| {
+                ax_err_type!(ResourceBusy, "nested table update already in progress")
+            })?;
+            if !update.quiescent() {
+                // Admission is already closed. A guest racing the final entry
+                // sees the pending physical IPI on hardware entry and exits.
+                let enabled = crate::percpu::enabled_cpu_mask();
+                for cpu in 0..usize::BITS as usize {
+                    if enabled & (1usize << cpu) != 0 {
+                        crate::host::task::send_ipi(cpu);
+                    }
+                }
+                let started = std::time::Instant::now();
+                while !update.quiescent() {
+                    if started.elapsed() >= std::time::Duration::from_secs(1) {
+                        return ax_err!(
+                            ResourceBusy,
+                            "guests did not retire for nested table update"
+                        );
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+            update
+        };
         let mut machine = self.machine.lock();
         let resources = machine
             .resources_mut()
@@ -1616,6 +1685,7 @@ impl AxVM {
     }
 
     /// Reads the immutable device graph resolved during architecture planning.
+    #[cfg(not(target_arch = "aarch64"))]
     pub(crate) fn with_planned_device_graph<F, R>(&self, f: F) -> AxVmResult<R>
     where
         F: FnOnce(&axdevice::ResolvedDeviceGraph) -> AxVmResult<R>,
@@ -1955,6 +2025,7 @@ impl AxVM {
             .map_err(Into::into)
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     pub(crate) fn handle_nested_page_fault(
         &self,
         addr: GuestPhysAddr,
@@ -1970,6 +2041,7 @@ impl AxVM {
         .unwrap_or(false)
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     fn debug_nested_page_fault(
         vm_id: usize,
         resources: &AxVMResources,
@@ -2785,7 +2857,7 @@ mod tests {
     #[test]
     fn vcpu_wake_before_park_is_observed_by_the_wait_generation() {
         let runtime = VmRuntimeHandle::new();
-        let snapshot = runtime.vcpu_event_wait_snapshot();
+        let snapshot = runtime.vcpu_event_wait_snapshot(Arc::new(crate::vcpu::VcpuRunState::new()));
         let entered_wait = AtomicBool::new(false);
 
         runtime.notify_all();
@@ -2803,9 +2875,32 @@ mod tests {
     }
 
     #[test]
+    fn targeted_notification_preserves_unrelated_wait_and_broadcast_releases_both() {
+        let runtime = VmRuntimeHandle::new();
+        let target = Arc::new(crate::vcpu::VcpuRunState::new());
+        let other = Arc::new(crate::vcpu::VcpuRunState::new());
+        let target_wait = runtime.vcpu_event_wait_snapshot(target.clone());
+        let other_wait = runtime.vcpu_event_wait_snapshot(other.clone());
+
+        target.request_unblock();
+        assert!(target_wait.take_pending_event(&runtime));
+        assert!(!other_wait.take_pending_event(&runtime));
+
+        let target_wait = runtime.vcpu_event_wait_snapshot(target.clone());
+        assert!(!target_wait.take_pending_event(&runtime));
+        target.request_unblock();
+        let target_wait = runtime.vcpu_event_wait_snapshot(target);
+        assert!(target_wait.take_pending_event(&runtime));
+        assert!(!target_wait.take_pending_event(&runtime));
+        runtime.notify_all();
+        assert!(target_wait.take_pending_event(&runtime));
+        assert!(other_wait.take_pending_event(&runtime));
+    }
+
+    #[test]
     fn timer_completion_before_park_is_observed_by_the_waiter() {
         let runtime = VmRuntimeHandle::new();
-        let snapshot = runtime.vcpu_event_wait_snapshot();
+        let snapshot = runtime.vcpu_event_wait_snapshot(Arc::new(crate::vcpu::VcpuRunState::new()));
         let completed = AtomicBool::new(true);
         let entered_wait = AtomicBool::new(false);
 
@@ -2823,7 +2918,7 @@ mod tests {
     #[test]
     fn timer_completion_at_the_park_boundary_is_rechecked() {
         let runtime = VmRuntimeHandle::new();
-        let snapshot = runtime.vcpu_event_wait_snapshot();
+        let snapshot = runtime.vcpu_event_wait_snapshot(Arc::new(crate::vcpu::VcpuRunState::new()));
         let completed = AtomicBool::new(false);
 
         wait_for_vcpu_event_if_idle_with(

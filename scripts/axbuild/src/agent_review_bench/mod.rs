@@ -394,18 +394,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_default_agent_configuration() {
-        let cli = TestCli::try_parse_from(["bench", "run"]).unwrap();
-        let Command::Run(args) = cli.command else {
-            panic!("expected run command");
-        };
-
-        assert_eq!(args.agent, AgentKind::Codex);
-        assert_eq!(args.model, None);
-        assert_eq!(args.reasoning_effort, "high");
-    }
-
-    #[test]
     fn percentage_handles_empty_and_non_empty_totals() {
         assert_eq!(percentage(0, 0), 0.0);
         assert_eq!(percentage(1, 2), 50.0);
@@ -416,25 +404,6 @@ mod tests {
         assert!(!recall_gate_failed(0.0, None));
         assert!(!recall_gate_failed(80.0, Some(80)));
         assert!(recall_gate_failed(79.9, Some(80)));
-    }
-
-    #[test]
-    fn agent_options_apply_to_review_and_grade() {
-        let args = RunArgs {
-            cases: Vec::new(),
-            prs: Vec::new(),
-            agent: AgentKind::Claude,
-            model: Some(String::new()),
-            reasoning_effort: "effort with spaces".into(),
-            timeout_secs: 7,
-            min_recall: None,
-            output: None,
-        };
-
-        let options = resolve_agent_options(&args);
-        assert_eq!(options.model.as_deref(), Some(""));
-        assert_eq!(options.reasoning_effort, "effort with spaces");
-        assert_eq!(options.timeout_secs, 7);
     }
 
     #[cfg(unix)]

@@ -17,7 +17,7 @@ use crate::{
     raw_console::RawConsoleInput,
     serial,
     structured_log::{RuntimeLogContext, write_record},
-    task::sync::SpinLock,
+    task::sync::RawSpinLock,
 };
 
 static ACTIVATION: OnceLock<ConsoleActivation> = OnceLock::new();
@@ -25,7 +25,7 @@ static TTY_NUMBERS: OnceLock<Box<[Option<usize>]>> = OnceLock::new();
 // Task writers take these in order. Log publishers take only the hardware
 // lock, so early CPUs and interrupt context never touch task-owned state.
 static RAW_OUTPUT_LOCK: Mutex<()> = Mutex::new(());
-static RAW_HARDWARE_LOCK: SpinLock<()> = SpinLock::new(());
+static RAW_HARDWARE_LOCK: RawSpinLock<()> = RawSpinLock::new(());
 static RAW_OUTPUT_SOURCE: OnceLock<Arc<PollSet>> = OnceLock::new();
 
 /// Result of selecting the firmware console before secondary CPUs start.
@@ -532,8 +532,9 @@ impl ConsoleLogSubscription {
     ///
     /// `tag` is opaque to the runtime and identifies the application stream and
     /// its generation. Adjacent writes with the same tag may coalesce. This
-    /// operation allocates nothing and never sleeps; a full queue rejects the
-    /// entire write with `WouldBlock` and accounts it in `dropped()`.
+    /// operation allocates nothing and never sleeps. A full queue rejects the
+    /// entire write with `WouldBlock`; the producer retains ownership and must
+    /// retry instead of reporting the bytes as dropped host logs.
     pub fn write_output(&self, tag: u128, bytes: &[u8]) -> RuntimeResult {
         self.inner.write_output(tag, bytes)
     }

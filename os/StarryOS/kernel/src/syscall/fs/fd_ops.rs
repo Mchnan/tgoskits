@@ -19,12 +19,14 @@ use crate::{
     },
     mm::{VmMutPtr, VmPtr, vm_load, vm_load_path_string},
     pseudofs::{Device, dev::tty},
-    sync::SpinRwLock,
+    sync::RawSpinRwLock,
     task::{
         TgidNumber, TidNumber, current_pid_view, get_user_process_data_by_number,
         get_user_task_by_number,
     },
 };
+
+use super::mutation_credentials;
 
 /// Convert open flags to [`OpenOptions`].
 fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32)) -> OpenOptions {
@@ -84,54 +86,43 @@ fn add_to_fd(
     flags: u32,
     mount_table_namespace: Option<Arc<MountNamespace>>,
 ) -> StarryResult<i32> {
-    // FIFO + O_NONBLOCK + O_WRONLY (no reader) → ENXIO.
-    //
-    // man 2 open §"ENXIO" 第 1 variant：
-    //   "O_NONBLOCK | O_WRONLY is set, the named file is a FIFO, and no
-    //    process has the FIFO open for reading."
-    //
-    // TODO: 当前实现假设「FIFO 始终无 reader」(conservative assumption)。
-    //
-    //   原因 / 妥协：starry 的 vfs 目前不为 FIFO 节点维护 reader/writer
-    //   count（实现完整 FIFO IPC state machine 超出 open/openat 修复
-    //   范围 — 是独立的 IPC 子系统功能补全）。
-    //
-    //   假设的理由：在测试环境里，bug-open-fifo-wronly-no-reader-no-enxio
-    //   只覆盖「无 reader」这一确定状态。对此状态本实现行为正确（返 ENXIO）。
-    //   若 FIFO 真存在 reader 进程并已 open(FIFO, O_RDONLY)，本实现仍会返
-    //   ENXIO —— 此时与 Linux 行为不符（Linux 应返 fd>=0）。
-    //
-    //   完整修复（待独立 PR）：FIFO node 加 reader_count / writer_count 字段
-    //   （AtomicU32 + 同步原语），open(FIFO) 路径根据 access mode 增减计数，
-    //   close 时递减，本检查改为：
-    //     if let Some(fifo) = inner.downcast_ref::<Fifo>() {
-    //         if fifo.reader_count() == 0 { return Err(...ENXIO...); }
-    //     }
-    //   同时阻塞模式（非 NONBLOCK）的 WRONLY 应等待 reader 到来（更复杂）。
-    //   该完整修复需联动 axfs-ng-vfs::Fifo 节点定义（目前无独立类型，FIFO 走通用
-    //   File backend 即不区分 reader / writer），属 IPC 子系统专项。
-    //
-    // Fixes bug-open-fifo-wronly-no-reader-no-enxio (no-reader case only).
-    if flags & O_PATH == 0
-        && flags & O_NONBLOCK != 0
-        && flags & 0b11 == O_WRONLY
-        && let OpenResult::File(ref f) = result
-        && let Ok(meta) = f.location().metadata()
-        && meta.node_type == NodeType::Fifo
-    {
-        return Err(StarryError::NoSuchDeviceOrAddress);
-    }
-
     let f: Arc<dyn FileLike> = match result {
         OpenResult::File(mut file) => {
             if flags & O_PATH != 0 {
                 return add_file_like(Arc::new(File::new(file, flags)), flags & O_CLOEXEC != 0);
             }
+            if file.location().node_type() == NodeType::Fifo {
+                let reservation = crate::file::FileDescriptorReservation::new()?;
+                let pipe = Pipe::open_fifo(current, file, flags)?;
+                let fd = reservation.fd();
+                reservation.install(crate::file::FileDescriptor {
+                    inner: Arc::new(pipe),
+                    cloexec: flags & O_CLOEXEC != 0,
+                });
+                return Ok(fd);
+            }
             // /dev/xx handling
             if let Ok(device) = file.location().entry().downcast::<Device>() {
                 let inner = device.inner().as_any();
+                if crate::pseudofs::dev::card0::is_card0_device(inner) {
+                    let wrapped = crate::pseudofs::dev::card0::open_card0_file(
+                        device.inner().clone(), file, flags,
+                    )?;
+                    if flags & O_NONBLOCK != 0 {
+                        wrapped.set_nonblocking(true)?;
+                    }
+                    return add_file_like(wrapped, flags & O_CLOEXEC != 0);
+                }
                 if crate::pseudofs::usbfs::is_usbfs_device(inner) {
                     let wrapped = crate::pseudofs::usbfs::open_usbfs_file(inner, file, flags)?;
+                    if flags & O_NONBLOCK != 0 {
+                        wrapped.set_nonblocking(true)?;
+                    }
+                    return add_file_like(wrapped, flags & O_CLOEXEC != 0);
+                }
+                #[cfg(feature = "rknpu")]
+                if crate::pseudofs::dev::card1::is_card1_device(inner) {
+                    let wrapped = crate::pseudofs::dev::card1::open_card1_file(file, flags)?;
                     if flags & O_NONBLOCK != 0 {
                         wrapped.set_nonblocking(true)?;
                     }
@@ -258,6 +249,9 @@ fn try_reopen_self_pipe(path: &str, flags: u32) -> Option<StarryResult<isize>> {
     };
     let pipe = file.downcast_ref::<Pipe>()?;
 
+    if pipe.named_file().is_some() {
+        return None;
+    }
     let requested_access = flags & O_ACCMODE;
     let expected_access = if pipe.is_read() { O_RDONLY } else { O_WRONLY };
     if requested_access != expected_access {
@@ -268,12 +262,12 @@ fn try_reopen_self_pipe(path: &str, flags: u32) -> Option<StarryResult<isize>> {
     Some(add_file_like(pipe, flags & O_CLOEXEC != 0).map(|fd| fd as isize))
 }
 
-/// Reopens a filesystem-backed regular file through `/proc/self/fd/<n>`.
+/// Reopens a filesystem-backed file through `/proc/self/fd/<n>`.
 ///
 /// Proc fd entries are magic links to the referenced inode, not ordinary
 /// pathname symlinks. Reopening must therefore keep working after unlink or
 /// mount-tree changes make the file's former pathname unresolvable.
-fn try_reopen_self_regular_file(
+fn try_reopen_self_file(
     current: &crate::task::UserTaskRef,
     path: &str,
     flags: u32,
@@ -287,17 +281,23 @@ fn try_reopen_self_regular_file(
         Ok(file) => file,
         Err(_) => return Some(Err(StarryError::NotFound)),
     };
-    let file = file_like.downcast_ref::<File>()?;
+    let file = file_like.downcast_ref::<File>().or_else(|| {
+        file_like
+            .downcast_ref::<Pipe>()?
+            .named_file()
+            .map(Arc::as_ref)
+    })?;
     let location = file.inner().location();
-    if location.node_type() != NodeType::RegularFile {
+    if !matches!(location.node_type(), NodeType::RegularFile | NodeType::Fifo) {
         return None;
     }
 
     let cred = current.as_thread().cred();
+    let mutation_cred = mutation_credentials(&cred);
     let options = flags_to_options(flags as i32, 0, (cred.fsuid, cred.fsgid));
     Some(
         options
-            .open_loc(location.clone())
+            .open_loc_with_credentials(location.clone(), &mutation_cred)
             .map_err(StarryError::from)
             .and_then(|result| add_to_fd(current, result, flags, None))
             .map(|fd| fd as isize),
@@ -506,7 +506,7 @@ pub fn sys_openat(
     if let Some(result) = try_reopen_self_pipe(&path, uflags) {
         return result;
     }
-    if let Some(result) = try_reopen_self_regular_file(current, &path, uflags) {
+    if let Some(result) = try_reopen_self_file(current, &path, uflags) {
         return result;
     }
 
@@ -530,6 +530,7 @@ pub fn sys_openat(
     }
 
     let cred = thread.cred();
+    let mutation_cred = mutation_credentials(&cred);
     let options = flags_to_options(flags, mode, (cred.fsuid, cred.fsgid));
     let should_notify_create = uflags & O_CREAT != 0
         && uflags & O_PATH == 0
@@ -540,7 +541,7 @@ pub fn sys_openat(
         })?;
 
     // Open first, then install the file so filesystem errors propagate unchanged.
-    let result = with_fs(dirfd, |fs| Ok(options.open(fs, path)?))?;
+    let result = with_fs(dirfd, |fs| Ok(options.open_with_credentials(fs, path, &mutation_cred)?))?;
     let mount_table_namespace = mount_table_namespace(current, &result);
     let fd = add_to_fd(current, result, flags as _, mount_table_namespace)?;
     if should_notify_create {
@@ -569,6 +570,13 @@ pub fn sys_openat2(
     openat2_check_extra_bytes(current, how, size)?;
 
     if how_value.flags & !OPENAT2_VALID_FLAGS != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    // Unlike openat, openat2 rejects flags incompatible with O_PATH instead
+    // of silently discarding them, including when resolve is zero.
+    if how_value.flags & O_PATH as u64 != 0
+        && how_value.flags & !((O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW) as u64) != 0
+    {
         return Err(StarryError::InvalidInput);
     }
     if how_value.mode & !0o7777 != 0 {
@@ -618,18 +626,54 @@ pub fn sys_openat2(
     let thread = curr.as_thread();
     let mode = mode & !thread.proc_data.umask();
     let cred = thread.cred();
+    let mutation_cred = mutation_credentials(&cred);
     let mut options = flags_to_options(flags, mode, (cred.fsuid, cred.fsgid));
     let result = with_fs(dirfd, |fs| {
-        let (parent, name) = fs.resolve_parent_beneath_no_symlinks(path.as_ref())?;
+        let path_ref = axfs_ng_vfs::path::Path::new(&path);
+        let must_be_dir = path_ref.has_trailing_slash();
+        let dot_only = path_ref
+            .components()
+            .all(|component| matches!(component, axfs_ng_vfs::path::Component::CurDir));
+
+        // A path made only of `.` components names the already-open dirfd.
+        // Resolving it directly avoids manufacturing a lookup through the
+        // dirfd's parent, which may be intentionally inaccessible. Preserve
+        // O_CREAT|O_EXCL's EEXIST precedence for this existing final entry.
+        if dot_only {
+            if uflags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) {
+                return Err(StarryError::AlreadyExists);
+            }
+            let (location, _) = fs.resolve_with_search_checked(axfs_ng_vfs::path::Path::new(&path), |directory| {
+                fs.check_search_path(directory, fs.permission_boundary(), &mutation_cred)
+            })?;
+            options.no_follow(true);
+            return Ok(options.open_loc_with_credentials(location, &mutation_cred)?);
+        }
+        let (parent, name) = fs.resolve_parent_beneath_no_symlinks_checked(
+            path.as_ref(),
+            |directory| fs.check_search_path(directory, fs.permission_boundary(), &mutation_cred),
+        )?;
         match parent.lookup_no_follow(name.as_ref()) {
             Ok(location) if location.node_type() == NodeType::Symlink => {
                 return Err(StarryError::FilesystemLoop);
             }
-            Err(VfsError::NotFound) | Ok(_) => {}
+            Ok(location) => {
+                if must_be_dir && !location.is_dir() {
+                    return Err(StarryError::NotADirectory);
+                }
+            }
+            Err(VfsError::NotFound) => {
+                // A trailing slash requires a directory and must not create a
+                // regular file while preparing the final lookup.
+                if must_be_dir {
+                    options.create(false).create_new(false);
+                }
+            }
             Err(error) => return Err(error.into()),
         }
+        let fs = fs.with_current_dir(parent)?;
         options.no_follow(true);
-        Ok(options.open(&fs.with_current_dir(parent)?, name.as_ref())?)
+        Ok(options.open_with_credentials(&fs, name.as_ref(), &mutation_cred)?)
     })?;
     let mount_table_namespace = mount_table_namespace(current, &result);
     add_to_fd(current, result, flags as u32, mount_table_namespace).map(|fd| fd as isize)
@@ -691,7 +735,7 @@ pub fn sys_close_range(
     debug!("sys_close_range <= fds: [{first}, {last}], flags: {flags:?}");
     if flags.contains(CloseRangeFlags::UNSHARE) {
         let curr = current;
-        let new_files = Arc::new(SpinRwLock::new(
+        let new_files = Arc::new(RawSpinRwLock::new(
             crate::file::current_fd_table().read().clone(),
         ));
         curr.as_thread().with_current_scope_mut(|scope| {

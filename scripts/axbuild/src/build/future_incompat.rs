@@ -59,37 +59,6 @@ pub(crate) struct FutureIncompatReportSession {
     finished: bool,
 }
 
-pub(crate) fn cargo_target_dir_for(
-    workspace_root: &Path,
-    cargo_args: &[String],
-) -> anyhow::Result<PathBuf> {
-    let mut target_dir = None;
-    let mut args = cargo_args.iter();
-    while let Some(arg) = args.next() {
-        if arg == "--" {
-            break;
-        }
-        if arg == "--target-dir" {
-            let value = args
-                .next()
-                .context("Cargo argument `--target-dir` is missing its value")?;
-            target_dir = Some(PathBuf::from(value));
-        } else if let Some(value) = arg.strip_prefix("--target-dir=") {
-            if value.is_empty() {
-                bail!("Cargo argument `--target-dir=` is missing its value");
-            }
-            target_dir = Some(PathBuf::from(value));
-        }
-    }
-
-    let target_dir = target_dir.unwrap_or_else(|| workspace_root.join("target"));
-    Ok(if target_dir.is_absolute() {
-        target_dir
-    } else {
-        workspace_root.join(target_dir)
-    })
-}
-
 pub(crate) fn start_future_incompat_report_session(
     target_dir: &Path,
 ) -> anyhow::Result<FutureIncompatReportSession> {
@@ -382,6 +351,15 @@ fn validate_package_diagnostics(package: &str, diagnostic: &str) -> anyhow::Resu
     let mut warning_count = 0;
     let mut index = 0;
     while index < lines.len() {
+        // Cargo concatenates reports when build-std and application dependencies
+        // instantiate the same package. Each instance must contain approved
+        // diagnostics; a repeated header does not authorize arbitrary content.
+        if lines[index] == header {
+            index += 1;
+            if index == lines.len() {
+                bail!("`{package}` has an empty repeated diagnostic body");
+            }
+        }
         if lines[index] != format!("> {WARNING}") {
             bail!(
                 "`{package}` contains unapproved content outside a Rust #134375 diagnostic: {}",
@@ -516,6 +494,27 @@ mod tests {
     }
 
     #[test]
+    fn report_accepts_std_and_dependency_instances_of_the_same_package() {
+        let diagnostic = approved_diagnostic("memchr@2.8.3").repeat(2);
+        assert_eq!(
+            validate_report_json(&report_json(
+                REPORT_VERSION,
+                &[("memchr@2.8.3", diagnostic)]
+            ))
+            .unwrap(),
+            ["memchr@2.8.3"]
+        );
+        let mixed = format!(
+            "{}{}",
+            approved_diagnostic("memchr@2.8.3"),
+            approved_diagnostic("memchr@2.8.3").replace(WARNING, "warning: unapproved ABI")
+        );
+        assert!(
+            validate_report_json(&report_json(REPORT_VERSION, &[("memchr@2.8.3", mixed)])).is_err()
+        );
+    }
+
+    #[test]
     fn report_rejects_unapproved_package_or_version() {
         let package_error = validate_report_json(&report_json(
             REPORT_VERSION,
@@ -583,25 +582,6 @@ mod tests {
             .push(duplicate);
         let id_error = validate_report_json(&duplicate_ids.to_string()).unwrap_err();
         assert!(id_error.to_string().contains("report ids"));
-    }
-
-    #[test]
-    fn cargo_target_dir_comes_from_the_cargo_invocation_not_artifact_depth() {
-        let workspace = Path::new("/workspace");
-
-        assert_eq!(
-            cargo_target_dir_for(workspace, &[]).unwrap(),
-            Path::new("/workspace/target")
-        );
-        assert_eq!(
-            cargo_target_dir_for(workspace, &["--target-dir".into(), "ktest-target".into()])
-                .unwrap(),
-            Path::new("/workspace/ktest-target")
-        );
-        assert_eq!(
-            cargo_target_dir_for(workspace, &["--target-dir=/tmp/custom-target".into()]).unwrap(),
-            Path::new("/tmp/custom-target")
-        );
     }
 
     #[test]

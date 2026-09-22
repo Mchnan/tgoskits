@@ -12,8 +12,11 @@ use ax_io::prelude::*;
 use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use ax_runtime::hal::{
     cpu::{
-        UserAccessError, UserAccessType, UserAtomicError, UserAtomicU32Op, asm::user_copy,
-        trap::PageFaultFlags, user_atomic_u32, user_read_u32,
+        trap::PageFaultFlags,
+        user::{
+            UserAccessError, UserAccessType, UserAtomicError, UserAtomicU32Op, user_atomic_u32,
+            user_cmpxchg_u32, user_copy, user_read_u32,
+        },
     },
     paging::MappingFlags,
 };
@@ -34,7 +37,7 @@ fn access_user_memory<R>(task: &UserTaskRef, f: impl FnOnce() -> R) -> VmResult<
         return Err(VmError::AccessDenied);
     }
     assert!(
-        ax_runtime::hal::cpu::asm::irqs_enabled(),
+        ax_runtime::hal::cpu::interrupt::irqs_enabled(),
         "faultable user memory access requires IRQs enabled"
     );
     let _scope = task.as_thread().enter_user_memory_access();
@@ -268,6 +271,20 @@ impl UserAccess<NoFault> {
         unsafe { user_read_u32(self.range.start.as_usize() as *const u32) }
     }
 
+    fn cmpxchg_u32(self, expected: u32, replacement: u32) -> Result<u32, UserAtomicError> {
+        debug_assert_eq!(self.intent, UserAccessIntent::ReadWrite);
+        // SAFETY: construction checked alignment and the active user range.
+        // The architecture exception table handles faults and concurrent unmaps;
+        // no Rust reference to user memory is constructed or retained.
+        unsafe {
+            user_cmpxchg_u32(
+                self.range.start.as_usize() as *mut u32,
+                expected,
+                replacement,
+            )
+        }
+    }
+
     fn atomic_u32(self, operation: UserAtomicU32Op, argument: u32) -> Result<u32, UserAtomicError> {
         debug_assert_eq!(self.intent, UserAccessIntent::ReadWrite);
         // SAFETY: construction checked alignment and the architecture user
@@ -313,7 +330,7 @@ fn user_range_probe_ready(range: UserAccessRange, intent: UserAccessIntent) -> b
         // SAFETY: IRQs are disabled for the whole loop by the guard above, which
         // is `user_access_ok_page`'s precondition (`PAR_EL1` not clobbered by a
         // concurrent `AT` on this CPU).
-        if !unsafe { ax_runtime::hal::cpu::asm::user_access_ok_page(page, architecture_access) } {
+        if !unsafe { ax_runtime::hal::cpu::user::user_access_ok_page(page, architecture_access) } {
             return false;
         }
         page += PAGE_SIZE_4K;
@@ -604,6 +621,18 @@ pub fn atomic_update_user_u32_nofault(
         .atomic_u32(operation, argument)
 }
 
+/// Returns the observed user word, replacing it only if it equals `expected`.
+/// Fault handling and contention rescheduling belong to the task-context caller.
+pub fn compare_exchange_user_u32_nofault(
+    ptr: *mut u32,
+    expected: u32,
+    replacement: u32,
+) -> Result<u32, UserAtomicError> {
+    UserAccess::<NoFault>::aligned_u32(ptr.addr(), UserAccessIntent::ReadWrite)
+        .ok_or(UserAtomicError::Fault)?
+        .cmpxchg_u32(expected, replacement)
+}
+
 pub fn read_user_u32_nofault(ptr: *const u32) -> Result<u32, UserAccessError> {
     UserAccess::<NoFault>::aligned_u32(ptr.addr(), UserAccessIntent::Read)
         .ok_or(UserAccessError::Fault)?
@@ -802,6 +831,7 @@ pub(crate) fn handle_page_fault(vaddr: VirtAddr, access_flags: PageFaultFlags) -
         return false;
     }
     PAGE_FAULT_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::perf::sw::on_page_fault(thr, false);
     aspace_arc.handle_page_fault(vaddr, access_flags)
 }
 
@@ -862,17 +892,6 @@ fn prepare_user_memory(
         UserAccessIntent::Read
     };
     UserAccess::<Faultable>::new(start, len, intent)?.prepare(task, op)
-}
-
-/// Faults in and validates a userspace output range without modifying it.
-///
-/// Transactions use this before their publication point so copyout is the
-/// only remaining userspace operation after kernel resources are prepared.
-pub(crate) fn prepare_user_write(task: &UserTaskRef, start: usize, len: usize) -> VmResult {
-    if len == 0 {
-        return Ok(());
-    }
-    prepare_user_memory(task, "write", start, len, MappingFlags::WRITE)
 }
 
 /// Validates a transaction's captured source range before publication.
@@ -1029,7 +1048,11 @@ where
                 flush_tlb_range(aligned_addr, aligned_length);
                 action(addr.as_mut_ptr());
 
-                ax_runtime::hal::cache::clean_dcache_to_pou(addr, len);
+                let cache_range = ax_cpu::cache::CacheRange::new(addr, len)
+                    .map_err(|_| StarryError::BadAddress)?;
+                // SAFETY: the locked kernel mapping covers the range, and
+                // stop_machine excludes concurrent text execution and writes.
+                unsafe { ax_cpu::cache::clean_dcache_range_to_pou(cache_range) };
 
                 guard.protect(aligned_addr, aligned_length, original_flags)?;
                 return Ok(());
@@ -1063,7 +1086,7 @@ pub fn write_kernel_text(addr: VirtAddr, data: &[u8]) -> StarryResult<()> {
 }
 
 pub fn flush_tlb_range(start: VirtAddr, size: usize) {
-    ax_runtime::hal::cache::flush_tlb_range(start, size);
+    ax_cpu::mmu::flush_tlb_range(start, size);
 }
 
 pub fn flush_tlb_range_sync(start: VirtAddr, size: usize) -> StarryResult {
@@ -1079,7 +1102,7 @@ pub fn flush_tlb_range_sync(start: VirtAddr, size: usize) -> StarryResult {
 }
 
 fn sync_modified_kernel_text(start: VirtAddr, size: usize) {
-    ax_runtime::hal::cache::sync_kernel_text(start, size);
+    ax_cpu::cache::sync_kernel_text(start, size);
 }
 
 #[cfg(all(test, not(axtest)))]

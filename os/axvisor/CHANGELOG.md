@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.8.0...axvisor-v0.8.1) - 2026-09-21
+
+### Fixed
+
+- *(axvisor)* validate guest kernels and complete shell editing ([#2462](https://github.com/rcore-os/tgoskits/pull/2462))
+- *(axvm)* unify targeted vCPU unblock and kick handling ([#1934](https://github.com/rcore-os/tgoskits/pull/1934))
+
+### Other
+
+- *(axbuild)* move generated artifacts into Cargo target ([#2460](https://github.com/rcore-os/tgoskits/pull/2460))
+
+## [0.8.0](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.7.5...axvisor-v0.8.0) - 2026-09-18
+
+### Added
+
+- *(axvm)* support LoongArch PCI direct boot ([#2405](https://github.com/rcore-os/tgoskits/pull/2405))
+- *(axvm)* support x86 virtio-blk file backends ([#2390](https://github.com/rcore-os/tgoskits/pull/2390))
+
+### Fixed
+
+- *(axvm)* reduce redundant vCPU scheduling and add board perf CI ([#2362](https://github.com/rcore-os/tgoskits/pull/2362))
+
+### Other
+
+- *(axvisor)* remove test-only features and normalize test layout ([#2450](https://github.com/rcore-os/tgoskits/pull/2450))
+
+## [0.7.5](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.7.4...axvisor-v0.7.5) - 2026-09-13
+
+### Other
+
+- updated the following local packages: ax-driver, axbuild, ax-std
+
+## [0.7.4](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.7.3...axvisor-v0.7.4) - 2026-09-12
+
+### Added
+
+- *(axvisor)* validate RISC-V virtio-blk guest ([#2379](https://github.com/rcore-os/tgoskits/pull/2379))
+
+## [0.7.3](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.7.2...axvisor-v0.7.3) - 2026-09-11
+
+### Added
+
+- *(axvisor)* validate AArch64 virtio-blk with Linux smoke
+
+### Fixed
+
+- *(axvm)* prepare host GIC before CPU enable and centralize fatal traps ([#2356](https://github.com/rcore-os/tgoskits/pull/2356))
+- *(axvisor)* restore COM1 console and preserve guest output order ([#2311](https://github.com/rcore-os/tgoskits/pull/2311))
+
+### Other
+
+- *(axbuild)* migrate test execution to shell check steps ([#2361](https://github.com/rcore-os/tgoskits/pull/2361))
+
 ## [0.7.2](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.7.1...axvisor-v0.7.2) - 2026-09-09
 
 ### Other

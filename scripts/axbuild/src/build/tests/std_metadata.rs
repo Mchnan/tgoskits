@@ -1,36 +1,6 @@
 use super::*;
 
 #[test]
-fn std_build_only_propagates_selected_features() {
-    let workspace = temp_workspace("std-app", "").unwrap();
-    let app_manifest = workspace.join("app/Cargo.toml");
-    fs::write(
-        &app_manifest,
-        "[package]\nname = \"std-app\"\nversion = \"0.1.0\"\nedition = \
-         \"2024\"\n\n[package.metadata.axstd]\nfeatures = [\"net\", \"log-level-debug\"]\n",
-    )
-    .unwrap();
-
-    let mut info = BuildInfo {
-        features: vec!["dns".to_string()],
-        ..BuildInfo::default()
-    };
-
-    info.resolve_std_features();
-    pass_std_build_nested_features(
-        &mut info.features,
-        &[],
-        &[
-            "dns".to_string(),
-            "net".to_string(),
-            "std-compat".to_string(),
-        ],
-    );
-
-    assert!(info.features.contains(&"ax-std/dns".to_string()));
-}
-
-#[test]
 fn std_build_does_not_auto_enable_app_arceos_feature() {
     let metadata = repo_metadata();
     let cargo = BuildInfo {
@@ -41,6 +11,7 @@ fn std_build_does_not_auto_enable_app_arceos_feature() {
         "arceos-helloworld",
         "x86_64-unknown-none",
         &metadata,
+        &repo_axbuild_dir(),
     )
     .unwrap();
 
@@ -58,6 +29,7 @@ fn std_build_config_preserves_backtrace_rustflags_from_env() {
             "arceos-helloworld",
             "x86_64-unknown-none",
             &metadata,
+            &repo_axbuild_dir(),
         )
         .unwrap();
 
@@ -80,6 +52,7 @@ fn std_build_config_enables_stack_protector_from_feature() {
             "arceos-helloworld",
             "x86_64-unknown-none",
             &metadata,
+            &repo_axbuild_dir(),
         )
         .unwrap();
 

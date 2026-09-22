@@ -1,6 +1,6 @@
 [package]
 name = "ax-std"
-version = "0.6.1"
+version = "0.7.4"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = [
@@ -48,7 +48,7 @@ fp-simd = ["ax-hal/fp-simd", "ax-runtime/fp-simd"]
 uspace = ["ax-runtime/uspace"]
 
 # Hypervisor support
-hv = ["ax-hal/hv"]
+hv = ["ax-hal/hv", "fp-simd"]
 
 # Inter-processor interrupts
 ipi = ["ax-api/ipi", "ax-runtime/ipi"]

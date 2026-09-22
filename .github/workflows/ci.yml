@@ -18,6 +18,7 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/reusable-check-matrix.yml"
       - ".github/workflows/starry-apps.yml"
+      - ".github/workflows/axvisor-nightly.yml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -345,15 +346,35 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          ACTOR: ${{ github.actor }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
           SINCE_REF: ${{ steps.since.outputs.since_ref }}
         run: |
           set -euo pipefail
+          self_hosted_eligible=true
+          if [ "$EVENT_NAME" = "pull_request" ] \
+            && [ "$HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]; then
+            self_hosted_eligible=false
+          fi
+          {
+            echo "## Runner trust"
+            echo ""
+            echo "- Event: \`${EVENT_NAME}\`"
+            echo "- Actor: \`${ACTOR}\`"
+            echo "- Head repository: \`${HEAD_REPOSITORY:-$GITHUB_REPOSITORY}\`"
+            echo "- Head revision: \`${HEAD_SHA}\`"
+            echo "- Self-hosted eligible: \`${self_hosted_eligible}\`"
+            echo "- Eligibility rule: non-PR event or PR head repository equals \`${GITHUB_REPOSITORY}\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
           python3 scripts/test/ci_plan.py \
             --mode main \
             --repository "$GITHUB_REPOSITORY" \
             --repository-owner "$REPOSITORY_OWNER" \
             --event-name "$EVENT_NAME" \
+            --head-repository "$HEAD_REPOSITORY" \
             --base-ref "$BASE_REF" \
             --since-ref "$SINCE_REF" \
             --summary-file "$GITHUB_STEP_SUMMARY" \
@@ -437,7 +458,8 @@ jobs:
     uses: ./.github/workflows/reusable-check-matrix.yml
     with:
       matrix_json: ${{ needs.plan_ci.outputs.starry_matrix }}
-      fail_fast: true
+      # Keep independent QEMU and board evidence when one hardware case fails.
+      fail_fast: false
       save_cache: >-
         ${{ github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') }}
@@ -462,7 +484,8 @@ jobs:
     uses: ./.github/workflows/reusable-check-matrix.yml
     with:
       matrix_json: ${{ needs.plan_ci.outputs.axvisor_matrix }}
-      fail_fast: true
+      # Independent board and QEMU targets must retain their own failure evidence.
+      fail_fast: false
       save_cache: >-
         ${{ github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') }}

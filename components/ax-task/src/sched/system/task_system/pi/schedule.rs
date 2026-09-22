@@ -1,7 +1,10 @@
 //! PI scheduling-class resolution and rq-owned priority updates.
 
 use super::*;
-use crate::sched::{algorithm::SchedulerClass, system::OwnerRqTaskState};
+use crate::sched::{
+    algorithm::SchedulerClass,
+    system::{OwnerRqTaskState, cpu::WakePreemptionContext},
+};
 impl TaskSystem {
     pub(in crate::sched::system::task_system) fn resolved_pi_schedule_update(
         &self,
@@ -70,6 +73,17 @@ impl TaskSystem {
         if transaction.owner() != owner {
             task_runtime::fatal_invariant(0x5049_1206, core.id().as_u64() as usize);
         }
+        if matches!(update.policy, SchedulePolicy::Fair { .. })
+            && matches!(
+                core.effective_policy_snapshot(),
+                SchedulePolicy::Fifo { .. } | SchedulePolicy::RoundRobin { .. }
+            )
+        {
+            // Linux rt_mutex_setprio() clears the watchdog count when PI
+            // deboost leaves the RT class. Keep the period stamp so a later
+            // boost cannot charge the same physical tick twice.
+            core.reset_realtime_ticks();
+        }
         let rq_state = transaction.task_state(core.id(), &sched.placement);
         let owner_now_ns = transaction.clock().wall().as_nanos();
         let source_fair = core
@@ -110,7 +124,10 @@ impl TaskSystem {
                 metadata,
             );
             core.publish_effective_schedule(policy, &entity);
-            return PiRqFollowup::RemoteReschedule;
+            return PiRqFollowup {
+                reschedule: Some(RescheduleKind::Immediate),
+                owner_work: false,
+            };
         }
         if rq_state.is_delayed_fair() {
             let active = transaction
@@ -143,7 +160,10 @@ impl TaskSystem {
                 sched.placement.finish_delayed_dequeue(owner);
             }
             core.publish_effective_schedule(policy, &entity);
-            return PiRqFollowup::SchedulerWork;
+            return PiRqFollowup {
+                reschedule: None,
+                owner_work: true,
+            };
         }
         if rq_state.is_queued() {
             let current_fair = transaction.current_fair_contender();
@@ -159,7 +179,7 @@ impl TaskSystem {
             let metadata = sched.rq_task_metadata().unwrap_or_else(|_| {
                 task_runtime::fatal_invariant(0x5049_120a, core.id().as_u64() as usize)
             });
-            let _enqueue_consumed_by_remote_reschedule = transaction.enqueue_task(
+            let enqueue = transaction.enqueue_task(
                 QueuedThread::new(
                     core.id(),
                     active,
@@ -171,8 +191,31 @@ impl TaskSystem {
                 EnqueueReason::PolicyChanged,
                 current_fair,
             );
+            let virtual_time = enqueue
+                .entity()
+                .fair()
+                .map_or(0, |_| transaction.virtual_time());
+            let reschedule = transaction
+                .wakeup_preempt_with_intent(
+                    core.id(),
+                    policy,
+                    enqueue.entity(),
+                    virtual_time,
+                    WakePreemptionContext::new(
+                        WakeIntent::Normal,
+                        EqualRtWakeAction::PreserveFifoOrder,
+                        self.cpu_remotes[owner.as_usize()].immediate_preemption_requested(),
+                    ),
+                )
+                .reschedule_kind(policy);
             core.publish_effective_schedule(policy, &entity);
-            return PiRqFollowup::RemoteReschedule;
+            // Linux switched_to_rt/prio_changed_rt do not preempt an equal
+            // priority current task. PI class changes still require the owner
+            // to maintain its timers and balancing callbacks independently.
+            return PiRqFollowup {
+                reschedule,
+                owner_work: true,
+            };
         }
         let active = core.sched().take_active(sched);
         let active = apply_pi_schedule_update(sched, active, update, owner_now_ns, fair_placement)
@@ -181,7 +224,10 @@ impl TaskSystem {
             });
         core.publish_effective_schedule(active.policy(), active.entity());
         core.sched().install_active(sched, active);
-        PiRqFollowup::SchedulerWork
+        PiRqFollowup {
+            reschedule: None,
+            owner_work: true,
+        }
     }
 
     /// Recomputes `pi_top_task` and the effective class while holding the task
@@ -283,12 +329,13 @@ impl TaskSystem {
             None
         };
         transaction.commit();
-        match followup {
-            Some(PiRqFollowup::RemoteReschedule) => {
-                remote.request_remote_reschedule(RescheduleKind::Immediate)
+        if let Some(followup) = followup {
+            match (followup.reschedule, followup.owner_work) {
+                (Some(kind), true) => remote.request_remote_reschedule_with_scheduler_work(kind),
+                (Some(kind), false) => remote.request_remote_reschedule(kind),
+                (None, true) => remote.request_scheduler_work(),
+                (None, false) => {}
             }
-            Some(PiRqFollowup::SchedulerWork) => remote.request_scheduler_work(),
-            None => {}
         }
         Ok(changed)
     }

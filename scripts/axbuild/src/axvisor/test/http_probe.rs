@@ -252,9 +252,9 @@ mod tests {
             // Some CI runners mount their system temporary directory with
             // `noexec`. Probe fixtures are deliberately executable, so keep
             // them below the workspace build directory instead.
-            let root = std::env::current_dir()
+            let root = crate::context::WorkspaceContext::discover(None)
                 .unwrap()
-                .join("target")
+                .target_dir()
                 .join("axbuild-http-probe-fixtures");
             fs::create_dir_all(&root).unwrap();
             tempfile::Builder::new()
@@ -335,17 +335,6 @@ mod tests {
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
-    }
-
-    #[test]
-    fn probe_asset_spawn_uses_the_text_file_busy_retry_boundary() {
-        let source = include_str!("http_probe.rs");
-        let retry_spawn = ["retry_text_file_busy", "(|| command.spawn())"].concat();
-
-        assert!(
-            source.contains(&retry_spawn),
-            "directly executed probe assets must retry the transient ETXTBSY publication window"
-        );
     }
 
     #[test]

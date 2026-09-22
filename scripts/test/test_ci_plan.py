@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import re
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,18 @@ SPEC = importlib.util.spec_from_file_location("ci_plan", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 ci_plan = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ci_plan)
+PERF_REPORT_SPEC = importlib.util.spec_from_file_location(
+    "ci_perf_report", MODULE_PATH.with_name("ci_perf_report.py")
+)
+assert PERF_REPORT_SPEC is not None and PERF_REPORT_SPEC.loader is not None
+ci_perf_report = importlib.util.module_from_spec(PERF_REPORT_SPEC)
+PERF_REPORT_SPEC.loader.exec_module(ci_perf_report)
+PERF_DASHBOARD_SPEC = importlib.util.spec_from_file_location(
+    "ci_perf_dashboard", MODULE_PATH.with_name("ci_perf_dashboard.py")
+)
+assert PERF_DASHBOARD_SPEC is not None and PERF_DASHBOARD_SPEC.loader is not None
+ci_perf_dashboard = importlib.util.module_from_spec(PERF_DASHBOARD_SPEC)
+PERF_DASHBOARD_SPEC.loader.exec_module(ci_perf_dashboard)
 
 MAIN_TEST_PREFIXES = ("workspace", "arceos", "starry", "axvisor")
 MAIN_TEST_GROUPS = ("Workspace", "ArceOS", "Starry", "AxVisor")
@@ -27,11 +41,323 @@ def main_test_rows(plan: dict) -> list[dict]:
 
 
 class CiPlanTests(unittest.TestCase):
+    def test_axvisor_nightly_runs_all_registered_checks_with_artifact_producer(self):
+        catalog = ci_plan.load_catalog(ci_plan.MAIN_MANIFESTS)
+        expected = {check["id"] for check in catalog if check["group"] == "AxVisor"}
+        for event in ("schedule", "workflow_dispatch"):
+            with self.subTest(event=event):
+                context = ci_plan.PlanContext(
+                    repository="rcore-os/tgoskits",
+                    repository_owner="rcore-os",
+                    event_name=event,
+                )
+                plan = ci_plan.build_axvisor_nightly_plan(context)
+                rows = plan["axvisor_matrix"]["include"]
+                self.assertEqual({row["id"] for row in rows}, expected)
+                self.assertEqual(len(rows), len(expected))
+                self.assertTrue(any(
+                    "--board orangepi-5-plus-linux --test-case ping" in row["command"]
+                    for row in rows
+                ))
+                producer, = plan["prepare_matrix"]["include"]
+                self.assertTrue(producer["upload_xtask_bin_artifact"])
+                self.assertEqual(producer["command"], "cargo build -p tg-xtask")
+                for row in rows:
+                    if row["download_xtask_bin_artifact"]:
+                        self.assertEqual(
+                            row["xtask_bin_artifact_name"], producer["xtask_bin_artifact_name"]
+                        )
+                main = ci_plan.build_main_plan(context)
+                nightly_ids = {
+                    check["id"] for check in catalog if check.get("nightly_only", False)
+                }
+                self.assertEqual(
+                    [row for row in rows if row["id"] not in nightly_ids],
+                    main["axvisor_matrix"]["include"],
+                )
+
+    def test_axvisor_nightly_maps_only_performance_checks_to_report_rows(self):
+        checks = [
+            {
+                "id": "xtask-producer",
+                "name": "producer",
+                "group": "Workspace",
+                "phase": "static",
+                "runs_on": ["ubuntu-latest"],
+                "environment": "host",
+                "command": "build-xtask",
+                "source": "synthetic.toml",
+                "upload_xtask_bin_artifact": True,
+            },
+            {
+                "id": "axvisor-performance",
+                "name": "performance",
+                "group": "AxVisor",
+                "phase": "test",
+                "runs_on": ["ubuntu-latest"],
+                "environment": "host",
+                "command": "run-performance",
+                "source": "synthetic.toml",
+                "performance_report": True,
+            },
+            {
+                "id": "axvisor-functional",
+                "name": "functional",
+                "group": "AxVisor",
+                "phase": "test",
+                "runs_on": ["ubuntu-latest"],
+                "environment": "host",
+                "command": "run-functional",
+                "source": "synthetic.toml",
+            },
+        ]
+        context = ci_plan.PlanContext(
+            repository="example/tgoskits",
+            repository_owner="example",
+            event_name="workflow_dispatch",
+            include_nightly=True,
+        )
+
+        rows = ci_plan._build_axvisor_nightly_plan(checks, context)[
+            "axvisor_matrix"
+        ]["include"]
+
+        self.assertEqual(
+            {row["id"] for row in rows if row["performance_report"]},
+            {"axvisor-performance"},
+        )
+        self.assertFalse(
+            next(row for row in rows if row["id"] == "axvisor-functional")[
+                "performance_report"
+            ]
+        )
+
+    def test_main_ci_never_runs_axvisor_nightly_only_cases(self):
+        for event in ("pull_request", "push", "workflow_dispatch", "schedule"):
+            with self.subTest(event=event):
+                context = ci_plan.replace(self.upstream, event_name=event)
+                rows = ci_plan.build_main_plan(context)["axvisor_matrix"]["include"]
+                commands = "\n".join(row["command"] for row in rows)
+                self.assertNotIn("timer-stress", commands)
+                self.assertNotIn("ivc-benchmark", commands)
+                self.assertNotIn("orangepi-5-plus-vcpu-perf", commands)
+                self.assertNotIn("--test-case ping", commands)
+                self.assertIn("--board orangepi-5-plus-linux --test-case smoke", commands)
+                self.assertNotIn("--board orangepi-5-plus-linux\n", commands)
+                self.assertIn("--test-case qemu-ivc", commands)
+                self.assertIn("--board orangepi-5-plus-starry", commands)
+
+    def test_nightly_only_suite_changes_keep_static_checks_without_running_board(self):
+        for path in (
+            "test-suit/axvisor/normal/qemu-timer-stress/gicv3-timer-stress/qemu-aarch64.toml",
+            "test-suit/axvisor/normal/board-orangepi-5-plus/ivc-benchmark/benchmark/board-orangepi-5-plus-ivc-benchmark.toml",
+            "test-suit/axvisor/normal/board-orangepi-5-plus/pci-network/ping/board-orangepi-5-plus-linux.toml",
+            "test-suit/axvisor/normal/board-orangepi-5-plus/vcpu-perf/performance/board-orangepi-5-plus-vcpu-perf.toml",
+        ):
+            with self.subTest(path=path):
+                context = ci_plan.replace(
+                    self.upstream,
+                    impact=ci_plan.CiImpact(
+                        full=False, reason="fixture", changed_paths=(path,),
+                        test_suite_paths=(path,), exclusive=True,
+                    ),
+                )
+                plan = ci_plan.build_main_plan(context)
+                self.assertTrue(plan["static_required"])
+                self.assertFalse(main_test_rows(plan))
+                self.assertFalse(plan["axvisor_required"])
+
+    def test_axvisor_nightly_rejects_incremental_pr_mode(self):
+        with self.assertRaises(ci_plan.PlanError):
+            ci_plan.build_axvisor_nightly_plan(self.upstream)
+
+    def test_performance_report_renders_supported_axvisor_results(self):
+        log_text = "\n".join(
+            [
+                "[VM 1] VCPU_PERF_SAMPLE index=0 blocks=1099483 "
+                "elapsed_ns=3000001123 timer_wakes=3011 checksum=841832",
+                "[VM 1] VCPU_PERF_SAMPLE index=1 blocks=1100123 "
+                "elapsed_ns=3000000987 timer_wakes=3010 checksum=841890",
+                "[VM 1] VCPU_PERF_RESULT blocks_per_second=365334.20 "
+                "baseline=364822.00 threshold=328339.80 samples=[364474.50,365334.20]",
+                "[VM 1] VCPU_PERF_PASS",
+            ]
+        )
+        report = ci_perf_report.render_report(
+            "test-axvisor-self-hosted-board-orangepi-5-plus-vcpu-perf",
+            "Board OrangePi 5 Plus · Single ArceOS guest performance",
+            log_text,
+        )
+
+        self.assertIn("#### vCPU samples (per window)", report)
+        self.assertIn(
+            "| index | blocks | elapsed_ns | timer_wakes | checksum |", report
+        )
+        self.assertIn("| 1 | 1100123 | 3000000987 | 3010 | 841890 |", report)
+        self.assertIn("#### vCPU throughput result", report)
+        self.assertIn(
+            "| blocks_per_second | baseline | threshold | samples |", report
+        )
+        self.assertIn(
+            "| 365334.20 | 364822.00 | 328339.80 | [364474.50,365334.20] |", report
+        )
+        self.assertEqual(
+            ci_perf_report.render_benchmarks(log_text),
+            [
+                {
+                    "name": "vcpu-perf/blocks_per_second",
+                    "unit": "blocks/s",
+                    "value": 365334.20,
+                }
+            ],
+        )
+
+    def test_performance_report_renders_axivc_benchmark_result(self):
+        log_text = "\n".join(
+            [
+                "[test_output] ========================================",
+                "[test_output] average sendBandwidth = 2263.10 MB/s, "
+                "average receiveBandwidth = 1505.03 MB/s, "
+                "testTime = 100, datasize = 262144",
+                "[test_output] average sendBandwidth = 2287.42 MB/s, "
+                "average receiveBandwidth = 2045.21 MB/s, "
+                "testTime = 100, datasize = 1048576",
+                "AXVISOR_IVC_BENCH_RESULT=PASS cases=4 testTime=100 "
+                "bytes=1232076800 chunks=400",
+            ]
+        )
+        report = ci_perf_report.render_report(
+            "test-axvisor-self-hosted-board-orangepi-5-plus-ivc-benchmark",
+            "Board OrangePi 5 Plus · AXIVC Zephyr-Starry benchmark",
+            log_text,
+        )
+
+        self.assertIn("#### AXIVC benchmark per-case bandwidth", report)
+        self.assertIn(
+            "| datasize | sendBandwidth (MB/s) | receiveBandwidth (MB/s) | testTime |",
+            report,
+        )
+        self.assertIn("| 262144 (256 KiB) | 2263.10 | 1505.03 | 100 |", report)
+        self.assertIn("| 1048576 (1 MiB) | 2287.42 | 2045.21 | 100 |", report)
+        self.assertIn("#### AXIVC benchmark result", report)
+        self.assertIn("| status | cases | testTime | bytes | chunks |", report)
+        self.assertIn("| PASS | 4 | 100 | 1232076800 | 400 |", report)
+        self.assertEqual(
+            ci_perf_report.render_benchmarks(log_text),
+            [
+                {"name": "ivc-bench/send/256KiB", "unit": "MB/s", "value": 2263.10},
+                {"name": "ivc-bench/receive/256KiB", "unit": "MB/s", "value": 1505.03},
+                {"name": "ivc-bench/send/1MiB", "unit": "MB/s", "value": 2287.42},
+                {"name": "ivc-bench/receive/1MiB", "unit": "MB/s", "value": 2045.21},
+            ],
+        )
+
+    def test_perf_dashboard_groups_by_test_case_with_date_axis_lines(self):
+        metrics = [
+            {"name": "vcpu-perf/blocks_per_second", "unit": "blocks/s", "value": 368008.45},
+            {"name": "ivc-bench/send/256KiB", "unit": "MB/s", "value": 2263.10},
+            {"name": "ivc-bench/receive/256KiB", "unit": "MB/s", "value": 1505.03},
+        ]
+        history = ci_perf_dashboard.update_history([], "2026-09-17", "rev1", metrics)
+        partial = [
+            {"name": "ivc-bench/send/256KiB", "unit": "MB/s", "value": 2287.42},
+        ]
+        history = ci_perf_dashboard.update_history(history, "2026-09-18", "rev2", partial)
+        # Re-running the same nightly replaces instead of appending.
+        history = ci_perf_dashboard.update_history(history, "2026-09-18", "rev2", partial)
+        self.assertEqual(
+            [entry["date"] for entry in history], ["2026-09-17", "2026-09-18"]
+        )
+
+        html = ci_perf_dashboard.render_dashboard("AxVisor Nightly Benchmarks", history)
+        self.assertIn("<h2>vcpu-perf</h2>", html)
+        # Send and receive bandwidth get separate charts.
+        self.assertIn("<h2>ivc-bench/send</h2>", html)
+        self.assertIn("<h2>ivc-bench/receive</h2>", html)
+        self.assertNotIn("<h2>ivc-bench</h2>", html)
+        self.assertIn('"label": "256KiB"', html)
+        self.assertIn('"labels": ["2026-09-17", "2026-09-18"]', html)
+        self.assertIn('"fill": false', html)
+        self.assertNotIn('"fill": true', html)
+        self.assertIn('"text": "blocks/s"', html)
+        self.assertIn('"text": "MB/s"', html)
+        # A metric missing on a later day renders as a gap, not a zero.
+        self.assertIn('"data": [368008.45, null]', html)
+
+    def test_perf_dashboard_charts_only_the_most_recent_window(self):
+        metrics = [
+            {"name": "vcpu-perf/blocks_per_second", "unit": "blocks/s", "value": 1.0},
+        ]
+        history: list[dict[str, object]] = []
+        for day in range(1, 10):
+            history = ci_perf_dashboard.update_history(
+                history, f"2026-09-0{day}", f"rev{day}", metrics
+            )
+
+        html = ci_perf_dashboard.render_dashboard("Benchmarks", history, window=7)
+        self.assertNotIn('"2026-09-01"', html)
+        self.assertNotIn('"2026-09-02"', html)
+        self.assertIn('"2026-09-03"', html)
+        self.assertIn('"2026-09-09"', html)
+        self.assertIn("showing last 7 of 9 nightly entries", html)
+        # window=0 keeps the full history available for manual inspection.
+        self.assertIn(
+            '"2026-09-01"',
+            ci_perf_dashboard.render_dashboard("Benchmarks", history, window=0),
+        )
+
+    def test_axvisor_nightly_preserves_runner_owner_restrictions(self):
+        context = ci_plan.PlanContext(
+            repository="example/tgoskits",
+            repository_owner="example",
+            event_name="workflow_dispatch",
+        )
+        rows = ci_plan.build_axvisor_nightly_plan(context)["axvisor_matrix"]["include"]
+        self.assertTrue(rows)
+        self.assertTrue(all("self-hosted" not in row["runs_on"] for row in rows))
+
+    def test_performance_report_renders_task_switch_groups(self):
+        lines = ["AXVISOR_TASK_SWITCH_BENCH_BEGIN groups=10"]
+        for index in range(10):
+            prefix = "[VM 1] " if index % 2 else ""
+            lines.append(
+                f"{prefix}AXVISOR_TASK_SWITCH_GROUP_SUMMARY index={index} "
+                f"samples_per_direction=1000000 avg_cycles={1700 + index} "
+                "min_cycles=1632 max_cycles=15879"
+            )
+        lines.append("AXVISOR_TASK_SWITCH_BENCH_DONE")
+        report = ci_perf_report.render_report("task-switch", "Task switch", "\n".join(lines))
+        self.assertIn("#### Task switch cycles (per group)", report)
+        self.assertIn(
+            "| index | samples_per_direction | avg_cycles | min_cycles | max_cycles |",
+            report,
+        )
+        for index in range(10):
+            self.assertIn(
+                f"| {index} | 1000000 | {1700 + index} | 1632 | 15879 |", report
+            )
+        self.assertEqual(
+            ci_perf_report.render_benchmarks("\n".join(lines)),
+            [
+                {
+                    "name": f"task-switch/avg_cycles/index-{index}",
+                    "unit": "cycles",
+                    "value": float(1700 + index),
+                }
+                for index in range(10)
+            ],
+        )
+        with self.assertRaises(ValueError):
+            ci_perf_report.render_report(
+                "task-switch", "Task switch", "AXVISOR_TASK_SWITCH_BENCH_BEGIN groups=10"
+            )
+
     def setUp(self) -> None:
         self.upstream = ci_plan.PlanContext(
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             base_ref="dev",
         )
 
@@ -64,6 +390,7 @@ class CiPlanTests(unittest.TestCase):
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             base_ref="dev",
             impact=ci_plan.CiImpact(
                 full=False,
@@ -93,22 +420,12 @@ class CiPlanTests(unittest.TestCase):
         self.assertFalse(plan["starry_required"])
         self.assertFalse(plan["axvisor_required"])
 
-    def test_incremental_clippy_uses_bounded_history_without_changing_other_checks(
-        self,
-    ) -> None:
-        plan = ci_plan.build_main_plan(self.upstream)
-        static_rows = self.assert_unique_ids(plan["static_matrix"]["include"])
-        test_rows = self.assert_unique_ids(main_test_rows(plan))
-
-        self.assertEqual(test_rows["run-clippy"]["fetch_depth"], "100")
-        self.assertEqual(static_rows["check-formatting"]["fetch_depth"], "1")
-        self.assertEqual(test_rows["test-with-std"]["fetch_depth"], "1")
-
     def test_pull_request_impact_package_selects_standalone_check(self) -> None:
         context = ci_plan.PlanContext(
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             impact=ci_plan.CiImpact(
                 full=False,
                 reason="fixture",
@@ -130,6 +447,7 @@ class CiPlanTests(unittest.TestCase):
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             impact=ci_plan.CiImpact(
                 full=False,
                 reason="fixture",
@@ -140,6 +458,7 @@ class CiPlanTests(unittest.TestCase):
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             impact=ci_plan.CiImpact.full_selection("fixture"),
         )
 
@@ -160,6 +479,7 @@ class CiPlanTests(unittest.TestCase):
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             base_ref="dev",
             impact=ci_plan.CiImpact(
                 full=False,
@@ -183,7 +503,7 @@ class CiPlanTests(unittest.TestCase):
         impact = ci_plan.CiImpact(
             full=False,
             reason="must be ignored outside pull requests",
-            changed_paths=("virtualization/arm_vcpu/src/lib.rs",),
+            changed_paths=("components/axcpu/src/arch/aarch64/mod.rs",),
             targets=("axvisor:aarch64",),
         )
         for event_name in ("push", "workflow_dispatch"):
@@ -212,6 +532,7 @@ class CiPlanTests(unittest.TestCase):
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             base_ref="dev",
             impact=ci_plan.CiImpact(
                 full=False,
@@ -248,6 +569,7 @@ class CiPlanTests(unittest.TestCase):
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             base_ref="dev",
             impact=ci_plan.CiImpact(
                 full=False,
@@ -271,11 +593,63 @@ class CiPlanTests(unittest.TestCase):
             "--board orangepi-5-plus",
         )
 
+    def test_cpu_vmx_suite_routes_to_the_registered_cpu_case(self) -> None:
+        path = "test-suit/arceos/cpu/guest-entry/qemu-x86_64-vmx.toml"
+        context = ci_plan.PlanContext(
+            repository="rcore-os/tgoskits",
+            repository_owner="rcore-os",
+            event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
+            base_ref="dev",
+            impact=ci_plan.CiImpact(
+                full=False,
+                reason="fixture",
+                changed_paths=(path,),
+                test_suite_paths=(path,),
+                exclusive=True,
+            ),
+        )
+        plan = ci_plan.build_main_plan(context)
+        rows = plan["arceos_matrix"]["include"]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("intel", rows[0]["runs_on"])
+        self.assertEqual(
+            rows[0]["command"],
+            "cargo xtask arceos test qemu --arch x86_64 "
+            "--test-group cpu --test-case guest-entry-vmx",
+        )
+
+    def test_cpu_pmu_board_routes_to_its_actual_case(self) -> None:
+        path = "test-suit/arceos/board-orangepi-5-plus/pmu/board-orangepi-5-plus.toml"
+        context = ci_plan.PlanContext(
+            repository="rcore-os/tgoskits",
+            repository_owner="rcore-os",
+            event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
+            base_ref="dev",
+            impact=ci_plan.CiImpact(
+                full=False,
+                reason="fixture",
+                changed_paths=(path,),
+                test_suite_paths=(path,),
+                exclusive=True,
+            ),
+        )
+        plan = ci_plan.build_main_plan(context)
+        rows = plan["arceos_matrix"]["include"]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("board", rows[0]["runs_on"])
+        self.assertEqual(
+            rows[0]["command"],
+            "cargo xtask arceos test board --test-case pmu --board orangepi-5-plus",
+        )
+
     def test_unregistered_test_suite_fails_planning(self) -> None:
         context = ci_plan.PlanContext(
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             impact=ci_plan.CiImpact(
                 full=False,
                 reason="fixture",
@@ -329,6 +703,7 @@ command = "true"
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             impact=ci_plan.CiImpact(
                 full=False,
                 reason="fixture",
@@ -371,6 +746,7 @@ command = "true"
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             impact=ci_plan.CiImpact(
                 full=False,
                 reason="fixture",
@@ -399,6 +775,7 @@ command = "true"
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             impact=ci_plan.CiImpact(
                 full=False,
                 reason="fixture",
@@ -422,6 +799,7 @@ command = "true"
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             impact=ci_plan.CiImpact(
                 full=False,
                 reason="fixture",
@@ -449,6 +827,7 @@ command = "true"
             repository="rcore-os/tgoskits",
             repository_owner="rcore-os",
             event_name="pull_request",
+            head_repository="rcore-os/tgoskits",
             impact=ci_plan.CiImpact(
                 full=False,
                 reason="fixture",
@@ -467,6 +846,49 @@ command = "true"
         self.assertEqual(plan["arceos_matrix"]["include"], [])
         self.assertEqual(plan["axvisor_matrix"]["include"], [])
 
+    def test_dualguest_robot_board_runs_both_guest_variants(self) -> None:
+        rows = self.assert_unique_ids(
+            ci_plan.build_main_plan(self.upstream)["axvisor_matrix"]["include"]
+        )
+        dualguest = rows["test-orangepi-5-plus-dualguest-robot"]
+
+        self.assertEqual(dualguest["runs_on"], ["self-hosted", "linux", "board"])
+        self.assertEqual(dualguest["timeout_minutes"], 30)
+        self.assertEqual(
+            dualguest["command"],
+            "cargo xtask starry build --config "
+            "test-suit/axvisor/normal/board-orangepi-5-plus/dual-starry-zephyr/"
+            "starry-guest-build.toml --smp 1\n"
+            "cargo xtask axvisor test board "
+            "--board orangepi-5-plus-dualguest-robot",
+        )
+
+    def test_dualguest_robot_board_markers_cannot_match_command_echo(self) -> None:
+        root = MODULE_PATH.parents[2]
+        configs = (
+            root
+            / "test-suit/axvisor/normal/board-orangepi-5-plus/dual-linux-zephyr"
+            / "board-orangepi-5-plus-dualguest-robot.toml",
+            root
+            / "test-suit/axvisor/normal/board-orangepi-5-plus/dual-starry-zephyr"
+            / "board-orangepi-5-plus-dualguest-robot.toml",
+        )
+
+        for path in configs:
+            with self.subTest(config=path):
+                config = tomllib.loads(path.read_text())
+                self.assertEqual(
+                    config["board_type"], "OrangePi-5-Plus-DualGuest-robot"
+                )
+                step = config["shell_check_steps"][-1]
+                for pattern in step["success_regex"] + step["fail_regex"]:
+                    self.assertIsNone(re.search(pattern, step["shell_cmd"]))
+                guest = "linux-zephyr" if "dual-linux" in str(path) else "starry-zephyr"
+                self.assertTrue(any(re.search(pattern, f"DUAL_PICK_CI_PASS guest={guest}\n")
+                                    for pattern in step["success_regex"]))
+                self.assertTrue(any(re.search(pattern, f"DUAL_PICK_CI_FAIL guest={guest} status=1\n")
+                                    for pattern in step["fail_regex"]))
+
     def test_fork_repository_filters_owner_checks_and_falls_back_from_qcs(
         self,
     ) -> None:
@@ -484,7 +906,7 @@ command = "true"
                 "run-clippy",
                 "test-with-std",
                 "test-arceos-aarch64-qemu-app-suites",
-                "test-axvisor-aarch64-qemu-panic-http-control-plane-ivc",
+                "test-axvisor-aarch64-qemu-http-control-plane-browser-console-ivc",
                 "test-starry-aarch64-qemu",
             }.issubset(test_rows)
         )
@@ -505,6 +927,66 @@ command = "true"
         self.assertEqual(clippy["runs_on"], ["ubuntu-latest"])
         self.assertEqual(clippy["fetch_depth"], "100")
         self.assertTrue(clippy["download_xtask_bin_artifact"])
+
+    def test_fork_pull_request_never_allocates_self_hosted_runners(self) -> None:
+        context = ci_plan.PlanContext(
+            repository="rcore-os/tgoskits",
+            repository_owner="rcore-os",
+            event_name="pull_request",
+            head_repository="contributor/tgoskits",
+            base_ref="dev",
+        )
+
+        plan = ci_plan.build_main_plan(context)
+        rows = self.assert_unique_ids(
+            plan["static_matrix"]["include"] + main_test_rows(plan)
+        )
+
+        self.assertTrue(rows)
+        self.assertTrue(
+            all("self-hosted" not in row["runs_on"] for row in rows.values())
+        )
+        catalog = ci_plan.load_catalog(ci_plan.MAIN_MANIFESTS)
+        self_hosted_only_ids = {
+            check["id"]
+            for check in catalog
+            if "self-hosted" in check["runs_on"]
+            and "fallback_environment" not in check
+        }
+        self.assertTrue(self_hosted_only_ids.isdisjoint(rows))
+        self.assertEqual(rows["check-formatting"]["runs_on"], ["ubuntu-latest"])
+        self.assertEqual(rows["run-clippy"]["runs_on"], ["ubuntu-latest"])
+
+        board_path = (
+            "test-suit/arceos/board-orangepi-5-plus/pmu/"
+            "board-orangepi-5-plus.toml"
+        )
+        board_only = ci_plan.replace(
+            context,
+            impact=ci_plan.CiImpact(
+                full=False,
+                reason="fixture",
+                changed_paths=(board_path,),
+                test_suite_paths=(board_path,),
+                exclusive=True,
+            ),
+        )
+        board_plan = ci_plan.build_main_plan(board_only)
+        board_rows = board_plan["static_matrix"]["include"] + main_test_rows(
+            board_plan
+        )
+        self.assertTrue(board_rows)
+        self.assertTrue(
+            all("self-hosted" not in row["runs_on"] for row in board_rows)
+        )
+
+    def test_same_repository_pull_request_keeps_self_hosted_runners(self) -> None:
+        plan = ci_plan.build_main_plan(self.upstream)
+        rows = self.assert_unique_ids(
+            plan["static_matrix"]["include"] + main_test_rows(plan)
+        )
+
+        self.assertTrue(any("self-hosted" in row["runs_on"] for row in rows.values()))
 
     def test_event_and_boolean_input_select_checks_independently(self) -> None:
         check = {"events": ["schedule"], "enable_boolean_input": "run_optional"}

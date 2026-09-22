@@ -27,8 +27,6 @@ const HOST_OUTPUT_BATCH_CAPACITY: usize = 512;
 struct HostConsole {
     input: Option<TaskConsoleInput>,
     logs: Option<ConsoleLogSubscription>,
-    #[cfg(feature = "test-console-atomic-output")]
-    test_output: TaskConsoleOutput,
 }
 
 struct HostOutput {
@@ -71,12 +69,7 @@ pub(crate) fn configure_host_console() -> Result<()> {
         Err(error) => return Err(error).context("failed to take host console input"),
     };
     let output = console::output().context("failed to open host console output")?;
-    let host_console = HostConsole {
-        input,
-        logs,
-        #[cfg(feature = "test-console-atomic-output")]
-        test_output: output.clone(),
-    };
+    let host_console = HostConsole { input, logs };
     std::thread::Builder::new()
         .name("axvisor-console-output".into())
         .spawn(move || run_host_output_worker(output))
@@ -109,15 +102,13 @@ pub(crate) fn read_host_log() -> Option<ConsoleLogRecord> {
     host_log_subscription()?.try_read()
 }
 
-/// Returns false only when this console has no ordered record subscription.
-pub(crate) fn queue_guest_output(tag: u128, bytes: &[u8]) -> bool {
+/// Returns `Ok(false)` only when this console has no ordered subscription.
+pub(crate) fn queue_guest_output(tag: u128, bytes: &[u8]) -> RuntimeResult<bool> {
     let Some(logs) = host_log_subscription() else {
-        return false;
+        return Ok(false);
     };
-    // Queue overflow is reported by the sole subscriber, never through guest
-    // UART bytes or recursive logging from an atomic callback.
-    let _ = logs.write_output(tag, bytes);
-    true
+    logs.write_output(tag, bytes)?;
+    Ok(true)
 }
 
 pub(crate) fn take_host_log_drops() -> ConsoleLogDropReport {
@@ -282,31 +273,4 @@ impl HostOutputBatch {
     fn is_empty(&self) -> bool {
         self.len == 0 && self.dropped_bytes == 0
     }
-}
-
-#[cfg(feature = "test-console-atomic-output")]
-/// Fills the bounded runtime ingress while the single owner CPU is held under
-/// `PreemptGuard`.
-pub(crate) fn fill_runtime_output_queue() {
-    static FRAME: [u8; 256] = [b'x'; 256];
-    const MAX_EXPECTED_RUNTIME_INGRESS: usize = 64 * 1024;
-
-    assert_eq!(
-        ax_std::os::arceos::modules::ax_hal::cpu_num(),
-        1,
-        "atomic-output regression requires the runtime owner and test on one CPU"
-    );
-    let mut accepted = 0;
-    while accepted <= MAX_EXPECTED_RUNTIME_INGRESS {
-        match host_console()
-            .expect("host console must be configured before running the regression")
-            .test_output
-            .try_write(&FRAME)
-        {
-            Ok(written) => accepted += written,
-            Err(RuntimeError::WouldBlock) => return,
-            Err(error) => panic!("failed to fill runtime output queue: {error}"),
-        }
-    }
-    panic!("runtime output accepted more than its bounded ingress contract");
 }

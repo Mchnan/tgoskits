@@ -1,6 +1,6 @@
 [package]
 name = "starry-kernel"
-version = "0.9.0"
+version = "0.12.0"
 edition.workspace = true
 description = "A Linux-compatible OS kernel built on ArceOS unikernel"
 authors = [
@@ -26,8 +26,6 @@ default = ["dynamic_debug"]
 dev-log = []
 ext4 = ["ax-fs-ng/ext4"]
 fat = ["ax-fs-ng/fat"]
-input = ["dep:ax-input", "ax-runtime/input"]
-ipi = ["ax-runtime/ipi"]
 memtrack = ["axbacktrace/alloc", "ax-alloc/tracking"]
 qperf-metrics = ["ax-runtime/qperf-metrics"]
 # Exposes a debugfs-only synchronization hook used by the real userspace QEMU
@@ -36,16 +34,10 @@ uaccess-lock-regression = []
 rknpu = ["ax-driver/rknpu"]
 jpeg = ["ax-driver/jpeg"]
 rga = ["ax-driver/rga", "dep:rockchip-rga"]
-rk3588-pwm = [
-    "ax-driver/rk3588-pwm",
-    "dep:rdif-pwm",
-]
-k230-kpu = ["ax-hal/xuantie-c9xx", "dep:k230-kpu"]
-vsock = ["ax-runtime/vsock"]
-dynamic_debug = ["ipi"]
+k230-kpu = ["ax-hal/riscv-thead-mae", "dep:k230-kpu"]
+dynamic_debug = []
 sg2002 = [
     "ax-driver/usb",
-    "dep:rdif-pwm",
     "dep:sg2002-tpu",
     "dep:some-serial",
     "dep:sg200x-bsp",
@@ -56,10 +48,9 @@ sg2002-cvi-usb-camera = [
     "dep:cvi-vdec-uapi",
     "dep:sg200x-jpu",
 ]
-smp = ["ax-std/smp"]
 stack-guard-page = ["ax-runtime/stack-guard-page"]
 stack-protector = ["ax-runtime/stack-protector"]
-axtest = []
+axtest = ["ax-runtime/fault-injection"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(feature, values("ax-std"))'] }
@@ -70,12 +61,12 @@ ax-display.workspace = true
 ax-fs-ng = { workspace = true, features = ["vfs"] }
 ax-cpu = { workspace = true, features = ["fp-simd"] }
 ax-hal = { workspace = true, features = ["fp-simd", "uspace"] }
-ax-input = { workspace = true, optional = true }
+ax-input.workspace = true
 ax-lazyinit.workspace = true
 ax-log.workspace = true
 ax-mm = { workspace = true, features = ["copy"] }
 ax-net = { workspace = true }
-ax-driver = { workspace = true, features = ["usb"] }
+ax-driver = { workspace = true, features = ["usb", "pwm"] }
 axklib.workspace = true
 axplat-dyn.workspace = true
 ax-runtime = { workspace = true, features = [
@@ -85,12 +76,16 @@ ax-runtime = { workspace = true, features = [
     "ext4fs",
     "net",
     "vmap-task-stack",
+    "input",
+    "ipi",
+    "vsock",
 ] }
 ax-std = { workspace = true, default-features = false, features = [
     "alloc",
     "fd",
     "task-ext",
     "tracepoint-hooks",
+    "smp",
 ] }
 rockchip-rga = { workspace = true, optional = true }
 sg2002-tpu = { workspace = true, optional = true }
@@ -104,7 +99,7 @@ ax-cgroup = { workspace = true }
 axfs-ng-vfs = { workspace = true }
 rdif-block = { workspace = true }
 rdif-pinctrl = { workspace = true, optional = true }
-rdif-pwm = { workspace = true, optional = true }
+rdif-pwm.workspace = true
 ax-io = { workspace = true }
 axhvc = { workspace = true }
 axivc = { workspace = true }
@@ -180,6 +175,9 @@ ax-std = { path = "../../arceos/ulib/axstd", default-features = false, features 
     "fs",
 ] }
 
+[target.'cfg(target_arch = "loongarch64")'.dev-dependencies]
+somehal.workspace = true
+
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]
 loom.workspace = true
 ax-runtime = { workspace = true, features = ["host-test", "smp"] }
@@ -188,7 +186,7 @@ ax-runtime = { workspace = true, features = ["host-test", "smp"] }
 name = "axtest_kernel"
 path = "src/axtest_kernel.rs"
 harness = false
-required-features = ["axtest", "smp"]
+required-features = ["axtest"]
 
 [package.metadata.axtest]
 runtime = "starry"
@@ -198,3 +196,7 @@ x86 = "0.52"
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
 riscv.workspace = true
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+ax-cpu = { workspace = true, features = ["pmu"] }
+ax-hal = { workspace = true, features = ["pmu"] }

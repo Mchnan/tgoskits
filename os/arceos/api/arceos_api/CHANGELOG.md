@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.4...ax-api-v0.8.5) - 2026-09-21
+
+### Fixed
+
+- *(axvisor)* validate guest kernels and complete shell editing ([#2462](https://github.com/rcore-os/tgoskits/pull/2462))
+
+## [0.8.4](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.3...ax-api-v0.8.4) - 2026-09-18
+
+### Fixed
+
+- *(starry-kernel)* enforce executable inode write exclusion ([#2375](https://github.com/rcore-os/tgoskits/pull/2375))
+
+## [0.8.3](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.2...ax-api-v0.8.3) - 2026-09-13
+
+### Other
+
+- updated the following local packages: ax-hal, ax-runtime
+
+## [0.8.2](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.1...ax-api-v0.8.2) - 2026-09-12
+
+### Other
+
+- updated the following local packages: ax-runtime
+
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.0...ax-api-v0.8.1) - 2026-09-11
+
+### Other
+
+- *(ax-task)* unify thread lifecycle and PREEMPT_RT lock semantics ([#2357](https://github.com/rcore-os/tgoskits/pull/2357))
+
 ## [0.8.0](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.7.9...ax-api-v0.8.0) - 2026-09-09
 
 ### Fixed

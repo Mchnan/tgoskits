@@ -1,6 +1,6 @@
 [package]
 name = "aic8800"
-version = "0.3.1"
+version = "0.3.3"
 edition = "2024"
 license = "Apache-2.0"
 repository.workspace = true
@@ -26,11 +26,6 @@ rdif = [
 name = "std"
 path = "tests/std.rs"
 required-features = ["host-test"]
-
-[[test]]
-name = "rdif"
-path = "tests/rdif.rs"
-required-features = ["host-test", "rdif"]
 
 [build-dependencies]
 ureq = "3"

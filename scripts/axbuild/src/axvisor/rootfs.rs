@@ -31,6 +31,7 @@ struct VmRootfsProbe {
 #[derive(Deserialize)]
 struct VmKernelRootfsProbe {
     kernel_path: Option<String>,
+    ramdisk_path: Option<String>,
 }
 
 pub(super) async fn qemu(axvisor: &mut Axvisor, args: super::ArgsQemu) -> anyhow::Result<()> {
@@ -46,16 +47,18 @@ pub(super) async fn qemu(axvisor: &mut Axvisor, args: super::ArgsQemu) -> anyhow
         .map(|rootfs| {
             crate::image::storage::resolve_explicit_rootfs(
                 axvisor.app.workspace_root(),
+                axvisor.app.target_dir(),
                 &request.arch,
                 rootfs,
             )
         })
         .transpose()?;
-    let mut cargo = build::load_cargo_config(&request)?;
+    let mut cargo = build::load_cargo_config(&request, axvisor.app.workspace_context())?;
     request.vmconfigs = build::vmconfigs_from_cargo(&cargo);
     ensure_qemu_assets_ready(
         &request,
         axvisor.app.workspace_root(),
+        axvisor.app.target_dir(),
         explicit_rootfs.as_deref(),
     )
     .await?;
@@ -95,6 +98,7 @@ pub(super) async fn load_patched_qemu_config(
         &mut qemu,
         request,
         axvisor.app.workspace_root(),
+        axvisor.app.target_dir(),
         explicit_rootfs,
     )?;
     Ok(qemu)
@@ -104,12 +108,14 @@ pub(super) async fn load_patched_qemu_config(
 pub(crate) async fn ensure_qemu_assets_ready(
     request: &ResolvedAxvisorRequest,
     workspace_root: &Path,
+    target_dir: &Path,
     explicit_rootfs: Option<&Path>,
 ) -> anyhow::Result<()> {
-    ensure_guest_image_bundles(request, workspace_root).await?;
-    let rootfs_path = managed_rootfs_path(request, workspace_root, explicit_rootfs)?;
+    ensure_guest_image_bundles(request, workspace_root, target_dir).await?;
+    let rootfs_path = managed_rootfs_path(request, workspace_root, target_dir, explicit_rootfs)?;
     crate::image::storage::ensure_optional_managed_rootfs(
         workspace_root,
+        target_dir,
         &request.arch,
         rootfs_path.as_deref(),
     )
@@ -125,14 +131,15 @@ struct GuestImageReference {
 async fn ensure_guest_image_bundles(
     request: &ResolvedAxvisorRequest,
     workspace_root: &Path,
+    target_dir: &Path,
 ) -> anyhow::Result<()> {
-    let references = guest_image_references(&request.vmconfigs, workspace_root)?;
+    let references = guest_image_references(&request.vmconfigs, workspace_root, target_dir)?;
     if references.is_empty() {
         return Ok(());
     }
 
-    let output_dir = crate::context::axbuild_tmp_dir(workspace_root).join("images");
-    let mut config = ImageConfig::read_config(workspace_root)?;
+    let output_dir = target_dir.join("axbuild").join("images");
+    let mut config = ImageConfig::read_config(workspace_root, target_dir)?;
     // Guest VM configs use a stable workspace-relative path, while the new
     // image architecture keeps download and extraction ownership separate.
     // Reuse the configured archive cache but bind this operation's extracted
@@ -181,8 +188,9 @@ async fn ensure_guest_image_bundles(
 fn guest_image_references(
     vmconfigs: &[PathBuf],
     workspace_root: &Path,
+    target_dir: &Path,
 ) -> anyhow::Result<BTreeMap<String, Vec<GuestImageReference>>> {
-    let image_dir = crate::context::axbuild_tmp_dir(workspace_root).join("images");
+    let image_dir = target_dir.join("axbuild").join("images");
     let mut references = BTreeMap::<String, Vec<GuestImageReference>>::new();
     for vmconfig in vmconfigs {
         let content = fs::read_to_string(vmconfig)
@@ -190,58 +198,71 @@ fn guest_image_references(
         let probe: VmRootfsProbe = toml::from_str(&content).map_err(|error| {
             anyhow!("failed to parse vm config {}: {error}", vmconfig.display())
         })?;
-        let Some(kernel_path) = probe.kernel.and_then(|kernel| kernel.kernel_path) else {
+        let Some(kernel) = probe.kernel else {
             continue;
         };
-        let required_path = resolve_vm_asset_path(vmconfig, workspace_root, &kernel_path);
-        let Ok(relative) = required_path.strip_prefix(&image_dir) else {
-            continue;
-        };
-        let components = relative.components().collect::<Vec<_>>();
-        if components.is_empty()
-            || components
-                .iter()
-                .any(|component| !matches!(component, Component::Normal(_)))
+        for kernel_path in [kernel.kernel_path, kernel.ramdisk_path]
+            .into_iter()
+            .flatten()
         {
-            bail!(
-                "invalid managed Axvisor guest image path `{}` in {}",
-                kernel_path,
-                vmconfig.display()
-            );
-        }
-        let image_name = components[0]
-            .as_os_str()
-            .to_str()
-            .ok_or_else(|| {
-                anyhow!(
-                    "Axvisor guest image name in {} is not valid UTF-8",
+            let required_path =
+                resolve_vm_asset_path(vmconfig, workspace_root, target_dir, &kernel_path);
+            let Ok(relative) = required_path.strip_prefix(&image_dir) else {
+                continue;
+            };
+            let components = relative.components().collect::<Vec<_>>();
+            if components.is_empty()
+                || components
+                    .iter()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                bail!(
+                    "invalid managed Axvisor guest image path `{}` in {}",
+                    kernel_path,
                     vmconfig.display()
-                )
-            })?
-            .to_string();
-        references
-            .entry(image_name)
-            .or_default()
-            .push(GuestImageReference {
-                vmconfig: vmconfig.clone(),
-                required_path,
-            });
+                );
+            }
+            let image_name = components[0]
+                .as_os_str()
+                .to_str()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Axvisor guest image name in {} is not valid UTF-8",
+                        vmconfig.display()
+                    )
+                })?
+                .to_string();
+            references
+                .entry(image_name)
+                .or_default()
+                .push(GuestImageReference {
+                    vmconfig: vmconfig.clone(),
+                    required_path,
+                });
+        }
     }
     Ok(references)
 }
 
-fn resolve_vm_asset_path(vmconfig: &Path, workspace_root: &Path, value: &str) -> PathBuf {
-    if let Some(relative) = value.strip_prefix("${workspace}/") {
-        return workspace_root.join(relative);
-    }
-    let path = Path::new(value);
-    if path.is_absolute() {
-        path.to_path_buf()
+fn resolve_vm_asset_path(
+    vmconfig: &Path,
+    workspace_root: &Path,
+    target_dir: &Path,
+    value: &str,
+) -> PathBuf {
+    let path = if let Some(relative) = value.strip_prefix("${workspace}/") {
+        workspace_root.join(relative)
     } else {
-        vmconfig
-            .parent()
-            .map_or_else(|| path.to_path_buf(), |parent| parent.join(path))
-    }
+        let path = Path::new(value);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            vmconfig
+                .parent()
+                .map_or_else(|| path.to_path_buf(), |parent| parent.join(path))
+        }
+    };
+    crate::context::resolve_axbuild_artifact_path(workspace_root, target_dir, &path)
 }
 
 /// Patches a QEMU config with the rootfs selected for an Axvisor request.
@@ -249,9 +270,10 @@ pub(crate) fn patch_qemu_rootfs(
     config: &mut QemuConfig,
     request: &ResolvedAxvisorRequest,
     workspace_root: &Path,
+    target_dir: &Path,
     explicit_rootfs: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let rootfs_path = qemu_rootfs_path(request, workspace_root, explicit_rootfs)?;
+    let rootfs_path = qemu_rootfs_path(request, workspace_root, target_dir, explicit_rootfs)?;
     let global_snapshot = config.args.iter().any(|argument| argument == "-snapshot");
     let write_policy = if global_snapshot {
         rootfs::qemu::RootfsWritePolicy::Discard
@@ -271,6 +293,7 @@ pub(crate) fn patch_qemu_rootfs(
 pub(crate) fn qemu_rootfs_path(
     request: &ResolvedAxvisorRequest,
     workspace_root: &Path,
+    target_dir: &Path,
     explicit_rootfs: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
     if let Some(explicit) = explicit_rootfs {
@@ -280,7 +303,7 @@ pub(crate) fn qemu_rootfs_path(
     infer_rootfs_path(&request.vmconfigs)?
         .map(Ok)
         .unwrap_or_else(|| {
-            crate::image::storage::default_rootfs_path(workspace_root, &request.arch)
+            crate::image::storage::default_rootfs_path(workspace_root, target_dir, &request.arch)
         })
 }
 
@@ -304,15 +327,21 @@ pub(crate) fn patch_qemu_rootfs_path(
 pub(crate) fn managed_rootfs_path(
     request: &ResolvedAxvisorRequest,
     workspace_root: &Path,
+    target_dir: &Path,
     explicit_rootfs: Option<&Path>,
 ) -> anyhow::Result<Option<PathBuf>> {
     if let Some(explicit_rootfs) = explicit_rootfs {
-        return crate::image::storage::resolve_managed_rootfs_path(workspace_root, explicit_rootfs);
+        return crate::image::storage::resolve_managed_rootfs_path(
+            workspace_root,
+            target_dir,
+            explicit_rootfs,
+        );
     }
 
     if infer_rootfs_path(&request.vmconfigs)?.is_none() {
         return Ok(Some(crate::image::storage::default_rootfs_path(
             workspace_root,
+            target_dir,
             &request.arch,
         )?));
     }
@@ -390,6 +419,10 @@ mod tests {
         root.join(".tgos-images").join(image_name)
     }
 
+    fn target_dir_for_test(root: &Path) -> PathBuf {
+        root.join("custom-target")
+    }
+
     fn write_test_image_config(root: &Path) {
         let config = crate::image::config::ImageConfig {
             registry: crate::image::config::DEFAULT_REGISTRY_URL.to_string(),
@@ -453,21 +486,23 @@ mod tests {
             &vmconfig,
             r#"
 [kernel]
-kernel_path = "${workspace}/tmp/axbuild/images/qemu-aarch64/linux/linux-qemu"
+kernel_path = "${workspace}/target/axbuild/images/qemu-aarch64/linux/linux-qemu"
 "#,
         )
         .unwrap();
 
-        ensure_qemu_assets_ready(&request(root.path(), vec![vmconfig]), root.path(), None)
-            .await
-            .unwrap();
+        let target_dir = target_dir_for_test(root.path());
+        ensure_qemu_assets_ready(
+            &request(root.path(), vec![vmconfig]),
+            root.path(),
+            &target_dir,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
-            fs::read(
-                root.path()
-                    .join("tmp/axbuild/images/qemu-aarch64/linux/linux-qemu"),
-            )
-            .unwrap(),
+            fs::read(target_dir.join("axbuild/images/qemu-aarch64/linux/linux-qemu"),).unwrap(),
             b"kernel"
         );
     }
@@ -562,6 +597,7 @@ kernel_path = "{}"
             &mut qemu,
             &request(root.path(), vec![vmconfig]),
             root.path(),
+            &target_dir_for_test(root.path()),
             None,
         )
         .unwrap();
@@ -586,7 +622,14 @@ kernel_path = "{}"
             ..Default::default()
         };
 
-        patch_qemu_rootfs(&mut qemu, &request(root.path(), vec![]), root.path(), None).unwrap();
+        patch_qemu_rootfs(
+            &mut qemu,
+            &request(root.path(), vec![]),
+            root.path(),
+            &target_dir_for_test(root.path()),
+            None,
+        )
+        .unwrap();
 
         assert!(
             qemu.args
@@ -611,7 +654,14 @@ kernel_path = "{}"
             ..Default::default()
         };
 
-        patch_qemu_rootfs(&mut qemu, &request(root.path(), vec![]), root.path(), None).unwrap();
+        patch_qemu_rootfs(
+            &mut qemu,
+            &request(root.path(), vec![]),
+            root.path(),
+            &target_dir_for_test(root.path()),
+            None,
+        )
+        .unwrap();
 
         assert!(qemu.args.iter().any(|argument| argument == "-snapshot"));
         assert!(
@@ -643,7 +693,14 @@ kernel_path = "{}"
             ..Default::default()
         };
 
-        patch_qemu_rootfs(&mut qemu, &request(root.path(), vec![]), root.path(), None).unwrap();
+        patch_qemu_rootfs(
+            &mut qemu,
+            &request(root.path(), vec![]),
+            root.path(),
+            &target_dir_for_test(root.path()),
+            None,
+        )
+        .unwrap();
 
         assert!(qemu.args.iter().any(|arg| arg.starts_with("nvme,")));
         assert!(
@@ -674,7 +731,13 @@ kernel_path = "/tmp/qemu-aarch64"
         .unwrap();
 
         assert_eq!(
-            managed_rootfs_path(&request(root.path(), vec![vmconfig]), root.path(), None).unwrap(),
+            managed_rootfs_path(
+                &request(root.path(), vec![vmconfig]),
+                root.path(),
+                &target_dir_for_test(root.path()),
+                None,
+            )
+            .unwrap(),
             Some(managed_rootfs_path_for_test(
                 root.path(),
                 "rootfs-aarch64-alpine.img"
@@ -702,25 +765,14 @@ kernel_path = "{}"
         .unwrap();
 
         assert_eq!(
-            managed_rootfs_path(&request(root.path(), vec![vmconfig]), root.path(), None).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn managed_rootfs_path_keeps_explicit_managed_rootfs() {
-        let root = tempdir().unwrap();
-        write_test_image_config(root.path());
-        let explicit = managed_rootfs_path_for_test(root.path(), "rootfs-aarch64-debian.img");
-
-        assert_eq!(
             managed_rootfs_path(
-                &request(root.path(), vec![]),
+                &request(root.path(), vec![vmconfig]),
                 root.path(),
-                Some(explicit.as_path())
+                &target_dir_for_test(root.path()),
+                None,
             )
             .unwrap(),
-            Some(explicit)
+            None
         );
     }
 

@@ -7,8 +7,11 @@
 
 mod address;
 mod bar;
+mod capability;
 mod config;
+mod config_layout;
 mod error;
+mod frontend;
 mod function;
 mod graph;
 mod placement;
@@ -16,6 +19,7 @@ mod root;
 mod runtime;
 mod topology;
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) use config::read_bytes;
 pub(crate) use root::all_ones;
 
@@ -23,13 +27,23 @@ pub(crate) const FOUR_GIB: u64 = 1 << 32;
 
 pub use address::{ConfigOffset, PciBarIndex, PciBdf, PciSegment};
 pub use bar::PciMemoryBar;
+pub use capability::{
+    PciCapabilityByteMode, PciCapabilityEffectAccess, PciCapabilityEffectRegion, PciCapabilityId,
+    PciCapabilityLayout, PciCapabilitySnapshot, PciCapabilitySpec, PciConfigEffectId,
+};
 pub use error::{PciError, PciResult};
+pub use frontend::{PciEcamConfigFrontend, PciMemoryApertureDevice, PciRootLifecycle};
 pub use function::{PciClass, PciEndpointIdentity, PciFunctionSpec};
-pub use graph::{PciFunctionRequirement, PciHostKey, PciHostProvider};
+pub use graph::{
+    PciFunctionRequirement, PciHostKey, PciHostProvider, PciIntxPin, PciIntxRequirement,
+    PciIntxRouter, ResolvedPciIntx,
+};
 pub use root::{PciBarRoute, PciRootState};
 pub(crate) use runtime::PciBindingLease;
 pub use runtime::{
-    EndpointRouteToken, PciBarAccess, PciFunction, PciRootBinding, PciRootBindingKey,
+    EndpointIrqTransitionPermit, EndpointRouteToken, PciBarAccess, PciCommandRevision,
+    PciCommandState, PciConfigReadEffect, PciConfigWriteEffect, PciEndpointContext, PciFunction,
+    PciRootBinding, PciRootBindingKey,
 };
 pub(crate) use topology::PciTopologyBuilder;
 pub use topology::{ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology};

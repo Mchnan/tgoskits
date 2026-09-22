@@ -39,27 +39,26 @@ impl RunQueue {
             Some(QueueMembershipClass::Deadline(key)) => self
                 .deadline
                 .get(key)
-                .map(QueuedThread::entity_snapshot)
+                .map(QueuedThread::entity)
                 .ok_or(TaskError::InvalidConfiguration)?,
             Some(QueueMembershipClass::Realtime(key)) => self
                 .rt
                 .get(key)
-                .map(QueuedThread::entity_snapshot)
+                .map(QueuedThread::entity)
                 .ok_or(TaskError::InvalidConfiguration)?,
             _ => current
                 .owned_scheduling_entity_ref()
-                .cloned()
                 .ok_or(TaskError::InvalidConfiguration)?,
         };
-        let dispatch = self.current.as_mut().ok_or(TaskError::NoRunnableThread)?;
-        let grub_reclaimed_ns = dispatch.grub_reclaimed_ns(
-            &current_entity,
+        let grub_reclaimed_ns = current.grub_reclaimed_ns(
+            current_entity,
             runtime_ns,
             inactive_bw_scaled,
             extra_bw_scaled,
             max_bw_scaled,
         );
         let reclaimed_ns = reclaimed_ns.saturating_add(grub_reclaimed_ns);
+        let dispatch = self.current.as_mut().ok_or(TaskError::NoRunnableThread)?;
         let charge = match membership {
             Some(QueueMembershipClass::Deadline(key)) => {
                 let entity = &mut self
@@ -100,17 +99,6 @@ impl RunQueue {
                 .ok_or(TaskError::InvalidConfiguration)?,
         };
         Ok((charge, policy, charged_entity, rt_quota_exempt))
-    }
-
-    /// Reserves every class index before a thread becomes externally visible.
-    /// Scheduler fast paths treat missing capacity as an invariant violation
-    /// instead of allocating under the irqsave rq lock.
-    pub(crate) fn prepare_thread_slot(&mut self, slot: usize) {
-        if self.membership.len() <= slot {
-            self.membership.resize(slot.saturating_add(1), None);
-        }
-        self.deadline.prepare_thread_slot(slot);
-        self.fair.prepare_thread_slot(slot);
     }
 
     pub(crate) const fn nr_running(&self) -> usize {
@@ -292,20 +280,25 @@ impl RunQueue {
     }
 
     pub(super) fn refresh_class_pushable(&mut self, thread: ThreadId, current: Option<ThreadId>) {
-        let previous = self.pushable_publication_state();
-        match self.membership_class(thread) {
+        let changed = match self.membership_class(thread) {
             Some(QueueMembershipClass::Deadline(_)) => {
-                self.deadline.refresh_pushable(thread, current)
+                let previous = self.deadline.has_pushable();
+                self.deadline.refresh_pushable(thread, current);
+                self.deadline.has_pushable() != previous
             }
-            Some(QueueMembershipClass::Realtime(key)) => self.rt.refresh_pushable(key, current),
+            Some(QueueMembershipClass::Realtime(key)) => {
+                let previous = self.rt.has_pushable();
+                self.rt.refresh_pushable(key, current);
+                self.rt.has_pushable() != previous
+            }
             Some(
                 QueueMembershipClass::Stop
                 | QueueMembershipClass::DeadlineThrottled
                 | QueueMembershipClass::Fair,
             )
-            | None => {}
-        }
-        if self.pushable_publication_state() != previous {
+            | None => false,
+        };
+        if changed {
             self.mark_publication_dirty();
         }
     }

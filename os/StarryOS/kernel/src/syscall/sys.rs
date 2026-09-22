@@ -19,7 +19,7 @@ use crate::{
     Errno, StarryError, StarryResult,
     mm::{UserPtr, VmMutPtr, VmPtr, vm_read_slice, vm_write_slice},
     sync::Mutex,
-    task::{SockFilter, SockFprog, get_task_by_number, processes},
+    task::{SeccompFilter, SockFilter, SockFprog, get_task_by_number, processes},
 };
 
 /// Sentinel value meaning "don't change this ID" (userspace passes -1 as signed,
@@ -49,6 +49,8 @@ const GETRANDOM_MAX_LEN: usize = (i32::MAX as usize) & !(PAGE_SIZE_4K - 1);
 /// Keep the syscall's temporary random-data buffer bounded by a small stack
 /// allocation, irrespective of the user-requested length.
 const GETRANDOM_CHUNK_SIZE: usize = 256;
+const SECCOMP_MODE_STRICT: usize = 1;
+const SECCOMP_MODE_FILTER: usize = 2;
 const SECCOMP_SET_MODE_STRICT: u32 = 0;
 const SECCOMP_SET_MODE_FILTER: u32 = 1;
 const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
@@ -1040,27 +1042,34 @@ fn check_seccomp_install_permission(current: &crate::task::UserTaskRef) -> crate
     if thread.no_new_privs() || thread.cred().has_cap_sys_admin() {
         Ok(())
     } else {
-        Err(StarryError::OperationNotPermitted)
+        Err(StarryError::PermissionDenied)
     }
 }
 
-fn read_seccomp_filter(
+fn read_seccomp_filter_header(
     current: &crate::task::UserTaskRef,
     args: *const (),
-) -> crate::StarryResult<Vec<SockFilter>> {
+) -> crate::StarryResult<SockFprog> {
     if args.is_null() {
         return Err(StarryError::BadAddress);
     }
-    let prog = unsafe {
-        (args as *const SockFprog)
-            .vm_read_uninit(current)?
-            .assume_init()
-    };
-    if prog.len == 0 || prog.filter.is_null() {
+    let header = (args as *const SockFprog).vm_read_uninit(current)?;
+    // SAFETY: `vm_read_uninit` initialized the full ABI record, and every bit
+    // pattern is valid for its integer and raw-pointer fields.
+    Ok(unsafe { header.assume_init() })
+}
+
+fn read_seccomp_filter_instructions(
+    current: &crate::task::UserTaskRef,
+    prog: SockFprog,
+) -> crate::StarryResult<Vec<SockFilter>> {
+    if prog.filter.is_null() {
         return Err(StarryError::InvalidInput);
     }
-    let mut raw = vec![MaybeUninit::<SockFilter>::uninit(); prog.len as usize];
+    let mut raw = vec![MaybeUninit::<SockFilter>::uninit(); usize::from(prog.len)];
     vm_read_slice(current, prog.filter, &mut raw)?;
+    // SAFETY: a successful `vm_read_slice` initialized every element, and all
+    // `SockFilter` fields accept every bit pattern.
     Ok(raw
         .into_iter()
         .map(|insn| unsafe { insn.assume_init() })
@@ -1089,14 +1098,37 @@ fn sync_seccomp_to_thread_group(current: &crate::task::UserTaskRef) {
     let curr = current;
     let thread = curr.as_thread();
     let state = thread.seccomp_state();
+    let no_new_privs = thread.no_new_privs();
     for tid in thread.proc_data.proc.threads() {
         if tid == thread.tid_number() {
             continue;
         }
         if let Ok(task) = get_task_by_number(tid) {
-            task.as_thread().set_seccomp_state(state.clone());
+            let peer = task.as_thread();
+            // Linux seccomp_sync_threads carries NNP with the filter. Publish
+            // it before set_seccomp_state enables the peer's syscall work.
+            if no_new_privs {
+                peer.set_no_new_privs();
+            }
+            peer.set_seccomp_state(state.clone());
         }
     }
+}
+
+/// Translate the `prctl(PR_SET_SECCOMP)` mode ABI into the shared seccomp
+/// operation ABI. Linux keeps these numbering spaces distinct and ignores the
+/// filter argument when strict mode is requested.
+pub(crate) fn prctl_set_seccomp(
+    current: &crate::task::UserTaskRef,
+    mode: usize,
+    filter: *const (),
+) -> crate::StarryResult<isize> {
+    let (op, args) = match mode {
+        SECCOMP_MODE_STRICT => (SECCOMP_SET_MODE_STRICT, core::ptr::null()),
+        SECCOMP_MODE_FILTER => (SECCOMP_SET_MODE_FILTER, filter),
+        _ => return Err(StarryError::InvalidInput),
+    };
+    sys_seccomp(current, op, 0, args)
 }
 
 pub fn sys_seccomp(
@@ -1114,13 +1146,19 @@ pub fn sys_seccomp(
             if flags != 0 || !args.is_null() {
                 return Err(StarryError::InvalidInput);
             }
+            let _update = current.as_thread().proc_data.thread_group_update();
             current.as_thread().install_seccomp_strict()?;
         }
         SECCOMP_SET_MODE_FILTER => {
+            // Linux validates the copied instruction count before checking
+            // permission, then validates and reads the instruction pointer.
+            let prog = read_seccomp_filter_header(current, args)?;
+            SeccompFilter::validate_instruction_count(usize::from(prog.len))?;
             check_seccomp_install_permission(current)?;
-            let filter = read_seccomp_filter(current, args)?;
+            let filter = read_seccomp_filter_instructions(current, prog)?;
             let curr = current;
             let thread = curr.as_thread();
+            let _update = thread.proc_data.thread_group_update();
             thread.append_seccomp_filter(filter)?;
             if flags & SECCOMP_FILTER_FLAG_TSYNC != 0 {
                 sync_seccomp_to_thread_group(current);
@@ -1151,7 +1189,7 @@ pub fn sys_riscv_flush_icache(start: usize, end: usize, flags: usize) -> StarryR
     }
 
     if flags & SYS_RISCV_FLUSH_ICACHE_LOCAL != 0 {
-        ax_runtime::hal::cache::flush_icache_all();
+        ax_cpu::cache::flush_icache_all();
     } else {
         ax_runtime::hal::cache::flush_icache_all_cpus();
     }
@@ -1192,7 +1230,7 @@ pub fn sys_riscv_hwprobe(
         // the next one. The value field is output-only and no array is staged.
         let key_ptr = pair.cast::<i64>();
         let mut key = key_ptr.vm_read(current)?;
-        let value = if let Some(value) = ax_runtime::hal::cpu::cap::riscv_hwprobe(key) {
+        let value = if let Some(value) = crate::cpu_capabilities::riscv_hwprobe(key) {
             value
         } else {
             key = -1;

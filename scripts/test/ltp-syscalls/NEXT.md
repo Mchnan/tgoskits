@@ -2,11 +2,17 @@
 
 ## 1. 范围与基准
 
-本批从 `dev cc8faa9222` 开始，继续上一轮已合入的 PR #2322。LTP 固定为 `20260529`、提交 `3a64d78f58bdceba93ed321e91215fb969a047ed`；Linux 对照仍为 v7.1、提交 `8cd9520d35a6c38db6567e97dd93b1f11f185dc6`。本批不修改内核或复制上游测试，候选失败时保留原程序并记录暂缓原因。
+本轮从 `origin/dev e8c2e66466682528d64e4b8102d5940333beaabb` 开始，继续上一轮已合入的 PR #2322。LTP 固定为 `20260529`、提交 `3a64d78f58bdceba93ed321e91215fb969a047ed`；Linux 对照仍为 v7.1、提交 `8cd9520d35a6c38db6567e97dd93b1f11f185dc6`。本轮先按名称审计 `bugfix-*`，首个可在现有功能内修复的普通缺陷为 `linkat` 绝对目标路径错误校验 `newdirfd`；完成该修复及此前成功迁移后停止新增候选。
 
 ### 1.1 执行与提交
 
 `cases.txt` 是实际累计执行集合，`probe-cases.txt` 保存候选。探测期间临时选择候选集合，探测日志与最终累计验证分别保存；失败候选保留在候选清单，不进入最终执行集合。每个原程序只在对应 LTP 完成四架构验证后单独提交，共用用例只安装一次；提交主题写入 `migration.csv` 以免变基使账本 hash 失效。
+
+### 1.3 本轮首个缺陷
+
+`bug-linkat-flags-symlink` 的原测试首先按固定 LTP `linkat01.c` 进行等效审计。LTP 用例第 11、15 项使用绝对目标路径，同时传入非目录或无效 `newdirfd`；Linux v7.1 的 `filename_linkat()` 通过 `filename_create()` 解析目标路径，绝对路径因此忽略该描述符。Starry 原实现直接以 `new_dirfd` 调用 `with_fs()`，修复前分别返回 `ENOTDIR`、`EBADF`，修复后把绝对目标路径的解析基准改为 `AT_FDCWD`。
+
+同一 LTP 用例提供确定性红绿证据：修复前累计 x86_64 集合 `total=90 passed=88 failed=2`，修复后移除不适用的 `linkat02` 后 `total=89 passed=89 failed=0`，`linkat01` 22 项全部 `TPASS`。原测试中 symlink 目标类型、坏用户指针的非法 flags 优先级和 `EEXIST` 等断言，以及 `linkat02` 依赖 ext2 工具的错误组合没有由 `linkat01` 承接，均记录为覆盖损失；不通过放宽 wrapper 或隐藏 `TCONF` 接入。
 
 ### 1.2 覆盖边界
 
@@ -15,6 +21,16 @@
 ## 2. 逐项映射
 
 每小节记录原程序的输入、生命周期断言和上游承接范围。上游源码链接固定到 LTP 提交；日志保存在实施机器 `/tmp/starry-ltp-next-evidence/`。
+
+### 2.8 linkat 路径与 flags
+
+`bug-linkat-flags-symlink` 部分替换为 [linkat01.c](https://github.com/linux-test-project/ltp/blob/3a64d78f58bdceba93ed321e91215fb969a047ed/testcases/kernel/syscalls/linkat/linkat01.c)。该用例承接相对和绝对源/目标路径、目录描述符边界、跨设备链接、目录链接及非法 flags 的 22 项断言。固定 Linux v7.1 的 [`filename_linkat()`](https://github.com/torvalds/linux/blob/8cd9520d35a6c38db6567e97dd93b1f11f185dc6/fs/namei.c#L5808-L5883) 先校验 flags，再解析源路径和目标路径；目标路径为绝对路径时，`newdfd` 不参与路径起点选择。
+
+Starry 调用链为 `sys_linkat` → `resolve_at` → `with_fs`/`FsContext::resolve_nonexistent` → `Location::link`。原实现只在源路径的 `resolve_at` 中处理绝对路径，目标路径无条件进入 `with_fs(new_dirfd, ...)`。修复后目标路径以 `/` 开头时改用 `AT_FDCWD`，所以 LTP `linkat01` 第 11、15 项从 `ENOTDIR`、`EBADF` 恢复为成功；这也是本轮首个普通可修复缺陷，之后停止探索新的候选。
+
+未承接的原断言包括：flags=0 对 symlink 本体的硬链接、`AT_SYMLINK_FOLLOW` 对目标文件的硬链接内容、坏 old/new 用户指针下非法 flags 的优先级以及已存在目标的 `EEXIST`。固定 LTP [linkat02.c](https://github.com/linux-test-project/ltp/blob/3a64d78f58bdceba93ed321e91215fb969a047ed/testcases/kernel/syscalls/linkat/linkat02.c) 还覆盖过长路径、ELOOP、EACCES、EROFS、EMLINK，但当前镜像没有 `mkfs.ext2`，运行结果为 `TCONF`，因此没有接入累计集合；原测试只删除已被 `linkat01` 部分承接的专属程序，覆盖损失保留在账本中。
+
+x86_64 修复前日志为 `/tmp/starry-ltp-next-evidence/` 中本轮基线输出，显示累计 90 项中 88 项通过、`linkat01` 两项失败；修复后四架构日志 `linkat01-{x86_64,aarch64,riscv64,loongarch64}-green.log` 分别显示累计 `89/89`、`87/87`、`87/87`、`87/87`，且 `linkat01` 均为 22/22 `TPASS`。完整 `qemu/system` 日志 `full-system-{x86_64,aarch64,riscv64,loongarch64}.log` 分别显示 `515/515`、`513/513`、`513/513`、`513/513`，外层均为 `PASS`。
 
 ### 2.1 POSIX 锁死锁检测
 
@@ -121,3 +137,44 @@
 | flock / x86_64:73；其他三架构:32 | [Linux v7.1 flock](https://github.com/torvalds/linux/blob/8cd9520d35a6c38db6567e97dd93b1f11f185dc6/fs/locks.c#L2214) | OFD 间共享/排他冲突、非阻塞 EWOULDBLOCK、阻塞信号中断 EINTR | sys_flock → flock_op → try_flock_once → FLOCK_LOCKS 及 inode 等待队列 | 正确 | flock02/04/06/07，四架构验证通过 |
 | futex / x86_64:202；其他三架构:98 | [Linux v7.1 do_futex](https://github.com/torvalds/linux/blob/8cd9520d35a6c38db6567e97dd93b1f11f185dc6/kernel/futex/syscalls.c#L112) | 私有 WAIT 返回0，WAKE 的计数为1 | sys_futex → FutexContext::resolve → wait_nofault_until/wake，进程私有键及桶队列 | 正确 | 复用 futex_wait03，四架构验证通过 |
 | getcwd / x86_64:79；其他三架构:17 | [Linux v7.1 getcwd](https://github.com/torvalds/linux/blob/8cd9520d35a6c38db6567e97dd93b1f11f185dc6/fs/d_path.c#L413) | 缓冲区过短先 ERANGE，足够长但地址无效 EFAULT；返回当前路径 | sys_getcwd → current_fs_context 当前目录 → absolute_path → vm_write_slice | 正确 | getcwd01/02，四架构验证通过；不证明 raw 成功长度 |
+
+## 5. 全量续迁
+
+2026-09-14 从 `51c2d5077938e535ea9b8a5ec468f33dbd3de765` 开始处理当前 `qemu/system` 中全部 139 个 `bugfix-*`、154 个 `syscall-*` 目录，共 295 个原程序。初始源码清单保存在本轮证据目录的 `inventory.json`，后续删除不改变清单范围。本节记录新的执行规则，不改变上文历史批次的事实。LTP 仍固定为 `20260529`、提交 `3a64d78f58bdceba93ed321e91215fb969a047ed`，本机上游源码检出干净。
+
+### 5.1 逐项处理
+
+按原目录名称先处理 bugfix，再处理 syscall。原程序只有在对应上游用例完成全部适用架构后才清理；LTP 部分承接时，未承接的断言写入 `migration.csv`，不补写自定义用例。完全没有对应项的程序保留，候选失败则恢复正式清单、保留原程序并继续下一项，不修改内核、上游测试、超时或通过门槛。本轮完成全部候选处置及必要验证后提交、推送并创建拉取请求；不创建缺陷议题。
+
+`cases.txt` 保存正式共同集合；探测时临时选择当前候选，结束后恢复正式集合。相同 LTP 用例的本轮结果可复用于多个原程序，失败结果也复用，不反复探测直到通过。架构范围只依据原源码限定，不能依据失败缩减。`syscall-test-vectored-io` 的三个可执行程序必须分别处置，不因主程序迁移而删除其余程序。
+
+全部 295 个原程序已逐项处置：134 个部分替代并清理、69 个无对应项保留、92 个失败跳过。`migration.csv` 中 `commit_subject` 为 `test(starry): migrate bugfix and syscall probes to LTP` 的 295 行属于本轮；其他行保留历史批次或范围外状态，不计入上述数量。混合目录保留 `test-special-fd-write-precedence`，仅删除已通过迁移的两个程序及它们的构建条目。
+
+### 5.2 本轮证据
+
+逐项命令、退出状态和失败输出写入 `migration.csv`，完整日志保存在实施机器 `/tmp/starry-ltp-5fb8-evidence/`。每个候选日志使用 `<LTP-ID>-<arch>.log`，历史日志不计入本轮通过证据。完成数量来自固定上游源码，并由 `minimum-passes.txt` 与现有 wrapper 检查；`TCONF`、`TBROK`、`TFAIL` 和零通过数均不能接入。
+
+逐项处置及最终四架构累计 LTP、完整 system 验证均已完成。初始 x86_64 累计 LTP 基线已通过，见 `baseline-x86_64.log`。正式集合为 172 个共同用例，x86_64 另有 3 个专有用例；每个架构还有两个独立计数的 native 隔离回归。
+
+`mprotect04` 在 aarch64 持续报告同一虚拟地址的页表映射冲突，未完成首条断言；本轮主动终止挂起的 QEMU 及同次 xtask，记录退出码 `-15`，不是自然超时。原程序保留，未重试；处置说明保存在 `mprotect04-abort.json`。
+
+宿主派生 rootfs 镜像缓存累积导致空间耗尽：`mq_notify01` 的 riscv64 镜像准备失败，退出 1；随后 `msgctl12` 的 x86_64 日志和退出码未能落盘，退出码记为未知。两项按环境失败或证据缺失跳过，不据此认定内核行为错误，也不重试。相关说明见 `mq_notify01-environment.json`、`msgctl12-environment.json` 与 `progress-172-285.log`。清理本工作树 275 份旧派生镜像后释放约 608 GiB，保留源码、原始 rootfs 和运行日志，再继续其余候选。
+
+最终整合基准为 `origin/dev 4a398bd618a5ad74b624d5668c3101d92a675839`，保留其新增 `nanosleep02` 及 `clock_nanosleep04` 完成门槛。重基前的累计验证仅作为阶段证据，日志统一为 `pre-rebase-*.log`；其中 aarch64 普通 system 分组通过，独立 system-perf 分组的 `perf-hw-sliced-period` 返回 1，协调器停止后未捕获该整条命令的退出码。重基后使用新的 `final-*.log` 和 `final-runs.json` 重新记录四架构结果。
+
+### 5.3 最终验证
+
+在整合基准上串行执行四架构定向 LTP，再执行四架构完整 `qemu/system`，八条命令退出码均为 0。定向计数包含两个 native 隔离回归；aarch64 完整套件分为普通 system 480 项和独立 system-perf 23 项，两组均通过。
+
+| 架构 | 定向 LTP 分组 | 完整 system | 日志文件 |
+| --- | --- | --- | --- |
+| x86_64 | 177/177 | 506/506 | `final-ltp-x86_64.log`、`final-system-x86_64.log` |
+| aarch64 | 174/174 | 480/480 + 23/23 | `final-ltp-aarch64.log`、`final-system-aarch64.log` |
+| riscv64 | 174/174 | 503/503 | `final-ltp-riscv64.log`、`final-system-riscv64.log` |
+| loongarch64 | 174/174 | 503/503 | `final-ltp-loongarch64.log`、`final-system-loongarch64.log` |
+
+上述文件均位于本轮证据目录。`final-runs.json` 保存完整命令、退出码及耗时；`final-ltp-audit.json` 核对每个用例的最少 TPASS、16 条文件系统阶段契约和零失败标记。用现有 `generate-common.sh` 从四份新日志生成公共清单，与正式 `cases.txt` 逐字节一致。
+
+`final-system-audit.json` 确认完整运行没有重复程序、已删除原程序残留或普通安装目录中的保留项遗漏。本轮保留的 161 个原程序中，155 个在普通套件实际执行，另 6 个维持既有 `starry-known-fail` 安装位置，不属于默认 system 执行集合。loongarch64 的 termios 测试在成功标记前输出 NUL 字节，离线核对解析时仅去除该前导字节，不修改原日志或运行器判定。
+
+`integrity-audit.json` 核对全部 295 条本轮处置、293 个原目录和 466 个删除文件的初始源码哈希；保留源文件、混合目录构建引用和正式清单一致。`git diff --check` 与文档站点 `npm run build` 通过。最终累计验证没有失败，不需要撤销已通过迁移；重基前的 aarch64 perf 失败保留为阶段记录，本次新基线完整验证通过。

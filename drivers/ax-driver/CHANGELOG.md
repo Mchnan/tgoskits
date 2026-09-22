@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/rcore-os/tgoskits/compare/ax-driver-v0.17.0...ax-driver-v0.18.0) - 2026-09-21
+
+### Added
+
+- *(pwm)* unify BSP-backed drivers and Starry integration ([#2437](https://github.com/rcore-os/tgoskits/pull/2437))
+
+## [0.17.0](https://github.com/rcore-os/tgoskits/compare/ax-driver-v0.16.0...ax-driver-v0.17.0) - 2026-09-18
+
+### Fixed
+
+- *(ci)* restore RK3588 NPU inference and require complete workload success ([#2441](https://github.com/rcore-os/tgoskits/pull/2441))
+- *(rknpu)* enforce per-owner and per-device GEM allocation quotas ([#2424](https://github.com/rcore-os/tgoskits/pull/2424))
+- *(ci)* fix debugfs test execution and virtio input startup ([#2396](https://github.com/rcore-os/tgoskits/pull/2396))
+- *(ax-driver)* keep PCI INTx unmasked for virtio input probe ([#2353](https://github.com/rcore-os/tgoskits/pull/2353))
+
+### Other
+
+- *(repo)* remove nonfunctional and redundant test assertions ([#2440](https://github.com/rcore-os/tgoskits/pull/2440))
+
+## [0.16.0](https://github.com/rcore-os/tgoskits/compare/ax-driver-v0.15.0...ax-driver-v0.16.0) - 2026-09-13
+
+### Fixed
+
+- *(rknpu)* copy and validate user task arrays before NPU submit ([#2327](https://github.com/rcore-os/tgoskits/pull/2327))
+
+## [0.15.0](https://github.com/rcore-os/tgoskits/compare/ax-driver-v0.14.0...ax-driver-v0.15.0) - 2026-09-11
+
+### Fixed
+
+- *(axvisor)* restore COM1 console and preserve guest output order ([#2311](https://github.com/rcore-os/tgoskits/pull/2311))
+- *(rknpu)* add timeout error handling and update ioctl error mapping ([#2324](https://github.com/rcore-os/tgoskits/pull/2324))
+
 ## [0.14.0](https://github.com/rcore-os/tgoskits/compare/ax-driver-v0.13.3...ax-driver-v0.14.0) - 2026-09-09
 
 ### Added
