@@ -386,6 +386,10 @@ int main(void)
     next_fb.fb_id = 0;
     CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &next_fb), 0, "ADDFB2 flip target");
 
+    struct drm_crtc_get_sequence before_flip = { .crtc_id = crtc_ids[0] };
+    CHECK_RET(ioctl(fd, DRM_IOCTL_CRTC_GET_SEQUENCE, &before_flip), 0,
+              "GET_SEQUENCE before flip");
+
     /* --- page flip with event --- */
     struct drm_mode_crtc_page_flip flip = {
         .crtc_id = crtc_ids[0], .fb_id = next_fb.fb_id,
@@ -434,8 +438,13 @@ int main(void)
     CHECK(gseq1.sequence >= seq1, "GET_SEQUENCE sequence >= flip seq");
     int64_t flip_edge_ns = (int64_t)ev.tv_sec * 1000000000LL
                          + (int64_t)ev.tv_usec * 1000;
-    int64_t expected_edge_ns = gseq1.sequence_ns
-                             - (int64_t)(gseq1.sequence - seq1) * (1000000000LL / 60);
+    /* The first active edge after a disable starts a new epoch. If the flip
+     * still reports the previously completed edge, compare against its
+     * pre-flip sample rather than extrapolating backward across that gap. */
+    int64_t expected_edge_ns = seq1 == before_flip.sequence
+                             ? before_flip.sequence_ns
+                             : gseq1.sequence_ns
+                               - (int64_t)(gseq1.sequence - seq1) * (1000000000LL / 60);
     CHECK(expected_edge_ns >= flip_edge_ns && expected_edge_ns - flip_edge_ns < 1000,
           "flip timestamp identifies its sequence's vblank edge");
 
