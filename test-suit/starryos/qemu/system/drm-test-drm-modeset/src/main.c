@@ -477,6 +477,18 @@ int main(void)
           "sequence event fired at or after target");
     CHECK(seq_ev.tv_ns >= gseq2.sequence_ns, "sequence event timestamp monotonic");
 
+    int render_seq = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    CHECK(render_seq >= 0, "open render node for sequence permissions");
+    struct drm_crtc_get_sequence render_get = { .crtc_id = crtc_ids[0] };
+    CHECK_ERR(ioctl(render_seq, DRM_IOCTL_CRTC_GET_SEQUENCE, &render_get), EACCES,
+              "render node rejects GET_SEQUENCE");
+    struct drm_crtc_queue_sequence render_queue = {
+        .crtc_id = crtc_ids[0], .flags = DRM_CRTC_SEQUENCE_RELATIVE, .sequence = 2,
+    };
+    CHECK_ERR(ioctl(render_seq, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &render_queue), EACCES,
+              "render node rejects QUEUE_SEQUENCE");
+    close(render_seq);
+
     /* --- QUEUE_SEQUENCE 错误路径 --- */
     struct drm_crtc_queue_sequence bad_flags = {
         .crtc_id = crtc_ids[0], .flags = 0x80000000, .sequence = 1,
@@ -603,9 +615,21 @@ int main(void)
               "disable CRTC rejects connectors");
     check_binding(fd, plane_ids[0], crtc_ids[0], next_fb.fb_id);
 
+    struct drm_crtc_get_sequence before_disable = { .crtc_id = crtc_ids[0] };
+    CHECK_RET(ioctl(fd, DRM_IOCTL_CRTC_GET_SEQUENCE, &before_disable), 0,
+              "query sequence before disable");
+    struct drm_crtc_queue_sequence suspended = {
+        .crtc_id = crtc_ids[0], .flags = DRM_CRTC_SEQUENCE_RELATIVE,
+        .sequence = 8, .user_data = 0xadd00ff,
+    };
+    CHECK_RET(ioctl(fd, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &suspended), 0,
+              "queue event before disabling CRTC");
     struct drm_mode_crtc disable = { .crtc_id = crtc_ids[0] };
     CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_SETCRTC, &disable), 0, "disable CRTC");
     check_binding(fd, plane_ids[0], crtc_ids[0], 0);
+    struct pollfd suspended_pfd = { .fd = fd, .events = POLLIN };
+    CHECK(poll(&suspended_pfd, 1, 300) == 0,
+          "queued vblank stays pending while CRTC is disabled");
     uint32_t plane = plane_ids[0], count = 1, src_x_prop = PROP_PLANE_SRC_X;
     uint64_t src_x = 1;
     struct drm_mode_atomic plane_only = {
@@ -622,7 +646,28 @@ int main(void)
               "plane-only update does not activate CRTC");
     setcrtc.fb_id = next_fb.fb_id;
     CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &setcrtc), 0, "re-enable CRTC");
+    struct drm_crtc_get_sequence after_enable = { .crtc_id = crtc_ids[0] };
+    CHECK_RET(ioctl(fd, DRM_IOCTL_CRTC_GET_SEQUENCE, &after_enable), 0,
+              "query sequence after re-enable");
+    CHECK(after_enable.sequence >= before_disable.sequence &&
+          after_enable.sequence - before_disable.sequence <= 1,
+          "disabled interval does not advance vblank sequence");
     check_binding(fd, plane_ids[0], crtc_ids[0], next_fb.fb_id);
+    CHECK(poll(&suspended_pfd, 1, 1000) == 1,
+          "queued vblank resumes after re-enable");
+    struct drm_event_crtc_sequence resumed_event = {0};
+    n = read(fd, &resumed_event, sizeof(resumed_event));
+    CHECK(n == (ssize_t)sizeof(resumed_event) &&
+          resumed_event.user_data == 0xadd00ff &&
+          resumed_event.sequence >= suspended.sequence,
+          "resumed event carries the reached sequence");
+    struct drm_crtc_get_sequence after_event = { .crtc_id = crtc_ids[0] };
+    CHECK_RET(ioctl(fd, DRM_IOCTL_CRTC_GET_SEQUENCE, &after_event), 0,
+              "query sequence after resumed event");
+    CHECK(after_event.sequence >= resumed_event.sequence &&
+          after_event.sequence_ns - resumed_event.tv_ns ==
+          (int64_t)(after_event.sequence - resumed_event.sequence) * (1000000000LL / 60),
+          "resumed event timestamp identifies its sequence edge");
 
     /* --- SETCRTC referencing a removed fb must fail with EINVAL --- */
     uint32_t old_fb_id = next_fb.fb_id;

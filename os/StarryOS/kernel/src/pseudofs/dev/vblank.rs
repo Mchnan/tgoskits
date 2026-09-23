@@ -6,16 +6,14 @@
 //! monotonic per-CRTC sequence advancing at the mode's refresh rate,
 //! plus timestamps of the most recent edge (`CRTC_GET_SEQUENCE`,
 //! `CRTC_QUEUE_SEQUENCE`, `WAIT_VBLANK`, and flip-completion events).
-//! The clock here derives that sequence from elapsed monotonic time
-//! anchored at card creation, mirroring Linux's
-//! `vblank_disable_immediate` mode where the counter is computed from
-//! timestamps rather than latched by an interrupt
-//! (`drivers/gpu/drm/drm_vblank.c`, `drm_vblank_count_and_time`).
+//! The clock derives that sequence from elapsed monotonic time while
+//! scanout is active. Disabling the CRTC freezes the counter; re-enabling
+//! starts a new epoch without counting the disabled interval.
 //!
 //! Each open file owns its queued events and a deadline worker wakes readers
 //! at the next edge; only the monotonic clock is shared by the device.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::RawSpinLock;
 
 /// Nanoseconds between synthesized vblank edges (60 Hz, matching the
 /// mode's `DEFAULT_VREFRESH` advertised by the card).
@@ -56,31 +54,95 @@ pub(super) struct PendingVblankEvent {
     pub target_sequence: u64,
 }
 
-/// Sequence counter derived from elapsed monotonic time. Sequence 0 is
-/// the card-creation anchor; edge *N* occurs at
-/// `anchor_ns + N * VBLANK_PERIOD_NS`.
+/// Sequence counter and the current active scanout epoch.
 pub(super) struct VblankClock {
-    anchor_ns: AtomicU64,
+    state: RawSpinLock<VblankState>,
+}
+
+struct VblankState {
+    active: bool,
+    anchor_ns: u64,
+    base_sequence: u64,
+    last_edge_ns: u64,
+}
+
+impl VblankState {
+    fn at(&self, now_ns: u64) -> (u64, u64) {
+        let elapsed = if self.active {
+            now_ns.saturating_sub(self.anchor_ns) / VBLANK_PERIOD_NS
+        } else {
+            0
+        };
+        let edge_ns = if elapsed == 0 {
+            self.last_edge_ns
+        } else {
+            self.anchor_ns
+                .saturating_add(elapsed.saturating_mul(VBLANK_PERIOD_NS))
+        };
+        (self.base_sequence.saturating_add(elapsed), edge_ns)
+    }
+
+    fn edge_ns_of(&self, sequence: u64) -> u64 {
+        if sequence <= self.base_sequence {
+            self.last_edge_ns
+        } else {
+            self.anchor_ns.saturating_add(
+                sequence
+                    .saturating_sub(self.base_sequence)
+                    .saturating_mul(VBLANK_PERIOD_NS),
+            )
+        }
+    }
 }
 
 impl VblankClock {
     pub(super) fn new(now_ns: u64) -> Self {
         Self {
-            anchor_ns: AtomicU64::new(now_ns),
+            state: RawSpinLock::new(VblankState {
+                active: false,
+                anchor_ns: now_ns,
+                base_sequence: 0,
+                last_edge_ns: now_ns,
+            }),
         }
     }
 
-    /// The most recent completed edge's sequence number at `now_ns`.
-    pub(super) fn sequence_at(&self, now_ns: u64) -> u64 {
-        let anchor = self.anchor_ns.load(Ordering::Relaxed);
-        now_ns.saturating_sub(anchor) / VBLANK_PERIOD_NS
+    /// Called under the device's modeset lock. Returns whether workers
+    /// must recompute their deadlines after the transition.
+    pub(super) fn set_active(&self, active: bool, now_ns: u64) -> bool {
+        let mut state = self.state.lock();
+        if state.active == active {
+            return false;
+        }
+        if active {
+            state.anchor_ns = now_ns;
+            if state.base_sequence == 0 {
+                state.last_edge_ns = now_ns;
+            }
+        } else {
+            (state.base_sequence, state.last_edge_ns) = state.at(now_ns);
+        }
+        state.active = active;
+        true
     }
 
-    /// Monotonic timestamp (nanoseconds) of edge `sequence`. Saturates
-    /// instead of overflowing for far-future targets.
+    pub(super) fn active_at(&self, now_ns: u64) -> Option<(u64, u64)> {
+        let state = self.state.lock();
+        state.active.then(|| state.at(now_ns))
+    }
+
+    pub(super) fn snapshot_at(&self, now_ns: u64) -> (u64, u64) {
+        self.state.lock().at(now_ns)
+    }
+
+    /// Monotonic timestamp of an edge in the current active epoch.
     pub(super) fn edge_ns_of(&self, sequence: u64) -> u64 {
-        let anchor = self.anchor_ns.load(Ordering::Relaxed);
-        anchor.saturating_add(sequence.saturating_mul(VBLANK_PERIOD_NS))
+        self.state.lock().edge_ns_of(sequence)
+    }
+
+    pub(super) fn deadline_ns(&self, sequence: u64) -> Option<u64> {
+        let state = self.state.lock();
+        state.active.then(|| state.edge_ns_of(sequence))
     }
 }
 
@@ -118,17 +180,28 @@ mod tests {
     #[test]
     fn clock_sequences_track_elapsed_periods() {
         let clock = VblankClock::new(1_000);
-        assert_eq!(clock.sequence_at(1_000), 0);
+        assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 3).0, 0);
+        clock.set_active(true, 1_000);
+        assert_eq!(clock.snapshot_at(1_000).0, 0);
         // Just before the first edge.
-        assert_eq!(clock.sequence_at(1_000 + VBLANK_PERIOD_NS - 1), 0);
+        assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS - 1).0, 0);
         // On the first edge.
-        assert_eq!(clock.sequence_at(1_000 + VBLANK_PERIOD_NS), 1);
+        assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS).0, 1);
         // Three and a half periods later.
         assert_eq!(
-            clock.sequence_at(1_000 + VBLANK_PERIOD_NS * 7 / 2),
+            clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 7 / 2).0,
             3
         );
         // Edge timestamps round-trip through the sequence computation.
         assert_eq!(clock.edge_ns_of(4), 1_000 + VBLANK_PERIOD_NS * 4);
+
+        clock.set_active(false, 1_000 + VBLANK_PERIOD_NS * 7 / 2);
+        assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 30).0, 3);
+        assert_eq!(clock.deadline_ns(4), None);
+        clock.set_active(true, 1_000 + VBLANK_PERIOD_NS * 30);
+        assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 30).0, 3);
+        assert_eq!(clock.edge_ns_of(3), 1_000 + VBLANK_PERIOD_NS * 3);
+        assert_eq!(clock.edge_ns_of(4), 1_000 + VBLANK_PERIOD_NS * 31);
+        assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 31).0, 4);
     }
 }
