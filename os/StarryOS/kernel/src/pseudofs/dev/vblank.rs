@@ -11,7 +11,7 @@
 //! starts a new epoch without counting the disabled interval.
 //!
 //! Each open file owns its queued events and a deadline worker wakes readers
-//! at the next edge; only the monotonic clock is shared by the device.
+//! at the next edge; the clock and deadline-change notification are shared.
 
 use crate::sync::RawSpinLock;
 
@@ -135,11 +135,6 @@ impl VblankClock {
         self.state.lock().at(now_ns)
     }
 
-    /// Monotonic timestamp of an edge in the current active epoch.
-    pub(super) fn edge_ns_of(&self, sequence: u64) -> u64 {
-        self.state.lock().edge_ns_of(sequence)
-    }
-
     pub(super) fn deadline_ns(&self, sequence: u64) -> Option<u64> {
         let state = self.state.lock();
         state.active.then(|| state.edge_ns_of(sequence))
@@ -193,15 +188,15 @@ mod tests {
             3
         );
         // Edge timestamps round-trip through the sequence computation.
-        assert_eq!(clock.edge_ns_of(4), 1_000 + VBLANK_PERIOD_NS * 4);
+        assert_eq!(clock.deadline_ns(4), Some(1_000 + VBLANK_PERIOD_NS * 4));
 
         clock.set_active(false, 1_000 + VBLANK_PERIOD_NS * 7 / 2);
         assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 30).0, 3);
         assert_eq!(clock.deadline_ns(4), None);
         clock.set_active(true, 1_000 + VBLANK_PERIOD_NS * 30);
         assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 30).0, 3);
-        assert_eq!(clock.edge_ns_of(3), 1_000 + VBLANK_PERIOD_NS * 3);
-        assert_eq!(clock.edge_ns_of(4), 1_000 + VBLANK_PERIOD_NS * 31);
+        assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 30).1, 1_000 + VBLANK_PERIOD_NS * 3);
+        assert_eq!(clock.deadline_ns(4), Some(1_000 + VBLANK_PERIOD_NS * 31));
         assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 31).0, 4);
     }
 }

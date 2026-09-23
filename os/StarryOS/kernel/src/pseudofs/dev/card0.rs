@@ -2923,9 +2923,11 @@ impl Card0 {
         }
         state.plane_fb_id = f.fb_id;
         self.present_fb(f.fb_id);
+        let flip_edge = (f.flags & DRM_MODE_PAGE_FLIP_EVENT != 0)
+            .then(|| self.vblank.snapshot_at(monotonic_time_nanos()));
         drop(state);
-        if f.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            self.queue_flip_event(file, f.user_data);
+        if let Some((sequence, edge_ns)) = flip_edge {
+            self.queue_flip_event(file, f.user_data, sequence, edge_ns);
         }
         Ok(0)
     }
@@ -2937,8 +2939,7 @@ impl Card0 {
     }
 
     /// Flip-completion and its timestamp refer to the same vblank edge.
-    fn queue_flip_event(&self, file: &Card0File, user_data: u64) {
-        let (sequence, edge_ns) = self.vblank.snapshot_at(monotonic_time_nanos());
+    fn queue_flip_event(&self, file: &Card0File, user_data: u64, sequence: u64, edge_ns: u64) {
         let ev = DrmEventVblank {
             base: DrmEvent {
                 event_type: DRM_EVENT_FLIP_COMPLETE,
@@ -3091,7 +3092,7 @@ impl Card0 {
 
         let vtype = req.rep_type;
         let now_ns = monotonic_time_nanos();
-        let (current_sequence, _) = self
+        let (current_sequence, current_edge_ns) = self
             .vblank
             .active_at(now_ns)
             .ok_or(VfsError::InvalidInput)?;
@@ -3102,7 +3103,7 @@ impl Card0 {
             && (vtype & (DRM_VBLANK_RELATIVE | DRM_VBLANK_EVENT | DRM_VBLANK_NEXTONMISS))
                 == DRM_VBLANK_RELATIVE
         {
-            let reply = self.wait_vblank_reply(vtype, current_sequence);
+            let reply = self.wait_vblank_reply(vtype, current_sequence, current_edge_ns);
             ptr.vm_write(current, reply).map_err(|_| VfsError::BadAddress)?;
             return Ok(0);
         }
@@ -3132,7 +3133,7 @@ impl Card0 {
             let fired = vblank_passed(current_sequence, target);
             file.serve_pending_vblank_events();
             if fired {
-                self.queue_vblank_event(file, user_data, current_sequence)?;
+                self.queue_vblank_event(file, user_data, current_sequence, current_edge_ns)?;
             } else {
                 file.queue_pending(PendingVblankEvent {
                     event: QueuedVblankEvent::Vblank { user_data },
@@ -3140,7 +3141,7 @@ impl Card0 {
                 })?;
             }
             let reply_sequence = if fired { current_sequence } else { target };
-            let mut reply = self.wait_vblank_reply(req.rep_type, current_sequence);
+            let mut reply = self.wait_vblank_reply(req.rep_type, current_sequence, current_edge_ns);
             reply.sequence = reply_sequence as u32;
             ptr.vm_write(current, reply).map_err(|_| VfsError::BadAddress)?;
             return Ok(0);
@@ -3148,23 +3149,22 @@ impl Card0 {
 
         // The timer may wake early; only the clock reaching the target
         // completes the request. A signal interrupts without a user reply.
-        let mut sequence = current_sequence;
+        let (mut sequence, mut edge_ns) = (current_sequence, current_edge_ns);
         while !vblank_passed(sequence, target) {
             listener!(self.vblank_event => listener);
-            let edge_ns = self
+            let deadline_ns = self
                 .vblank
                 .deadline_ns(target)
                 .ok_or(VfsError::InvalidInput)?;
-            let _ = block_on_user(current, timeout_at(Some(core::time::Duration::from_nanos(edge_ns)), listener))
+            let _ = block_on_user(current, timeout_at(Some(core::time::Duration::from_nanos(deadline_ns)), listener))
             .into_result()
             .map_err(|_| VfsError::Interrupted)?;
-            sequence = self
+            (sequence, edge_ns) = self
                 .vblank
                 .active_at(monotonic_time_nanos())
-                .ok_or(VfsError::InvalidInput)?
-                .0;
+                .ok_or(VfsError::InvalidInput)?;
         }
-        let reply = self.wait_vblank_reply(req.rep_type, sequence);
+        let reply = self.wait_vblank_reply(req.rep_type, sequence, edge_ns);
         ptr.vm_write(current, reply).map_err(|_| VfsError::BadAddress)?;
         Ok(0)
     }
@@ -3172,8 +3172,8 @@ impl Card0 {
     /// Builds a `WAIT_VBLANK` reply reporting `sequence`'s edge time,
     /// mirroring `drm_wait_vblank_reply()`: the truncated counter plus
     /// the timestamp of the most recent vblank edge.
-    fn wait_vblank_reply(&self, rep_type: u32, sequence: u64) -> DrmWaitVblank {
-        let edge_ns = self.vblank.edge_ns_of(sequence) as i64;
+    fn wait_vblank_reply(&self, rep_type: u32, sequence: u64, edge_ns: u64) -> DrmWaitVblank {
+        let edge_ns = edge_ns as i64;
         DrmWaitVblank {
             rep_type,
             sequence: sequence as u32,
@@ -3183,8 +3183,13 @@ impl Card0 {
     }
 
     /// Queues an immediate `DRM_EVENT_VBLANK` for a fired target.
-    fn queue_vblank_event(&self, file: &Card0File, user_data: u64, sequence: u64) -> VfsResult<()> {
-        let edge_ns = self.vblank.edge_ns_of(sequence);
+    fn queue_vblank_event(
+        &self,
+        file: &Card0File,
+        user_data: u64,
+        sequence: u64,
+        edge_ns: u64,
+    ) -> VfsResult<()> {
         let ev = DrmEventVblank {
             base: DrmEvent {
                 event_type: DRM_EVENT_VBLANK,
@@ -3262,12 +3267,14 @@ impl Card0 {
             current_fb != 0 && state.crtc_active != 0,
             monotonic_time_nanos(),
         );
+        let flip_edge = (a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0)
+            .then(|| self.vblank.snapshot_at(monotonic_time_nanos()));
         drop(state);
         if changed {
             self.vblank_event.notify(usize::MAX);
         }
-        if a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            self.queue_flip_event(file, a.user_data);
+        if let Some((sequence, edge_ns)) = flip_edge {
+            self.queue_flip_event(file, a.user_data, sequence, edge_ns);
         }
         Ok(0)
     }
