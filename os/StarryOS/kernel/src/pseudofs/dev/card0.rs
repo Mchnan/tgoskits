@@ -49,7 +49,7 @@ use core::{
 use ax_alloc::GlobalPage;
 use ax_memory_addr::{PAGE_SIZE_4K, PhysAddrRange};
 use ax_runtime::hal::{mem::virt_to_phys, time::monotonic_time_nanos};
-use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
+use axfs_ng_vfs::{DeviceId, NodeFlags, VfsError, VfsResult};
 use axpoll::{IoEvents, Pollable};
 use axpoll_set::PollSet;
 use bytemuck::bytes_of;
@@ -689,6 +689,7 @@ struct PerFdCtx {
 struct Card0File {
     base: KernelFile,
     card: Arc<Card0>,
+    is_primary: bool,
     file_id: u64,
     events: Mutex<Card0Events>,
     poll_rx: PollSet,
@@ -761,7 +762,7 @@ pub struct Card0 {
     next_ctx_id: AtomicU32,
     /// Stable identity assigned to each open file description.
     next_file_id: AtomicU64,
-    /// Live open file descriptions, guarded by `state` during open and drop.
+    /// Live primary-node file descriptions, guarded by `state` during open and drop.
     open_files: Mutex<usize>,
     /// Cached capset data keyed by (capset_id, version). GET_CAPS results
     /// are cached here so repeated queries don't round-trip to the host.
@@ -1044,7 +1045,12 @@ pub(crate) fn open_card0_file(
         .downcast_ref::<Card0>()
         .ok_or(StarryError::NoSuchDevice)?;
     let card = card.self_weak.upgrade().ok_or(StarryError::NoSuchDevice)?;
-    let opened = Arc::new(Card0File::new(KernelFile::new(file, open_flags), card));
+    let is_primary = file.location().metadata()?.rdev == DeviceId::new(226, 0);
+    let opened = Arc::new(Card0File::new(
+        KernelFile::new(file, open_flags),
+        card,
+        is_primary,
+    ));
     let weak = Arc::downgrade(&opened);
     crate::task::kernel_thread_builder(format!("card0-vblank-{}", opened.file_id))
         .spawn(move || block_on(run_vblank_timer(weak)))
@@ -1179,16 +1185,17 @@ impl DeviceOps for Card0 {
 }
 
 impl Card0File {
-    fn new(base: KernelFile, card: Arc<Card0>) -> Self {
+    fn new(base: KernelFile, card: Arc<Card0>, is_primary: bool) -> Self {
         let file_id = card.next_file_id.fetch_add(1, Ordering::Relaxed);
         // Both open and final close take `state` before updating the count.
-        {
+        if is_primary {
             let _state = card.state.lock();
             *card.open_files.lock() += 1;
         }
         Self {
             base,
             card,
+            is_primary,
             file_id,
             events: Mutex::new(Card0Events::default()),
             poll_rx: PollSet::new(),
@@ -1522,7 +1529,7 @@ impl Drop for Card0File {
 
         let mut state = self.card.state.lock();
         let mut open_files = self.card.open_files.lock();
-        let last_file = *open_files == 1;
+        let last_file = self.is_primary && *open_files == 1;
         if last_file {
             let _ = self.card.clear_scanout();
             *state = ModesetState::default();
@@ -1580,7 +1587,9 @@ impl Drop for Card0File {
                 .collect::<Vec<_>>()
         };
         drop((removed_dumbs, removed_aliases, removed_resources));
-        *open_files -= 1;
+        if self.is_primary {
+            *open_files -= 1;
+        }
     }
 }
 

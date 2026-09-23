@@ -674,6 +674,8 @@ int main(void)
               "GETCRTC before final close");
     CHECK(before_close.mode_valid == 1 && before_close.fb_id == 0,
           "unbound mode is committed before close");
+    int render = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    CHECK(render >= 0, "render node stays open during final card0 close");
     close(fd);
     fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC | O_NONBLOCK);
     CHECK(fd >= 0, "reopen card0 after final close");
@@ -683,5 +685,6 @@ int main(void)
     CHECK(after_close.mode_valid == 0 && after_close.fb_id == 0,
           "reopen does not inherit the prior client's KMS state");
     close(fd);
+    close(render);
     TEST_DONE();
 }
