@@ -120,6 +120,7 @@ struct drm_event_vblank {
 #define DRM_IOCTL_MODE_GETPLANE          _IOWR('d', 0xB6, struct drm_mode_get_plane)
 #define DRM_IOCTL_MODE_ADDFB2            _IOWR('d', 0xB8, struct drm_mode_fb_cmd2)
 #define DRM_IOCTL_MODE_ATOMIC            _IOWR('d', 0xBC, struct drm_mode_atomic)
+#define DRM_IOCTL_MODE_CREATEPROPBLOB    _IOWR('d', 0xBD, struct drm_mode_create_blob)
 #define DRM_IOCTL_MODE_OBJ_GETPROPERTIES _IOWR('d', 0xB9, struct drm_mode_obj_get_properties)
 #define DRM_IOCTL_WAIT_VBLANK            _IOWR('d', 0x3A, union drm_wait_vblank)
 #define DRM_IOCTL_CRTC_GET_SEQUENCE      _IOWR('d', 0x3B, struct drm_crtc_get_sequence)
@@ -142,6 +143,7 @@ struct drm_crtc_queue_sequence {
     uint32_t crtc_id; uint32_t flags;
     uint64_t sequence; uint64_t user_data;
 };
+struct drm_mode_create_blob { uint64_t data; uint32_t length; uint32_t blob_id; };
 struct drm_event_crtc_sequence {
     struct drm_event base; int64_t user_data; int64_t tv_ns; uint64_t sequence;
 };
@@ -649,6 +651,37 @@ int main(void)
     CHECK_ERR(ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &bad_fb), EINVAL,
               "SETCRTC rejects nonexistent fb_id");
 
+    /* A committed mode without an FB must not survive the final close. */
+    struct drm_mode_create_blob mode_blob = {
+        .data = (uint64_t)(uintptr_t)&modes[0],
+        .length = sizeof(modes[0]),
+    };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_CREATEPROPBLOB, &mode_blob), 0,
+              "CREATEPROPBLOB for unbound mode");
+    uint32_t crtc_obj = crtc_ids[0], crtc_count = 1, mode_prop = 0x201;
+    uint64_t mode_value = mode_blob.blob_id;
+    struct drm_mode_atomic unbound_mode = {
+        .count_objs = 1,
+        .objs_ptr = (uint64_t)(uintptr_t)&crtc_obj,
+        .count_props_ptr = (uint64_t)(uintptr_t)&crtc_count,
+        .props_ptr = (uint64_t)(uintptr_t)&mode_prop,
+        .prop_values_ptr = (uint64_t)(uintptr_t)&mode_value,
+    };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_ATOMIC, &unbound_mode), 0,
+              "commit unbound CRTC mode");
+    struct drm_mode_crtc before_close = { .crtc_id = crtc_ids[0] };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_GETCRTC, &before_close), 0,
+              "GETCRTC before final close");
+    CHECK(before_close.mode_valid == 1 && before_close.fb_id == 0,
+          "unbound mode is committed before close");
+    close(fd);
+    fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC | O_NONBLOCK);
+    CHECK(fd >= 0, "reopen card0 after final close");
+    struct drm_mode_crtc after_close = { .crtc_id = crtc_ids[0] };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_GETCRTC, &after_close), 0,
+              "GETCRTC after final close");
+    CHECK(after_close.mode_valid == 0 && after_close.fb_id == 0,
+          "reopen does not inherit the prior client's KMS state");
     close(fd);
     TEST_DONE();
 }

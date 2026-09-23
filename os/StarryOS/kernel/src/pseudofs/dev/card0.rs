@@ -761,6 +761,8 @@ pub struct Card0 {
     next_ctx_id: AtomicU32,
     /// Stable identity assigned to each open file description.
     next_file_id: AtomicU64,
+    /// Live open file descriptions, guarded by `state` during open and drop.
+    open_files: Mutex<usize>,
     /// Cached capset data keyed by (capset_id, version). GET_CAPS results
     /// are cached here so repeated queries don't round-trip to the host.
     capset_cache: Mutex<BTreeMap<(u32, u32), Vec<u8>>>,
@@ -962,6 +964,7 @@ impl Card0 {
             next_res_handle: AtomicU32::new(FIRST_GPU_RESOURCE_ID),
             next_ctx_id: AtomicU32::new(FIRST_VIRGL_CTX_ID),
             next_file_id: AtomicU64::new(1),
+            open_files: Mutex::new(0),
             capset_cache: Mutex::new(BTreeMap::new()),
         });
         card.register_irq();
@@ -1041,10 +1044,7 @@ pub(crate) fn open_card0_file(
         .downcast_ref::<Card0>()
         .ok_or(StarryError::NoSuchDevice)?;
     let card = card.self_weak.upgrade().ok_or(StarryError::NoSuchDevice)?;
-    let opened = Arc::new(Card0File::new(
-        KernelFile::new(file, open_flags),
-        card,
-    ));
+    let opened = Arc::new(Card0File::new(KernelFile::new(file, open_flags), card));
     let weak = Arc::downgrade(&opened);
     crate::task::kernel_thread_builder(format!("card0-vblank-{}", opened.file_id))
         .spawn(move || block_on(run_vblank_timer(weak)))
@@ -1181,6 +1181,11 @@ impl DeviceOps for Card0 {
 impl Card0File {
     fn new(base: KernelFile, card: Arc<Card0>) -> Self {
         let file_id = card.next_file_id.fetch_add(1, Ordering::Relaxed);
+        // Both open and final close take `state` before updating the count.
+        {
+            let _state = card.state.lock();
+            *card.open_files.lock() += 1;
+        }
         Self {
             base,
             card,
@@ -1516,22 +1521,32 @@ impl Drop for Card0File {
         }
 
         let mut state = self.card.state.lock();
+        let mut open_files = self.card.open_files.lock();
+        let last_file = *open_files == 1;
+        if last_file {
+            let _ = self.card.clear_scanout();
+            *state = ModesetState::default();
+        }
         {
             let mut framebuffers = self.card.fbs.lock();
             let ids = framebuffers
                 .iter()
                 .filter_map(|(&id, framebuffer)| (framebuffer.owner == self.file_id).then_some(id))
                 .collect::<Vec<_>>();
-            if ids.contains(&state.plane_fb_id) {
+            if !last_file && ids.contains(&state.plane_fb_id) {
                 let _ = self.card.clear_scanout();
                 *state = ModesetState::default();
             }
             for id in &ids {
                 framebuffers.remove(id);
             }
+            if last_file {
+                framebuffers.clear();
+            }
         }
-        drop(state);
-
+        if last_file {
+            self.card.blobs.lock().clear();
+        }
         let removed_dumbs = {
             let mut dumbs = self.card.dumbs.lock();
             let handles = dumbs
@@ -1565,6 +1580,7 @@ impl Drop for Card0File {
                 .collect::<Vec<_>>()
         };
         drop((removed_dumbs, removed_aliases, removed_resources));
+        *open_files -= 1;
     }
 }
 
