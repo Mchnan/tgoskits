@@ -118,7 +118,8 @@ impl VblankClock {
         }
         if active {
             state.anchor_ns = now_ns;
-            if state.base_sequence == 0 {
+            // A re-enable at sequence zero must not overwrite the disabled edge.
+            if state.disable_generation == 0 {
                 state.last_edge_ns = now_ns;
             }
         } else {
@@ -224,9 +225,10 @@ mod tests {
         clock.set_active(true, 1_000);
         let generation = clock.disable_generation();
 
-        let disabled_at = 1_000 + VBLANK_PERIOD_NS * 3;
+        let disabled_at = 1_000 + VBLANK_PERIOD_NS / 2;
         clock.set_active(false, disabled_at);
         let frozen = clock.snapshot_at(disabled_at);
+        assert_eq!(frozen, (0, 1_000));
         clock.set_active(true, disabled_at + VBLANK_PERIOD_NS * 10);
 
         let (active_for_wait, sequence, edge_ns) =
