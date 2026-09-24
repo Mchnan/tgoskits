@@ -135,6 +135,12 @@ impl VblankClock {
         self.state.lock().at(now_ns)
     }
 
+    pub(super) fn status_at(&self, now_ns: u64) -> (bool, u64, u64) {
+        let state = self.state.lock();
+        let (sequence, edge_ns) = state.at(now_ns);
+        (state.active, sequence, edge_ns)
+    }
+
     pub(super) fn deadline_ns(&self, sequence: u64) -> Option<u64> {
         let state = self.state.lock();
         state.active.then(|| state.edge_ns_of(sequence))

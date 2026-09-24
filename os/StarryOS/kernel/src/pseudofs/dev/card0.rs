@@ -765,6 +765,8 @@ pub struct Card0 {
     next_file_id: AtomicU64,
     /// Live primary-node file descriptions, guarded by `state` during open and drop.
     open_files: Mutex<usize>,
+    /// Weak per-open references for completing queued events on CRTC disable.
+    vblank_files: Mutex<Vec<Weak<Card0File>>>,
     /// Cached capset data keyed by (capset_id, version). GET_CAPS results
     /// are cached here so repeated queries don't round-trip to the host.
     capset_cache: Mutex<BTreeMap<(u32, u32), Vec<u8>>>,
@@ -776,6 +778,44 @@ struct Card0Events {
     pending: Vec<PendingVblankEvent>,
     reserved: usize,
     shutdown: bool,
+}
+
+struct EventReservation<'a> {
+    events: &'a Mutex<Card0Events>,
+    poll_rx: &'a PollSet,
+    reserved: bool,
+}
+
+impl EventReservation<'_> {
+    fn new<'a>(events: &'a Mutex<Card0Events>, poll_rx: &'a PollSet) -> VfsResult<EventReservation<'a>> {
+        let mut state = events.lock();
+        if !state.has_space() {
+            return Err(VfsError::NoMemory);
+        }
+        state.reserved += 1;
+        Ok(EventReservation {
+            events,
+            poll_rx,
+            reserved: true,
+        })
+    }
+
+    fn enqueue<E: bytemuck::NoUninit>(mut self, event: &E) {
+        let mut state = self.events.lock();
+        state.reserved -= 1;
+        state.ready.push_back(serialize_event(event));
+        self.reserved = false;
+        drop(state);
+        unsafe { self.poll_rx.wake(IoEvents::IN) };
+    }
+}
+
+impl Drop for EventReservation<'_> {
+    fn drop(&mut self) {
+        if self.reserved {
+            self.events.lock().reserved -= 1;
+        }
+    }
 }
 
 impl Card0Events {
@@ -790,6 +830,15 @@ impl Card0Events {
             .map(core::time::Duration::from_nanos)
             .min()
     }
+
+    fn complete_pending(&mut self, sequence: u64, edge_ns: u64) -> bool {
+        let pending = core::mem::take(&mut self.pending);
+        let delivered = !pending.is_empty();
+        for event in pending {
+            self.ready.push_back(vblank_event_slot(event, sequence, edge_ns));
+        }
+        delivered
+    }
 }
 
 impl Card0File {
@@ -797,22 +846,8 @@ impl Card0File {
         &self.card
     }
 
-    fn reserve_event(&self) -> VfsResult<()> {
-        let mut state = self.events.lock();
-        if !state.has_space() {
-            return Err(VfsError::NoMemory);
-        }
-        state.reserved += 1;
-        Ok(())
-    }
-
-    fn enqueue_reserved_event<E: bytemuck::NoUninit>(&self, event: &E) {
-        let mut state = self.events.lock();
-        state.reserved -= 1;
-        state.ready.push_back(serialize_event(event));
-        drop(state);
-        // The event is visible before notifying registered readers.
-        unsafe { self.poll_rx.wake(IoEvents::IN) };
+    fn reserve_event(&self) -> VfsResult<EventReservation<'_>> {
+        EventReservation::new(&self.events, &self.poll_rx)
     }
 
     fn enqueue_event<E: bytemuck::NoUninit>(&self, event: &E) -> VfsResult<()> {
@@ -832,13 +867,12 @@ impl Card0File {
             return Err(VfsError::NoMemory);
         }
         state.pending.push(event);
-        drop(state);
-        self.card.vblank_event.notify(usize::MAX);
         Ok(())
     }
 
     fn serve_pending_vblank_events(&self) {
         let card = self.card();
+        let _mode = card.state.lock();
         let Some((current, edge_ns)) = card.vblank.active_at(monotonic_time_nanos()) else {
             return;
         };
@@ -855,6 +889,7 @@ impl Card0File {
             }
         }
         drop(state);
+        drop(_mode);
         if delivered {
             unsafe { self.poll_rx.wake(IoEvents::IN) };
         }
@@ -941,6 +976,40 @@ async fn run_vblank_timer(weak: Weak<Card0File>) {
 }
 
 impl Card0 {
+    /// Called with the modeset state locked, so queue submission cannot race
+    /// the transition from an active clock to a completed pending event.
+    fn set_vblank_active(&self, active: bool, now_ns: u64) -> Option<Vec<(Arc<Card0File>, bool)>> {
+        if !self.vblank.set_active(active, now_ns) {
+            return None;
+        }
+        let mut completed = Vec::new();
+        if !active {
+            let (sequence, edge_ns) = self.vblank.snapshot_at(now_ns);
+            let files = {
+                let mut registry = self.vblank_files.lock();
+                registry.retain(|file| file.strong_count() > 0);
+                registry.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+            };
+            for file in files {
+                let delivered = file.events.lock().complete_pending(sequence, edge_ns);
+                // Even idle files must remain alive until the modeset lock is released.
+                completed.push((file, delivered));
+            }
+        }
+        Some(completed)
+    }
+
+    fn notify_vblank_change(&self, completed: Option<Vec<(Arc<Card0File>, bool)>>) {
+        if let Some(completed) = completed {
+            self.vblank_event.notify(usize::MAX);
+            for (file, delivered) in completed {
+                if delivered {
+                    unsafe { file.poll_rx.wake(IoEvents::IN) };
+                }
+            }
+        }
+    }
+
     pub fn new() -> Arc<Self> {
         let card = Arc::new_cyclic(|weak| Self {
             self_weak: weak.clone(),
@@ -969,6 +1038,7 @@ impl Card0 {
             next_ctx_id: AtomicU32::new(FIRST_VIRGL_CTX_ID),
             next_file_id: AtomicU64::new(1),
             open_files: Mutex::new(0),
+            vblank_files: Mutex::new(Vec::new()),
             capset_cache: Mutex::new(BTreeMap::new()),
         });
         card.register_irq();
@@ -1056,8 +1126,12 @@ pub(crate) fn open_card0_file(
     ));
     let weak = Arc::downgrade(&opened);
     crate::task::kernel_thread_builder(format!("card0-vblank-{}", opened.file_id))
-        .spawn(move || block_on(run_vblank_timer(weak)))
+        .spawn({
+            let weak = weak.clone();
+            move || block_on(run_vblank_timer(weak))
+        })
         .map_err(|_| StarryError::NoMemory)?;
+    opened.card.vblank_files.lock().push(weak);
     Ok(opened)
 }
 
@@ -1471,6 +1545,9 @@ impl FileLike for Card0File {
         // A vblank wait can outlive many other ioctls on this open file.
         // Its CRTC and event state has separate locks from the 3D operation state.
         if cmd == DRM_IOCTL_WAIT_VBLANK {
+            if !self.is_primary {
+                return Err(VfsError::PermissionDenied.into());
+            }
             return Ok(self.card.handle_wait_vblank(self, current, arg)?);
         }
         let _operation = self.operation.lock();
@@ -1595,12 +1672,14 @@ impl Drop for Card0File {
         if self.is_primary {
             *open_files -= 1;
         }
+        self.card
+            .vblank_files
+            .lock()
+            .retain(|file| file.strong_count() > 0);
         let active = state.crtc_active != 0 && state.plane_fb_id != 0;
-        let changed = self.card.vblank.set_active(active, monotonic_time_nanos());
+        let completed = self.card.set_vblank_active(active, monotonic_time_nanos());
         drop((state, open_files));
-        if changed {
-            self.card.vblank_event.notify(usize::MAX);
-        }
+        self.card.notify_vblank_change(completed);
     }
 }
 
@@ -2319,11 +2398,9 @@ impl Card0 {
             let mut state = self.state.lock();
             self.clear_scanout()?;
             *state = ModesetState::default();
-            let changed = self.vblank.set_active(false, monotonic_time_nanos());
+            let completed = self.set_vblank_active(false, monotonic_time_nanos());
             drop(state);
-            if changed {
-                self.vblank_event.notify(usize::MAX);
-            }
+            self.notify_vblank_change(completed);
             return Ok(0);
         }
 
@@ -2373,11 +2450,9 @@ impl Card0 {
             ..ModesetState::default()
         };
         self.present_fb(c.fb_id);
-        let changed = self.vblank.set_active(true, monotonic_time_nanos());
+        let completed = self.set_vblank_active(true, monotonic_time_nanos());
         drop(state);
-        if changed {
-            self.vblank_event.notify(usize::MAX);
-        }
+        self.notify_vblank_change(completed);
         Ok(0)
     }
 }
@@ -2568,11 +2643,9 @@ impl Card0 {
             *state = ModesetState::default();
         }
         let active = state.crtc_active != 0 && state.plane_fb_id != 0;
-        let changed = self.vblank.set_active(active, monotonic_time_nanos());
+        let completed = self.set_vblank_active(active, monotonic_time_nanos());
         drop(state);
-        if changed {
-            self.vblank_event.notify(usize::MAX);
-        }
+        self.notify_vblank_change(completed);
         Ok(0)
     }
 }
@@ -2918,16 +2991,19 @@ impl Card0 {
         if state.crtc_active == 0 || !self.fbs.lock().contains_key(&f.fb_id) {
             return Err(VfsError::InvalidInput);
         }
-        if f.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            file.reserve_event()?;
-        }
+        let reservation = if f.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+            Some(file.reserve_event()?)
+        } else {
+            None
+        };
         state.plane_fb_id = f.fb_id;
         self.present_fb(f.fb_id);
-        let flip_edge = (f.flags & DRM_MODE_PAGE_FLIP_EVENT != 0)
-            .then(|| self.vblank.snapshot_at(monotonic_time_nanos()));
+        let flip_edge = reservation
+            .as_ref()
+            .map(|_| self.vblank.snapshot_at(monotonic_time_nanos()));
         drop(state);
-        if let Some((sequence, edge_ns)) = flip_edge {
-            self.queue_flip_event(file, f.user_data, sequence, edge_ns);
+        if let (Some(reservation), Some((sequence, edge_ns))) = (reservation, flip_edge) {
+            self.queue_flip_event(reservation, f.user_data, sequence, edge_ns);
         }
         Ok(0)
     }
@@ -2939,7 +3015,13 @@ impl Card0 {
     }
 
     /// Flip-completion and its timestamp refer to the same vblank edge.
-    fn queue_flip_event(&self, file: &Card0File, user_data: u64, sequence: u64, edge_ns: u64) {
+    fn queue_flip_event(
+        &self,
+        reservation: EventReservation<'_>,
+        user_data: u64,
+        sequence: u64,
+        edge_ns: u64,
+    ) {
         let ev = DrmEventVblank {
             base: DrmEvent {
                 event_type: DRM_EVENT_FLIP_COMPLETE,
@@ -2951,7 +3033,7 @@ impl Card0 {
             sequence: sequence as u32,
             crtc_id: CRTC_ID,
         };
-        file.enqueue_reserved_event(&ev);
+        reservation.enqueue(&ev);
     }
 
     /// `CRTC_GET_SEQUENCE` — report the synthesized counter's most recent
@@ -3007,7 +3089,9 @@ impl Card0 {
         if q.flags & !(DRM_CRTC_SEQUENCE_RELATIVE | DRM_CRTC_SEQUENCE_NEXT_ON_MISS) != 0 {
             return Err(VfsError::InvalidInput);
         }
-        if !self.crtc_active() {
+        file.serve_pending_vblank_events();
+        let mode = self.state.lock();
+        if mode.crtc_active == 0 || mode.plane_fb_id == 0 {
             return Err(VfsError::InvalidInput);
         }
 
@@ -3027,10 +3111,10 @@ impl Card0 {
             target = current_sequence + 1;
         }
 
-        if vblank_passed(current_sequence, target) {
+        let queued = !vblank_passed(current_sequence, target);
+        if !queued {
             // Missed: fire synchronously with the current counter, like
             // Linux's immediate `send_vblank_event`.
-            file.serve_pending_vblank_events();
             let ev = DrmEventCrtcSequence {
                 base: DrmEvent {
                     event_type: DRM_EVENT_CRTC_SEQUENCE,
@@ -3050,6 +3134,10 @@ impl Card0 {
                 target_sequence: target,
             })?;
             q.sequence = target;
+        }
+        drop(mode);
+        if queued {
+            self.vblank_event.notify(usize::MAX);
         }
         ptr.vm_write(current, q).map_err(|_| VfsError::BadAddress)?;
         Ok(0)
@@ -3086,7 +3174,11 @@ impl Card0 {
         if req.rep_type & (DRM_VBLANK_HIGH_CRTC_MASK | DRM_VBLANK_SECONDARY) != 0 {
             return Err(VfsError::InvalidInput);
         }
-        if !self.crtc_active() {
+        if req.rep_type & DRM_VBLANK_EVENT != 0 {
+            file.serve_pending_vblank_events();
+        }
+        let mode = self.state.lock();
+        if mode.crtc_active == 0 || mode.plane_fb_id == 0 {
             return Err(VfsError::InvalidInput);
         }
 
@@ -3131,7 +3223,6 @@ impl Card0 {
             // `tv_sec`) is the user_data of the delivered event.
             let user_data = req.tv_sec as u64;
             let fired = vblank_passed(current_sequence, target);
-            file.serve_pending_vblank_events();
             if fired {
                 self.queue_vblank_event(file, user_data, current_sequence, current_edge_ns)?;
             } else {
@@ -3140,6 +3231,10 @@ impl Card0 {
                     target_sequence: target,
                 })?;
             }
+            drop(mode);
+            if !fired {
+                self.vblank_event.notify(usize::MAX);
+            }
             let reply_sequence = if fired { current_sequence } else { target };
             let mut reply = self.wait_vblank_reply(req.rep_type, current_sequence, current_edge_ns);
             reply.sequence = reply_sequence as u32;
@@ -3147,26 +3242,40 @@ impl Card0 {
             return Ok(0);
         }
 
-        // The timer may wake early; only the clock reaching the target
-        // completes the request. A signal interrupts without a user reply.
+        drop(mode);
+
+        // A signal interrupts without a reply. Disabling the CRTC completes
+        // the wait at the frozen edge; the total wait is capped at 3 seconds.
+        let timeout_ns = monotonic_time_nanos().saturating_add(3_000_000_000);
         let (mut sequence, mut edge_ns) = (current_sequence, current_edge_ns);
+        let mut timed_out = false;
         while !vblank_passed(sequence, target) {
             listener!(self.vblank_event => listener);
-            let deadline_ns = self
-                .vblank
-                .deadline_ns(target)
-                .ok_or(VfsError::InvalidInput)?;
-            let _ = block_on_user(current, timeout_at(Some(core::time::Duration::from_nanos(deadline_ns)), listener))
+            let now_ns = monotonic_time_nanos();
+            let (active, current_sequence, edge) = self.vblank.status_at(now_ns);
+            (sequence, edge_ns) = (current_sequence, edge);
+            if !active || vblank_passed(sequence, target) {
+                break;
+            }
+            if now_ns >= timeout_ns {
+                timed_out = true;
+                break;
+            }
+            let Some(deadline_ns) = self.vblank.deadline_ns(target) else {
+                continue;
+            };
+            let deadline = core::time::Duration::from_nanos(deadline_ns.min(timeout_ns));
+            let _ = block_on_user(current, timeout_at(Some(deadline), listener))
             .into_result()
             .map_err(|_| VfsError::Interrupted)?;
-            (sequence, edge_ns) = self
-                .vblank
-                .active_at(monotonic_time_nanos())
-                .ok_or(VfsError::InvalidInput)?;
         }
         let reply = self.wait_vblank_reply(req.rep_type, sequence, edge_ns);
         ptr.vm_write(current, reply).map_err(|_| VfsError::BadAddress)?;
-        Ok(0)
+        if timed_out {
+            Err(VfsError::ResourceBusy)
+        } else {
+            Ok(0)
+        }
     }
 
     /// Builds a `WAIT_VBLANK` reply reporting `sequence`'s edge time,
@@ -3252,9 +3361,11 @@ impl Card0 {
         if a.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 {
             return Ok(0);
         }
-        if a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            file.reserve_event()?;
-        }
+        let reservation = if a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+            Some(file.reserve_event()?)
+        } else {
+            None
+        };
         let current_fb = proposed.plane_fb_id;
         if (current_fb == 0 || proposed.crtc_active == 0) && state.plane_fb_id != 0 {
             self.clear_scanout()?;
@@ -3263,18 +3374,17 @@ impl Card0 {
         if current_fb != 0 && state.crtc_active != 0 {
             self.present_fb(current_fb);
         }
-        let changed = self.vblank.set_active(
+        let completed = self.set_vblank_active(
             current_fb != 0 && state.crtc_active != 0,
             monotonic_time_nanos(),
         );
-        let flip_edge = (a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0)
-            .then(|| self.vblank.snapshot_at(monotonic_time_nanos()));
+        let flip_edge = reservation
+            .as_ref()
+            .map(|_| self.vblank.snapshot_at(monotonic_time_nanos()));
         drop(state);
-        if changed {
-            self.vblank_event.notify(usize::MAX);
-        }
-        if let Some((sequence, edge_ns)) = flip_edge {
-            self.queue_flip_event(file, a.user_data, sequence, edge_ns);
+        self.notify_vblank_change(completed);
+        if let (Some(reservation), Some((sequence, edge_ns))) = (reservation, flip_edge) {
+            self.queue_flip_event(reservation, a.user_data, sequence, edge_ns);
         }
         Ok(0)
     }
@@ -4398,3 +4508,47 @@ const _DUMB_BUFFER_FIELDS_USED: fn(&DumbBuffer) = |b| {
     let _ = (b.width, b.height, b.bpp, b.pitch);
     let _ = (b.size, b.offset, &b.pages);
 };
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabling_completes_all_pending_event_types_at_the_frozen_edge() {
+        let mut events = Card0Events::default();
+        events.pending.push(PendingVblankEvent {
+            event: QueuedVblankEvent::CrtcSequence { user_data: 12 },
+            target_sequence: 100,
+        });
+        events.pending.push(PendingVblankEvent {
+            event: QueuedVblankEvent::Vblank { user_data: 34 },
+            target_sequence: 100,
+        });
+        assert!(events.complete_pending(3, 5_000));
+        assert!(events.pending.is_empty());
+        assert_eq!(events.ready.len(), 2);
+        assert_eq!(
+            events.ready.pop_front(),
+            Some(vblank_event_slot(
+                PendingVblankEvent {
+                    event: QueuedVblankEvent::CrtcSequence { user_data: 12 },
+                    target_sequence: 100,
+                },
+                3,
+                5_000
+            ))
+        );
+        assert_eq!(
+            events.ready.pop_front(),
+            Some(vblank_event_slot(
+                PendingVblankEvent {
+                    event: QueuedVblankEvent::Vblank { user_data: 34 },
+                    target_sequence: 100,
+                },
+                3,
+                5_000
+            ))
+        );
+        assert!(events.has_space());
+    }
+}
