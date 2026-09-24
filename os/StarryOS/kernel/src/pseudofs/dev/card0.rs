@@ -3242,6 +3242,7 @@ impl Card0 {
             return Ok(0);
         }
 
+        let disable_generation = self.vblank.disable_generation();
         drop(mode);
 
         // A signal interrupts without a reply. Disabling the CRTC completes
@@ -3252,7 +3253,8 @@ impl Card0 {
         while !vblank_passed(sequence, target) {
             listener!(self.vblank_event => listener);
             let now_ns = monotonic_time_nanos();
-            let (active, current_sequence, edge) = self.vblank.status_at(now_ns);
+            let (active, current_sequence, edge) =
+                self.vblank.status_since(now_ns, disable_generation);
             (sequence, edge_ns) = (current_sequence, edge);
             if !active || vblank_passed(sequence, target) {
                 break;

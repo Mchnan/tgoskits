@@ -64,6 +64,7 @@ struct VblankState {
     anchor_ns: u64,
     base_sequence: u64,
     last_edge_ns: u64,
+    disable_generation: u64,
 }
 
 impl VblankState {
@@ -103,6 +104,7 @@ impl VblankClock {
                 anchor_ns: now_ns,
                 base_sequence: 0,
                 last_edge_ns: now_ns,
+                disable_generation: 0,
             }),
         }
     }
@@ -121,6 +123,7 @@ impl VblankClock {
             }
         } else {
             (state.base_sequence, state.last_edge_ns) = state.at(now_ns);
+            state.disable_generation = state.disable_generation.wrapping_add(1);
         }
         state.active = active;
         true
@@ -135,8 +138,17 @@ impl VblankClock {
         self.state.lock().at(now_ns)
     }
 
-    pub(super) fn status_at(&self, now_ns: u64) -> (bool, u64, u64) {
+    pub(super) fn disable_generation(&self) -> u64 {
+        self.state.lock().disable_generation
+    }
+
+    /// A disable completes a wait even if the CRTC was re-enabled before
+    /// the waiter ran. The frozen edge survives until the next disable.
+    pub(super) fn status_since(&self, now_ns: u64, generation: u64) -> (bool, u64, u64) {
         let state = self.state.lock();
+        if state.disable_generation != generation {
+            return (false, state.base_sequence, state.last_edge_ns);
+        }
         let (sequence, edge_ns) = state.at(now_ns);
         (state.active, sequence, edge_ns)
     }
@@ -204,5 +216,22 @@ mod tests {
         assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 30).1, 1_000 + VBLANK_PERIOD_NS * 3);
         assert_eq!(clock.deadline_ns(4), Some(1_000 + VBLANK_PERIOD_NS * 31));
         assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 31).0, 4);
+    }
+
+    #[test]
+    fn waiter_observes_disable_after_crtc_is_reenabled() {
+        let clock = VblankClock::new(1_000);
+        clock.set_active(true, 1_000);
+        let generation = clock.disable_generation();
+
+        let disabled_at = 1_000 + VBLANK_PERIOD_NS * 3;
+        clock.set_active(false, disabled_at);
+        let frozen = clock.snapshot_at(disabled_at);
+        clock.set_active(true, disabled_at + VBLANK_PERIOD_NS * 10);
+
+        let (active_for_wait, sequence, edge_ns) =
+            clock.status_since(disabled_at + VBLANK_PERIOD_NS * 11, generation);
+        assert!(!active_for_wait);
+        assert_eq!((sequence, edge_ns), frozen);
     }
 }
