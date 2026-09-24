@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <sys/syscall.h>
@@ -127,7 +128,7 @@ struct drm_event_vblank {
 #define DRM_IOCTL_CRTC_QUEUE_SEQUENCE    _IOWR('d', 0x3C, struct drm_crtc_queue_sequence)
 
 #define DRM_MODE_OBJECT_PLANE       0xeeeeeeee
-#define PROP_PLANE_SRC_X            0x103
+#define DRM_MODE_OBJECT_CRTC        0xcccccccc
 #define DRM_PLANE_TYPE_PRIMARY      1
 #define DRM_MODE_PAGE_FLIP_EVENT    0x01
 #define DRM_MODE_PROP_ENUM          (1 << 3)
@@ -448,8 +449,8 @@ int main(void)
     CHECK(props.count_props >= 1, "plane reports >=1 prop");
 
     /* 找 type 属性，校验值是 PRIMARY。prop id 不在 stable uapi 中，靠名字匹配。 */
-    uint32_t type_prop_id = 0, fb_prop_id = 0;
-    for (uint32_t i = 0; i < props.count_props; i++) {
+    uint32_t type_prop_id = 0, fb_prop_id = 0, src_x_prop_id = 0;
+    for (uint32_t i = 0; i < props.count_props && i < 32; i++) {
         struct drm_mode_get_property probe = {0};
         probe.prop_id = prop_ids[i];
         if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &probe) != 0)
@@ -460,10 +461,13 @@ int main(void)
                   "plane type value == PRIMARY");
         } else if (strcmp(probe.name, "FB_ID") == 0) {
             fb_prop_id = prop_ids[i];
+        } else if (strcmp(probe.name, "SRC_X") == 0) {
+            src_x_prop_id = prop_ids[i];
         }
     }
     CHECK(type_prop_id != 0, "plane has 'type' property");
     CHECK(fb_prop_id != 0, "plane has 'FB_ID' property");
+    CHECK(src_x_prop_id != 0, "plane has 'SRC_X' property");
 
     /* 描述 plane 的 type property。 */
     struct drm_property_enum enums[3] = {0};
@@ -606,6 +610,8 @@ int main(void)
     };
     CHECK_RET(ioctl(fd, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &qseq), 0,
               "QUEUE_SEQUENCE accepts relative target");
+    CHECK(qseq.sequence >= gseq2.sequence + 2,
+          "relative QUEUE_SEQUENCE returns an absolute target");
     struct pollfd qpfd = { .fd = fd, .events = POLLIN };
     pr = poll(&qpfd, 1, 1000);
     CHECK(pr == 1, "poll wakes for queued sequence event");
@@ -657,6 +663,8 @@ int main(void)
     wev.req.signal = 0xcafef00dcafebabeULL;
     CHECK_RET(ioctl(fd, DRM_IOCTL_WAIT_VBLANK, &wev), 0,
               "WAIT_VBLANK EVENT returns immediately");
+    CHECK(wev.req.signal == 0xcafef00dcafebabeULL && wev.req.pad == 0,
+          "WAIT_VBLANK EVENT preserves the request payload");
     struct pollfd wpfd = { .fd = fd, .events = POLLIN };
     pr = poll(&wpfd, 1, 1000);
     CHECK(pr == 1, "poll wakes for vblank event");
@@ -698,6 +706,33 @@ int main(void)
     close(other);
     struct pollfd isolated = { .fd = fd, .events = POLLIN };
     CHECK(poll(&isolated, 1, 100) == 0, "closing other open cancels its events");
+
+    struct drm_crtc_queue_sequence first_ready = {
+        .crtc_id = crtc_ids[0], .sequence = 0, .user_data = 0xface01,
+    };
+    struct drm_crtc_queue_sequence second_ready = {
+        .crtc_id = crtc_ids[0], .sequence = 0, .user_data = 0xface02,
+    };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &first_ready), 0,
+              "queue first immediate event for partial read");
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &second_ready), 0,
+              "queue second immediate event for partial read");
+    void *guard = mmap(NULL, sizeof(seq_ev), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(guard != MAP_FAILED, "map inaccessible destination for partial read");
+    if (guard != MAP_FAILED) {
+        struct drm_event_crtc_sequence first_read = {0}, second_read = {0};
+        struct iovec read_iov[2] = {
+            { .iov_base = &first_read, .iov_len = sizeof(first_read) },
+            { .iov_base = guard, .iov_len = sizeof(second_read) },
+        };
+        n = syscall(SYS_readv, fd, read_iov, 2);
+        CHECK(n == (ssize_t)sizeof(first_read) && first_read.user_data == 0xface01,
+              "readv returns bytes copied before the second event faults");
+        n = syscall(SYS_read, fd, &second_read, sizeof(second_read));
+        CHECK(n == (ssize_t)sizeof(second_read) && second_read.user_data == 0xface02,
+              "partial read leaves the faulted event queued");
+        munmap(guard, sizeof(seq_ev));
+    }
 
     /* --- 相对阻塞等待按周期睡眠 --- */
     union drm_wait_vblank wblock = {0};
@@ -875,13 +910,13 @@ int main(void)
           (int64_t)other_event.tv_usec * 1000) < 1000,
           "both disabled events describe the same frozen edge");
     close(other_disable);
-    uint32_t plane = plane_ids[0], count = 1, src_x_prop = PROP_PLANE_SRC_X;
+    uint32_t plane = plane_ids[0], count = 1;
     uint64_t src_x = 1;
     struct drm_mode_atomic plane_only = {
         .count_objs = 1,
         .objs_ptr = (uint64_t)(uintptr_t)&plane,
         .count_props_ptr = (uint64_t)(uintptr_t)&count,
-        .props_ptr = (uint64_t)(uintptr_t)&src_x_prop,
+        .props_ptr = (uint64_t)(uintptr_t)&src_x_prop_id,
         .prop_values_ptr = (uint64_t)(uintptr_t)&src_x,
     };
     CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &plane_only), 0,
@@ -949,7 +984,25 @@ int main(void)
     };
     CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_CREATEPROPBLOB, &mode_blob), 0,
               "CREATEPROPBLOB for unbound mode");
-    uint32_t crtc_obj = crtc_ids[0], crtc_count = 1, mode_prop = 0x201;
+    uint32_t crtc_prop_ids[32] = {0};
+    uint64_t crtc_prop_vals[32] = {0};
+    struct drm_mode_obj_get_properties crtc_props = {
+        .obj_id = crtc_ids[0], .obj_type = DRM_MODE_OBJECT_CRTC,
+        .count_props = 32,
+        .props_ptr = (uint64_t)(uintptr_t)crtc_prop_ids,
+        .prop_values_ptr = (uint64_t)(uintptr_t)crtc_prop_vals,
+    };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &crtc_props), 0,
+              "OBJ_GETPROPERTIES on CRTC");
+    uint32_t mode_prop = 0;
+    for (uint32_t i = 0; i < crtc_props.count_props && i < 32; i++) {
+        struct drm_mode_get_property probe = { .prop_id = crtc_prop_ids[i] };
+        if (syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_GETPROPERTY, &probe) == 0 &&
+            strcmp(probe.name, "MODE_ID") == 0)
+            mode_prop = crtc_prop_ids[i];
+    }
+    CHECK(mode_prop != 0, "CRTC has 'MODE_ID' property");
+    uint32_t crtc_obj = crtc_ids[0], crtc_count = 1;
     uint64_t mode_value = mode_blob.blob_id;
     struct drm_mode_atomic unbound_mode = {
         .count_objs = 1,

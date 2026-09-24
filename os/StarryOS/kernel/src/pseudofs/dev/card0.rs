@@ -903,7 +903,13 @@ impl Card0File {
             let Some(event) = state.ready.front() else {
                 break;
             };
-            dst.write_all(event)?;
+            if let Err(error) = dst.write_all(event) {
+                return if written == 0 {
+                    Err(error.into())
+                } else {
+                    Ok(written)
+                };
+            }
             state.ready.pop_front();
             written += EVENT_SLOT_BYTES;
         }
@@ -3236,9 +3242,8 @@ impl Card0 {
                 self.vblank_event.notify(usize::MAX);
             }
             let reply_sequence = if fired { current_sequence } else { target };
-            let mut reply = self.wait_vblank_reply(req.rep_type, current_sequence, current_edge_ns);
-            reply.sequence = reply_sequence as u32;
-            ptr.vm_write(current, reply).map_err(|_| VfsError::BadAddress)?;
+            req.sequence = reply_sequence as u32;
+            ptr.vm_write(current, req).map_err(|_| VfsError::BadAddress)?;
             return Ok(0);
         }
 
