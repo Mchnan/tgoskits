@@ -823,10 +823,10 @@ impl Card0Events {
         self.ready.len() + self.pending.len() + self.reserved < MAX_EVENTS
     }
 
-    fn next_deadline(&self, clock: &VblankClock) -> Option<core::time::Duration> {
+    fn next_deadline(&self, clock: &VblankClock, now_ns: u64) -> Option<core::time::Duration> {
         self.pending
             .iter()
-            .filter_map(|event| clock.deadline_ns(event.target_sequence))
+            .filter_map(|event| clock.deadline_ns(event.target_sequence, now_ns))
             .map(core::time::Duration::from_nanos)
             .min()
     }
@@ -961,7 +961,7 @@ async fn run_vblank_timer(weak: Weak<Card0File>) {
             if state.shutdown {
                 return;
             }
-            state.next_deadline(&file.card().vblank)
+            state.next_deadline(&file.card().vblank, monotonic_time_nanos())
         };
         match deadline {
             None => listener.await,
@@ -1676,7 +1676,7 @@ impl Drop for Card0File {
             .vblank_files
             .lock()
             .retain(|file| file.strong_count() > 0);
-        let active = state.crtc_active != 0 && state.plane_fb_id != 0;
+        let active = state.crtc_active != 0;
         let completed = self.card.set_vblank_active(active, monotonic_time_nanos());
         drop((state, open_files));
         self.card.notify_vblank_change(completed);
@@ -2642,7 +2642,7 @@ impl Card0 {
         if state.plane_fb_id == fb_id {
             *state = ModesetState::default();
         }
-        let active = state.crtc_active != 0 && state.plane_fb_id != 0;
+        let active = state.crtc_active != 0;
         let completed = self.set_vblank_active(active, monotonic_time_nanos());
         drop(state);
         self.notify_vblank_change(completed);
@@ -3008,10 +3008,10 @@ impl Card0 {
         Ok(0)
     }
 
-    /// Report whether the committed CRTC is actually scanning out a framebuffer.
+    /// Report whether the committed CRTC remains enabled, independent of its plane.
     fn crtc_active(&self) -> bool {
         let state = self.state.lock();
-        state.crtc_active != 0 && state.plane_fb_id != 0
+        state.crtc_active != 0
     }
 
     /// Flip-completion and its timestamp refer to the same vblank edge.
@@ -3091,7 +3091,7 @@ impl Card0 {
         }
         file.serve_pending_vblank_events();
         let mode = self.state.lock();
-        if mode.crtc_active == 0 || mode.plane_fb_id == 0 {
+        if mode.crtc_active == 0 {
             return Err(VfsError::InvalidInput);
         }
 
@@ -3178,7 +3178,7 @@ impl Card0 {
             file.serve_pending_vblank_events();
         }
         let mode = self.state.lock();
-        if mode.crtc_active == 0 || mode.plane_fb_id == 0 {
+        if mode.crtc_active == 0 {
             return Err(VfsError::InvalidInput);
         }
 
@@ -3263,9 +3263,7 @@ impl Card0 {
                 timed_out = true;
                 break;
             }
-            let Some(deadline_ns) = self.vblank.deadline_ns(target) else {
-                continue;
-            };
+            let deadline_ns = self.vblank.deadline_ns(target, now_ns).unwrap_or(timeout_ns);
             let deadline = core::time::Duration::from_nanos(deadline_ns.min(timeout_ns));
             let _ = block_on_user(current, timeout_at(Some(deadline), listener))
             .into_result()
@@ -3376,10 +3374,7 @@ impl Card0 {
         if current_fb != 0 && state.crtc_active != 0 {
             self.present_fb(current_fb);
         }
-        let completed = self.set_vblank_active(
-            current_fb != 0 && state.crtc_active != 0,
-            monotonic_time_nanos(),
-        );
+        let completed = self.set_vblank_active(state.crtc_active != 0, monotonic_time_nanos());
         let flip_edge = reservation
             .as_ref()
             .map(|_| self.vblank.snapshot_at(monotonic_time_nanos()));

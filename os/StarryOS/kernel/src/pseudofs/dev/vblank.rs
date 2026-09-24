@@ -20,13 +20,10 @@ use crate::sync::RawSpinLock;
 pub const VBLANK_PERIOD_NS: u64 = 1_000_000_000 / 60;
 
 /// Wrap-aware "has the counter reached `target`" test on u64 sequences.
-/// Mirrors Linux's `vblank_passed()` in `drivers/gpu/drm/drm_vblank.c`:
-/// the comparison survives counter wraparound by interpreting the
-/// difference as signed. The u32 userspace view is covered by casting
-/// truncated values back to u64, which preserves the wrap semantics the
-/// ABI hands out.
+/// Linux's `drm_vblank_passed()` accepts only a bounded distance behind
+/// the current sequence, so an old target outside that window stays pending.
 pub const fn vblank_passed(current: u64, target: u64) -> bool {
-    current == target || (current.wrapping_sub(target) as i64) > 0
+    current.wrapping_sub(target) <= 1 << 23
 }
 
 /// Linux's `widen_32_to_64()` (`drm_vblank.c`): reconstructs the full
@@ -154,9 +151,16 @@ impl VblankClock {
         (state.active, sequence, edge_ns)
     }
 
-    pub(super) fn deadline_ns(&self, sequence: u64) -> Option<u64> {
+    pub(super) fn deadline_ns(&self, sequence: u64, now_ns: u64) -> Option<u64> {
         let state = self.state.lock();
-        state.active.then(|| state.edge_ns_of(sequence))
+        if !state.active {
+            return None;
+        }
+        let (current, _) = state.at(now_ns);
+        if sequence <= current && !vblank_passed(current, sequence) {
+            return None;
+        }
+        Some(state.edge_ns_of(sequence))
     }
 }
 
@@ -177,6 +181,8 @@ mod tests {
         // A nearby target just before wrap has passed; a future target has not.
         assert!(vblank_passed(1, u64::MAX));
         assert!(!vblank_passed(1, 2));
+        assert!(vblank_passed(1 << 23, 0));
+        assert!(!vblank_passed((1 << 23) + 1, 0));
     }
 
     #[test]
@@ -207,16 +213,24 @@ mod tests {
             3
         );
         // Edge timestamps round-trip through the sequence computation.
-        assert_eq!(clock.deadline_ns(4), Some(1_000 + VBLANK_PERIOD_NS * 4));
+        assert_eq!(clock.deadline_ns(4, 1_000), Some(1_000 + VBLANK_PERIOD_NS * 4));
 
         clock.set_active(false, 1_000 + VBLANK_PERIOD_NS * 7 / 2);
         assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 30).0, 3);
-        assert_eq!(clock.deadline_ns(4), None);
+        assert_eq!(clock.deadline_ns(4, 1_000 + VBLANK_PERIOD_NS * 30), None);
         clock.set_active(true, 1_000 + VBLANK_PERIOD_NS * 30);
         assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 30).0, 3);
         assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 30).1, 1_000 + VBLANK_PERIOD_NS * 3);
-        assert_eq!(clock.deadline_ns(4), Some(1_000 + VBLANK_PERIOD_NS * 31));
+        assert_eq!(
+            clock.deadline_ns(4, 1_000 + VBLANK_PERIOD_NS * 30),
+            Some(1_000 + VBLANK_PERIOD_NS * 31)
+        );
         assert_eq!(clock.snapshot_at(1_000 + VBLANK_PERIOD_NS * 31).0, 4);
+
+        let stale_clock = VblankClock::new(1_000);
+        stale_clock.set_active(true, 1_000);
+        let stale_at = 1_000 + VBLANK_PERIOD_NS * ((1 << 23) + 1);
+        assert_eq!(stale_clock.deadline_ns(0, stale_at), None);
     }
 
     #[test]

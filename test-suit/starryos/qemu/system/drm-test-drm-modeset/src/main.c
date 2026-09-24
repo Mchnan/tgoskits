@@ -448,19 +448,22 @@ int main(void)
     CHECK(props.count_props >= 1, "plane reports >=1 prop");
 
     /* 找 type 属性，校验值是 PRIMARY。prop id 不在 stable uapi 中，靠名字匹配。 */
-    uint32_t type_prop_id = 0;
+    uint32_t type_prop_id = 0, fb_prop_id = 0;
     for (uint32_t i = 0; i < props.count_props; i++) {
         struct drm_mode_get_property probe = {0};
         probe.prop_id = prop_ids[i];
-        if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &probe) == 0
-            && strcmp(probe.name, "type") == 0) {
+        if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &probe) != 0)
+            continue;
+        if (strcmp(probe.name, "type") == 0) {
             type_prop_id = prop_ids[i];
             CHECK(prop_vals[i] == DRM_PLANE_TYPE_PRIMARY,
                   "plane type value == PRIMARY");
-            break;
+        } else if (strcmp(probe.name, "FB_ID") == 0) {
+            fb_prop_id = prop_ids[i];
         }
     }
     CHECK(type_prop_id != 0, "plane has 'type' property");
+    CHECK(fb_prop_id != 0, "plane has 'FB_ID' property");
 
     /* 描述 plane 的 type property。 */
     struct drm_property_enum enums[3] = {0};
@@ -680,10 +683,15 @@ int main(void)
     for (unsigned i = 0; i < 128; i++) {
         struct drm_crtc_queue_sequence future = {
             .crtc_id = crtc_ids[0], .flags = DRM_CRTC_SEQUENCE_RELATIVE,
-            .sequence = i == 0 ? 2 : 100000, .user_data = i,
+            .sequence = 100000, .user_data = i,
         };
         CHECK_RET(ioctl(other, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &future), 0,
                   "reserve future event space");
+        if (i == 0) {
+            struct pollfd future_pfd = { .fd = other, .events = POLLIN };
+            CHECK(poll(&future_pfd, 1, 0) == 0,
+                  "future sequence event is not delivered early");
+        }
     }
     CHECK_ERR(ioctl(other, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &immediate), ENOMEM,
               "ready and future events share a per-open budget");
@@ -713,6 +721,49 @@ int main(void)
 
     /* --- 队列再次清空 --- */
     CHECK_ERR(read(fd, buf, sizeof(buf)), EAGAIN, "event queue drained");
+
+    /* An active CRTC keeps vblanking when its primary plane has no FB. */
+    uint32_t plane_obj = plane_ids[0], plane_prop_count = 1;
+    uint64_t plane_fb_value = 0;
+    struct drm_mode_atomic detach_fb = {
+        .count_objs = 1,
+        .objs_ptr = (uint64_t)(uintptr_t)&plane_obj,
+        .count_props_ptr = (uint64_t)(uintptr_t)&plane_prop_count,
+        .props_ptr = (uint64_t)(uintptr_t)&fb_prop_id,
+        .prop_values_ptr = (uint64_t)(uintptr_t)&plane_fb_value,
+    };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_ATOMIC, &detach_fb), 0,
+              "atomic detach primary FB while CRTC stays active");
+    struct drm_mode_crtc unbound_crtc = { .crtc_id = crtc_ids[0] };
+    CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &unbound_crtc), 0,
+              "GETCRTC after primary FB detach");
+    CHECK(unbound_crtc.fb_id == 0 && unbound_crtc.mode_valid == 1,
+          "CRTC mode remains enabled without primary FB");
+    struct drm_crtc_get_sequence unbound_seq = { .crtc_id = crtc_ids[0] };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_CRTC_GET_SEQUENCE, &unbound_seq), 0,
+              "GET_SEQUENCE accepts active CRTC without primary FB");
+    CHECK(unbound_seq.active == 1, "unbound active CRTC reports active vblank");
+    union drm_wait_vblank unbound_wait = {0};
+    unbound_wait.req.type = _DRM_VBLANK_RELATIVE;
+    unbound_wait.req.sequence = 1;
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_WAIT_VBLANK, &unbound_wait), 0,
+              "WAIT_VBLANK works without primary FB");
+    struct drm_crtc_queue_sequence unbound_event = {
+        .crtc_id = crtc_ids[0], .flags = DRM_CRTC_SEQUENCE_RELATIVE,
+        .sequence = 1, .user_data = 0xfeed0001,
+    };
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_CRTC_QUEUE_SEQUENCE, &unbound_event), 0,
+              "QUEUE_SEQUENCE works without primary FB");
+    struct pollfd unbound_pfd = { .fd = fd, .events = POLLIN };
+    CHECK(poll(&unbound_pfd, 1, 1000) == 1,
+          "active unbound CRTC delivers queued sequence");
+    n = read(fd, &seq_ev, sizeof(seq_ev));
+    CHECK(n == (ssize_t)sizeof(seq_ev) && seq_ev.user_data == 0xfeed0001,
+          "unbound CRTC sequence event is readable");
+    plane_fb_value = next_fb.fb_id;
+    CHECK_RET(syscall(SYS_ioctl, fd, DRM_IOCTL_MODE_ATOMIC, &detach_fb), 0,
+              "atomic restore primary FB");
+    check_binding(fd, plane_ids[0], crtc_ids[0], next_fb.fb_id);
 
     /* --- legacy GETCRTC readback matches the SETCRTC we ran above --- */
     uint32_t readback_conns[4] = {0};
