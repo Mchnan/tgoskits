@@ -12,16 +12,17 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{
     BLOB_FLAG_USE_CROSS_DEVICE, BLOB_FLAG_USE_MASK, BLOB_MEM_GUEST, BLOB_MEM_HOST3D,
-    BLOB_MEM_HOST3D_GUEST, BlobMemory, CapsetInfo, Error, IrqEvent, OutputInfo, Rect,
-    Resource2dFormat, ResourceCreate3d, ResourceCreateBlob, Transfer3d,
+    BLOB_MEM_HOST3D_GUEST, BlobMemory, CapsetInfo, Error, IrqEvent, MAP_CACHE_MASK, OutputInfo,
+    Rect, Resource2dFormat, ResourceCreate3d, ResourceCreateBlob, Transfer3d,
     ctrl::ControlQueue,
     dma::Dma,
     wire::{
         CmdCtxCreate, CmdCtxResource, CmdGetCapset, CmdGetCapsetInfo, CmdResourceCreate3D,
-        CmdResourceCreateBlob, CmdSubmit3D, CmdTransferHost3D, Command, Config, CtrlHeader,
-        Features, GPU_FLAG_FENCE, MemEntry, ResourceAttachBacking, ResourceCreate2D,
-        ResourceDetachBacking, ResourceFlush, ResourceUnref, RespCapsetInfo, RespDisplayInfo,
-        SUPPORTED_FEATURES, SetScanout, SetScanoutBlob, TransferToHost2D, VIRTIO_GPU_EVENT_DISPLAY,
+        CmdResourceCreateBlob, CmdResourceMapBlob, CmdResourceUnmapBlob, CmdSubmit3D,
+        CmdTransferHost3D, Command, Config, CtrlHeader, Features, GPU_FLAG_FENCE, MemEntry,
+        ResourceAttachBacking, ResourceCreate2D, ResourceDetachBacking, ResourceFlush,
+        ResourceUnref, RespCapsetInfo, RespDisplayInfo, RespMapInfo, SUPPORTED_FEATURES,
+        SetScanout, SetScanoutBlob, TransferToHost2D, VIRTIO_GPU_EVENT_DISPLAY,
     },
 };
 
@@ -40,6 +41,21 @@ const SCANOUT_ID: u32 = 0;
 
 /// Resource backing the default framebuffer.
 const FRAMEBUFFER_RESOURCE_ID: u32 = 0xbabe;
+
+/// A device shared-memory region backing mappable blob resources.
+///
+/// Resolved from the PCI `SHARED_MEMORY_CFG` vendor capability by the
+/// OS adapter (`VIRTIO_GPU_SHM_ID_HOST_VISIBLE`). Blob resources created with
+/// `VIRTGPU_BLOB_FLAG_USE_MAPPABLE` are mapped at caller-chosen offsets inside
+/// this window via [`VirtIoGpu::map_blob`], and userspace maps the same
+/// guest-physical range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemRegion {
+    /// Guest-physical base address of the shared memory BAR.
+    pub phys_base: u64,
+    /// Size of the window in bytes.
+    pub length: u64,
+}
 
 /// A virtio-gpu device driven over any [`Transport`].
 ///
@@ -91,6 +107,9 @@ pub struct VirtIoGpu<H: Hal, T: Transport> {
     /// Device-advertised scanouts, capped to the protocol's sixteen entries.
     num_scanouts: u32,
     reset_done: bool,
+    /// Shared-memory region backing mappable blob resources, when the
+    /// OS adapter resolved one from the bus (PCI `SHARED_MEMORY_CFG`).
+    hostmem: Option<HostMemRegion>,
 }
 
 impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
@@ -144,7 +163,23 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
             has_context_init,
             num_scanouts: num_scanouts.min(16),
             reset_done: false,
+            hostmem: None,
         })
+    }
+
+    /// Publishes the shared-memory region backing mappable blob resources.
+    ///
+    /// The OS adapter resolves the region from the bus capability before the
+    /// device is registered; mapping requests before this call fail with
+    /// [`Error::Unsupported`].
+    pub fn attach_hostmem(&mut self, region: HostMemRegion) {
+        self.hostmem = Some(region);
+    }
+
+    /// The shared-memory region backing mappable blob resources, if the bus
+    /// exposed one.
+    pub fn hostmem(&self) -> Option<HostMemRegion> {
+        self.hostmem
     }
 
     /// Number of output slots exposed by this device.
@@ -967,6 +1002,68 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         self.ctrl
             .enqueue(&mut self.transport, &req, Some(cmds), fence_id)
             .map(|_| fence_id)
+    }
+
+    /// Ring-aware variant of [`VirtIoGpu::submit_3d`] for contexts that
+    /// declare command rings (venus and other ring-based capsets).
+    ///
+    /// The header sets `VIRTIO_GPU_FLAG_INFO_RING_IDX` next to the fence flag
+    /// so the host retires `fence_id` on the named ring's timeline
+    /// (`virtio_gpu_fence_emit`). Semantics otherwise match
+    /// [`VirtIoGpu::submit_3d`].
+    pub fn submit_3d_ring(&mut self, ctx_id: u32, cmds: &[u8], ring_idx: u8) -> Result<u64, Error> {
+        self.require_virgl()?;
+        if !cmds.len().is_multiple_of(size_of::<u32>()) {
+            return Err(Error::InvalidParam);
+        }
+        let size = u32::try_from(cmds.len()).map_err(|_| Error::Overflow)?;
+        let fence_id = self.alloc_fence()?;
+        let req = CmdSubmit3D {
+            header: CtrlHeader::with_fence_ring(Command::SUBMIT_3D, ctx_id, fence_id, ring_idx),
+            size,
+            _padding: 0,
+        };
+        self.ctrl
+            .enqueue(&mut self.transport, &req, Some(cmds), fence_id)
+            .map(|_| fence_id)
+    }
+
+    /// Maps a host-3D blob resource into the shared-memory window at
+    /// `offset` (blocking, Linux `virtio_gpu_cmd_resource_map_blob`).
+    ///
+    /// The caller owns offset allocation inside the region published by
+    /// [`VirtIoGpu::attach_hostmem`] — the host does not choose it. Returns
+    /// the device-reported `map_info` (`VIRTIO_GPU_MAP_CACHE_*` bits), which
+    /// tells userspace whether the mapping may be cached.
+    pub fn map_blob(&mut self, resource_id: u32, offset: u64) -> Result<u32, Error> {
+        if !self.has_resource_blob || self.hostmem.is_none() {
+            return Err(Error::Unsupported);
+        }
+        let resp: RespMapInfo = self.request(CmdResourceMapBlob {
+            header: CtrlHeader::with_type(Command::RESOURCE_MAP_BLOB),
+            resource_id,
+            _padding: 0,
+            offset,
+        })?;
+        resp.header
+            .check_type(Command::OK_MAP_INFO)
+            .map_err(|_| Error::InvalidResponse)?;
+        Ok(resp.map_info & MAP_CACHE_MASK)
+    }
+
+    /// Unmaps a blob resource from the shared-memory window (blocking, Linux
+    /// `virtio_gpu_cmd_resource_unmap_blob`).
+    pub fn unmap_blob(&mut self, resource_id: u32) -> Result<(), Error> {
+        if !self.has_resource_blob || self.hostmem.is_none() {
+            return Err(Error::Unsupported);
+        }
+        let resp: CtrlHeader = self.request(CmdResourceUnmapBlob {
+            header: CtrlHeader::with_type(Command::RESOURCE_UNMAP_BLOB),
+            resource_id,
+            _padding: 0,
+        })?;
+        resp.check_type(Command::OK_NODATA)
+            .map_err(|_| Error::InvalidResponse)
     }
 
     /// Creates a blob resource such as host-visible memory or a dma-buf.
