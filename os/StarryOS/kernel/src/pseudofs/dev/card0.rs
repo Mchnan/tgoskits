@@ -40,11 +40,11 @@ use alloc::{
 };
 use core::{
     any::Any,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 use ax_alloc::GlobalPage;
-use ax_memory_addr::{PAGE_SIZE_4K, PhysAddrRange};
+use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr, PhysAddrRange};
 use ax_runtime::hal::{mem::virt_to_phys, time::monotonic_time};
 use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
 use axpoll::{IoEvents, Pollable};
@@ -193,8 +193,22 @@ use super::drm::{
     VIRTGPU_PARAM_HOST_VISIBLE,
     VIRTGPU_PARAM_RESOURCE_BLOB,
     VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS,
+    DRM_IOCTL_SYNCOBJ_CREATE,
+    DRM_IOCTL_SYNCOBJ_DESTROY,
+    DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,
+    DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE,
+    DRM_IOCTL_SYNCOBJ_WAIT,
+    DRM_IOCTL_SYNCOBJ_RESET,
+    DRM_IOCTL_SYNCOBJ_SIGNAL,
+    DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+    DRM_IOCTL_SYNCOBJ_QUERY,
+    DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+    DRM_CAP_SYNCOBJ,
+    DRM_CAP_SYNCOBJ_TIMELINE,
+    VIRTGPU_DRM_CAPSET_VENUS,
 };
 use super::sync_file::SyncFile;
+use super::vgpu::{self, BLOB_MMAP_KEY_BASE};
 use crate::{
     StarryError, StarryResult,
     file::{
@@ -413,6 +427,9 @@ struct Framebuffer {
     width: u32,
     /// Framebuffer height in pixels — from ADDFB2.height.
     height: u32,
+    /// DRM fourcc — from ADDFB2.pixel_format. The blob present path maps it
+    /// onto a `VIRTIO_GPU_FORMAT_*` for SET_SCANOUT_BLOB.
+    format: u32,
     /// Backing storage kind. Present copies guest RAM for dumb buffers
     /// (2D path) and binds the host texture as scanout for virgl 3D
     /// resources (`SET_SCANOUT`) — matching Linux, which always sets the
@@ -433,6 +450,11 @@ enum FbBacking {
     /// present must NOT transfer them (Linux `virtio_gpu_plane_atomic_update`
     /// transfers the dumb/2D case only).
     Gpu3d { resource: Arc<GpuResource> },
+    /// A venus blob resource (capset-4 context). The host displays the
+    /// blob's backing memory in place via `SET_SCANOUT_BLOB` — no guest RAM
+    /// copy and no axdisplay involvement (venus-only hosts have no display
+    /// device).
+    Blob { res_handle: u32 },
 }
 
 /// StarryOS kernel-side dma-buf GEM object for DRM card0.
@@ -636,9 +658,9 @@ struct ImportedBlob {
 
 /// Per-open virgl context state.
 struct PerFdCtx {
-    /// CONTEXT_INIT parameters. Kept for per-fd semantics (a future
-    /// context-info query may report them); not read today.
-    #[allow(dead_code)]
+    /// CONTEXT_INIT parameters. `capset_id` routes cleanup: a venus (4)
+    /// context is owned by the 3D face, everything else by the axdisplay
+    /// virgl path.
     capset_id: u32,
     #[allow(dead_code)]
     num_rings: u32,
@@ -726,6 +748,13 @@ pub struct Card0 {
     /// Cached capset data keyed by (capset_id, version). GET_CAPS results
     /// are cached here so repeated queries don't round-trip to the host.
     capset_cache: Mutex<BTreeMap<(u32, u32), Vec<u8>>>,
+    /// venus (capset 4) 3D face state: per-fd contexts, blob resources and
+    /// the syncobj tables, driven through the virtio-gpu driver's global 3D
+    /// handle. The virgl face above keeps using the axdisplay adapter.
+    vgpu: vgpu::Vgpu,
+    /// Whether the host scanout currently shows a venus blob surface. A
+    /// dumb present must rebind the 2D scanout first on mixed 2D+3D devices.
+    blob_scanout_active: AtomicBool,
 }
 
 impl Card0 {
@@ -756,6 +785,8 @@ impl Card0 {
             next_ctx_id: AtomicU32::new(FIRST_VIRGL_CTX_ID),
             next_file_id: AtomicU64::new(1),
             capset_cache: Mutex::new(BTreeMap::new()),
+            vgpu: vgpu::Vgpu::new(),
+            blob_scanout_active: AtomicBool::new(false),
         });
         card.register_irq();
         card
@@ -1120,7 +1151,12 @@ impl Card0File {
             // resources (incl. PRIME imports). Linux funnels both GEM_CLOSE
             // and DESTROY_DUMB through `drm_gem_handle_delete`; we mirror
             // that by sharing one cleanup helper.
-            DRM_IOCTL_GEM_CLOSE => card.handle_gem_close(self, current, arg),
+            DRM_IOCTL_GEM_CLOSE => {
+                match card.vgpu.handle_gem_close(self.file_id, current, arg) {
+                    Some(result) => result,
+                    None => card.handle_gem_close(self, current, arg),
+                }
+            }
 
             DRM_IOCTL_MODE_GETPLANERESOURCES => handle_get_plane_resources(current, arg),
             DRM_IOCTL_MODE_GETPLANE => card.handle_get_plane(current, arg),
@@ -1137,20 +1173,58 @@ impl Card0File {
             DRM_IOCTL_GET_MAGIC => handle_get_magic(current, arg),
             DRM_IOCTL_AUTH_MAGIC => handle_auth_magic(current, arg),
             DRM_IOCTL_MODE_DIRTYFB => card.handle_dirty_fb(self, current, arg),
-            DRM_IOCTL_PRIME_HANDLE_TO_FD => card.handle_prime_handle_to_fd(self, current, arg),
-            DRM_IOCTL_PRIME_FD_TO_HANDLE => card.handle_prime_fd_to_handle(self, current, arg),
+            DRM_IOCTL_PRIME_HANDLE_TO_FD => {
+                match card.vgpu.handle_prime_handle_to_fd(self.file_id, current, arg) {
+                    Some(result) => result,
+                    None => card.handle_prime_handle_to_fd(self, current, arg),
+                }
+            }
+            DRM_IOCTL_PRIME_FD_TO_HANDLE => {
+                match card.vgpu.handle_prime_fd_to_handle(current, arg) {
+                    Some(result) => result,
+                    None => card.handle_prime_fd_to_handle(self, current, arg),
+                }
+            }
 
             // ---- virtgpu 3D ioctls ----
-            DRM_IOCTL_VIRTGPU_GETPARAM => card.handle_virtgpu_getparam(current, arg),
+            //
+            // The 3D face has two backends: the axdisplay virgl adapter
+            // (dev's original path) and the venus face in `vgpu` driven
+            // through the driver's global handle. Queries that only read
+            // device capabilities route to the venus face whenever a 3D
+            // device registered one — on a venus-only host there is no
+            // axdisplay display device, so the virgl handlers would answer
+            // from a has_virgl() that is spuriously false. Per-fd work
+            // (contexts, blobs, submission) routes by the fd's context kind
+            // instead, so virgl clients keep their exact dev semantics.
+            DRM_IOCTL_VIRTGPU_GETPARAM => {
+                if card.vgpu.available() {
+                    card.vgpu.handle_getparam(current, arg)
+                } else {
+                    card.handle_virtgpu_getparam(current, arg)
+                }
+            }
             DRM_IOCTL_VIRTGPU_CONTEXT_INIT => card.handle_virtgpu_context_init(self, current, arg),
-            DRM_IOCTL_VIRTGPU_GET_CAPS => card.handle_virtgpu_get_caps(current, arg),
+            DRM_IOCTL_VIRTGPU_GET_CAPS => {
+                if card.vgpu.available() {
+                    card.vgpu.handle_get_caps(current, arg)
+                } else {
+                    card.handle_virtgpu_get_caps(current, arg)
+                }
+            }
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => {
                 card.handle_virtgpu_resource_create(self, current, arg)
             }
             DRM_IOCTL_VIRTGPU_RESOURCE_INFO => {
-                card.handle_virtgpu_resource_info(self, current, arg)
+                match card.vgpu.handle_resource_info(self.file_id, current, arg) {
+                    Some(result) => result,
+                    None => card.handle_virtgpu_resource_info(self, current, arg),
+                }
             }
-            DRM_IOCTL_VIRTGPU_MAP => card.handle_virtgpu_map(self, current, arg),
+            DRM_IOCTL_VIRTGPU_MAP => match card.vgpu.handle_map(self.file_id, current, arg) {
+                Some(result) => result,
+                None => card.handle_virtgpu_map(self, current, arg),
+            },
             // DRM_IOCTL_VIRTGPU_EXECBUFFER is dispatched by `Card0File::ioctl`
             // on the `StarryResult` path so a fence-fd reservation can report
             // `EMFILE` (TooManyOpenFiles); `VfsError` has no such variant.
@@ -1162,7 +1236,36 @@ impl Card0File {
             }
             DRM_IOCTL_VIRTGPU_WAIT => card.handle_virtgpu_wait(self, current, arg),
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => {
-                card.handle_virtgpu_resource_create_blob(self, current, arg)
+                if card.vgpu.has_context(self.file_id) {
+                    let res_id = card.next_res_handle.fetch_add(1, Ordering::Relaxed);
+                    card.vgpu.handle_resource_create_blob(self.file_id, res_id, current, arg)
+                } else {
+                    card.handle_virtgpu_resource_create_blob(self, current, arg)
+                }
+            }
+
+            // ---- generic-DRM syncobj family (venus fences) ----
+            DRM_IOCTL_SYNCOBJ_CREATE => card.vgpu.handle_syncobj_create(self.file_id, current, arg),
+            DRM_IOCTL_SYNCOBJ_DESTROY => {
+                card.vgpu.handle_syncobj_destroy(self.file_id, current, arg)
+            }
+            DRM_IOCTL_SYNCOBJ_WAIT => card.vgpu.handle_syncobj_wait(self.file_id, current, arg),
+            DRM_IOCTL_SYNCOBJ_RESET => card.vgpu.handle_syncobj_reset(self.file_id, current, arg),
+            DRM_IOCTL_SYNCOBJ_SIGNAL => card.vgpu.handle_syncobj_signal(self.file_id, current, arg),
+            DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT => {
+                card.vgpu.handle_syncobj_timeline_wait(self.file_id, current, arg)
+            }
+            DRM_IOCTL_SYNCOBJ_QUERY => card.vgpu.handle_syncobj_query(self.file_id, current, arg),
+            DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL => {
+                card.vgpu.handle_syncobj_timeline_signal(self.file_id, current, arg)
+            }
+            // Sync_file export/import of a syncobj stays unsupported (as in
+            // Linux drivers without in-fence export): venus uses the
+            // timeline path exclusively, so keep the requests explicitly
+            // ENOSYS instead of letting them fall into the generic
+            // unsupported-ioctl arm.
+            DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD | DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => {
+                Err(VfsError::OperationNotSupported)
             }
 
             _ => {
@@ -1244,17 +1347,48 @@ impl FileLike for Card0File {
         }
         let _operation = self.operation.lock();
         if cmd == DRM_IOCTL_VIRTGPU_EXECBUFFER {
-            // Fence-fd reservation must surface `EMFILE`
-            // (`StarryError::TooManyOpenFiles`), which the `VfsError` domain
-            // cannot represent. This one command therefore runs on the
-            // `StarryResult` path; the lock scope above still covers it.
-            return self.card.handle_virtgpu_execbuffer(self, current, arg);
+            if self.card.vgpu.has_context(self.file_id) {
+                // venus context: the submit is fenced and fire-and-forget on
+                // the 3D face; no fence-fd reservation, so the `VfsError`
+                // domain is enough.
+                self.card
+                    .vgpu
+                    .handle_execbuffer(self.file_id, current, arg)
+                    .map_err(StarryError::from)
+            } else {
+                // Fence-fd reservation must surface `EMFILE`
+                // (`StarryError::TooManyOpenFiles`), which the `VfsError`
+                // domain cannot represent. This one command therefore runs on
+                // the `StarryResult` path; the lock scope above still covers
+                // it.
+                self.card.handle_virtgpu_execbuffer(self, current, arg)
+            }
+        } else {
+            self.ioctl_inner(current, cmd, arg).map_err(StarryError::from)
         }
-        Ok(self.ioctl_inner(current, cmd, arg)?)
     }
 
     fn device_mmap(&self, offset: u64, length: u64) -> StarryResult<DeviceMmap> {
         let _operation = self.operation.lock();
+        // Host-visible blob mmap keys live far above the dumb-offset range.
+        // The key is a selector, not a byte offset, so the resolved variants
+        // keep the generic path from adding it again; cached or not follows
+        // the host's map_info (venus hostmem is normal RAM — userspace runs
+        // atomics on its ring buffers).
+        if offset >= BLOB_MMAP_KEY_BASE {
+            let (phys, size, cached) = self
+                .card
+                .vgpu
+                .blob_physical_range(offset)
+                .ok_or(StarryError::InvalidInput)?;
+            let range =
+                PhysAddrRange::from_start_size(PhysAddr::from(phys as usize), size as usize);
+            return Ok(if cached {
+                DeviceMmap::PhysicalCachedResolved(range, None)
+            } else {
+                DeviceMmap::PhysicalResolved(range, None)
+            });
+        }
         let dumbs = self.card.dumbs.lock();
         let buffer = dumbs
             .values()
@@ -1289,10 +1423,16 @@ impl FileLike for Card0File {
 impl Drop for Card0File {
     fn drop(&mut self) {
         if let Some(context) = self.context.lock().take() {
-            for resource_id in context.attached_resources {
-                let _ = ax_display::gpu3d_ctx_detach_resource(context.ctx_id, resource_id);
+            if context.capset_id == VIRTGPU_DRM_CAPSET_VENUS {
+                // venus context: owned by the 3D face, which destroys the
+                // host context and releases this fd's blobs and syncobjs.
+                self.card.vgpu.close_fd(self.file_id);
+            } else {
+                for resource_id in context.attached_resources {
+                    let _ = ax_display::gpu3d_ctx_detach_resource(context.ctx_id, resource_id);
+                }
+                let _ = ax_display::gpu3d_ctx_destroy(context.ctx_id);
             }
-            let _ = ax_display::gpu3d_ctx_destroy(context.ctx_id);
         }
 
         let mut state = self.card.state.lock();
@@ -1350,6 +1490,14 @@ impl Drop for Card0File {
 
 impl Card0 {
     fn clear_scanout(&self) -> VfsResult<()> {
+        if self.blob_scanout_active.swap(false, Ordering::AcqRel) {
+            // A venus blob surface is on the scanout; release it through the
+            // 3D face (works with or without an axdisplay device).
+            if let Err(err) = self.vgpu.disable_scanout() {
+                warn!("card0: disable blob scanout failed: {err:?}");
+            }
+            return Ok(());
+        }
         if !ax_display::has_display() {
             return Ok(());
         }
@@ -1377,6 +1525,7 @@ impl Card0 {
                 stride: fb.stride,
                 width: fb.width,
                 height: fb.height,
+                format: fb.format,
                 kind: fb.kind.clone(),
             },
             None => return,
@@ -1390,6 +1539,14 @@ impl Card0 {
                 if !ax_display::has_display() {
                     return;
                 };
+                if self.blob_scanout_active.swap(false, Ordering::AcqRel) {
+                    // The host is scanning out a venus blob surface; rebind
+                    // the 2D scanout so the flushed dumb content is visible
+                    // again (mixed 2D+3D devices only).
+                    if let Err(err) = self.vgpu.bind_2d_scanout() {
+                        warn!("card0: 2D scanout rebind after blob scanout failed: {err:?}");
+                    }
+                }
                 let mut scanout = self.scanout_resource.lock();
                 if scanout.is_some()
                     && ax_display::gpu3d_set_scanout(0, 0, 0, 0, 0, 0).is_err()
@@ -1461,6 +1618,42 @@ impl Card0 {
                     fb.width,
                     fb.height,
                 );
+            }
+            // Venus blob resource: `SET_SCANOUT_BLOB` makes the host display
+            // the blob's backing memory in place — the zero-copy 3D present
+            // path. It runs without an axdisplay device (venus-only hosts
+            // have none), so it goes through the 3D face handle directly.
+            FbBacking::Blob { res_handle } => {
+                let Some(virtio_format) = vgpu::virtio_format_of(fb.format) else {
+                    warn!(
+                        "card0: fb format {:#x} has no virtio equivalent for scanout",
+                        fb.format
+                    );
+                    return;
+                };
+                let params = virtio_gpu::ScanoutBlobParams {
+                    res_id: *res_handle,
+                    scanout_id: 0,
+                    x: 0,
+                    y: 0,
+                    scanout_width: fb.width,
+                    scanout_height: fb.height,
+                    width: fb.width,
+                    height: fb.height,
+                    format: virtio_format,
+                    stride: fb.stride,
+                    offset: 0,
+                };
+                match self.vgpu.set_scanout_blob(params) {
+                    Ok(()) => {
+                        self.blob_scanout_active.store(true, Ordering::Release);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "card0: SET_SCANOUT_BLOB failed for resource {res_handle}: {err:?}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1761,6 +1954,11 @@ fn handle_get_cap(current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<u
         DRM_CAP_CRTC_IN_VBLANK_EVENT => 1,
         DRM_CAP_ADDFB2_MODIFIERS => 1,
         DRM_CAP_PRIME => DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT,
+        // The syncobj family (incl. the timeline form venus fences on) is
+        // implemented for venus contexts; reporting the caps is what makes
+        // Mesa's sync provider pick the kernel path instead of emulating.
+        DRM_CAP_SYNCOBJ => 1,
+        DRM_CAP_SYNCOBJ_TIMELINE => 1,
         _ => 0,
     };
     ptr.vm_write(current, cap)
@@ -2178,7 +2376,13 @@ impl Card0 {
         //      present binds it with SET_SCANOUT instead of copying empty
         //      guest RAM (the shadow pages are never attached to the host).
         //   2) a plain guest-RAM dumb buffer (2D path).
-        let (kind, size) = {
+        // A venus blob handle resolves through the 3D face and present-maps
+        // via SET_SCANOUT_BLOB; check it before the virgl/dumb tables (the
+        // handle namespaces do not overlap).
+        let vgpu_blob = self.vgpu.lookup_blob(file.file_id, handle);
+        let (kind, size) = if let Some((res_handle, blob_size)) = vgpu_blob {
+            (FbBacking::Blob { res_handle }, blob_size)
+        } else {
             let imported = self
                 .blob_aliases
                 .lock()
@@ -2273,6 +2477,7 @@ impl Card0 {
             stride: fb_stride,
             width: fb_width,
             height: fb_height,
+            format: fb_pixel_format,
             kind,
         };
         f.fb_id = fb_id;
@@ -3096,12 +3301,6 @@ impl Card0 {
             .vm_read(current)
             .map_err(|_| VfsError::BadAddress)?;
 
-        // Linux: if (!vgdev->has_context_init || !vgdev->has_virgl_3d)
-        //           return -EINVAL;
-        if !ax_display::has_context_init() || !ax_display::has_virgl() {
-            return Err(VfsError::InvalidInput);
-        }
-
         // Linux kernel: each fd can only call CONTEXT_INIT once.
         if file.context.lock().is_some() {
             return Err(VfsError::AlreadyExists);
@@ -3135,9 +3334,11 @@ impl Card0 {
                         }
                         // Linux: if ((vgdev->capset_id_mask & (1ULL << value)) == 0)
                         //           return -EINVAL;
-                        // 我们支持 VIRGL(1) 和 VIRGL2(2)
+                        // VIRGL(1)/VIRGL2(2) 走 axdisplay virgl 面；
+                        // VENUS(4) 走 vgpu 3D 面（下方分支，逐一校验）。
                         if capset_id != VIRTGPU_DRM_CAPSET_VIRGL
                             && capset_id != VIRTGPU_DRM_CAPSET_VIRGL2
+                            && capset_id != VIRTGPU_DRM_CAPSET_VENUS
                         {
                             warn!("[card0] CONTEXT_INIT: unsupported capset_id={capset_id}");
                             return Err(VfsError::InvalidInput);
@@ -3160,6 +3361,37 @@ impl Card0 {
                     }
                 }
             }
+        }
+
+        // A venus (capset 4) context rides the 3D face handle: on a
+        // venus-only host there is no axdisplay display device, so the
+        // has_virgl/has_context_init checks below (axdisplay-based) do not
+        // apply. The face validates the capset against the host's list and
+        // creates the context with card0's shared ctx-id allocator.
+        if capset_id == VIRTGPU_DRM_CAPSET_VENUS {
+            if !self.vgpu.venus_context_supported() {
+                return Err(VfsError::InvalidInput);
+            }
+            let ctx_id = self.next_ctx_id.fetch_add(1, Ordering::Relaxed);
+            let debug_name = format!("starry-ctx-{ctx_id}");
+            self.vgpu
+                .open_context(file.file_id, ctx_id, num_rings, &debug_name)?;
+            info!(
+                "[card0] CONTEXT_INIT(venus): ctx_id={ctx_id}, num_rings={num_rings}"
+            );
+            *file.context.lock() = Some(PerFdCtx {
+                capset_id,
+                num_rings,
+                ctx_id,
+                attached_resources: BTreeSet::new(),
+            });
+            return Ok(0);
+        }
+
+        // Linux: if (!vgdev->has_context_init || !vgdev->has_virgl_3d)
+        //           return -EINVAL;
+        if !ax_display::has_context_init() || !ax_display::has_virgl() {
+            return Err(VfsError::InvalidInput);
         }
 
         // Context creation itself is shared with the legacy lazy paths; the

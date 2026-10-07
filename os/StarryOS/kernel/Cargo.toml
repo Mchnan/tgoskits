@@ -67,6 +67,7 @@ ax-log.workspace = true
 ax-mm = { workspace = true, features = ["copy"] }
 ax-net = { workspace = true }
 ax-driver = { workspace = true, features = ["usb", "pwm"] }
+virtio-gpu.workspace = true
 axklib.workspace = true
 axplat-dyn.workspace = true
 ax-runtime = { workspace = true, features = [

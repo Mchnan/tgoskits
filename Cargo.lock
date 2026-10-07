@@ -7951,6 +7951,7 @@ dependencies = [
  "tock-registers 0.10.1",
  "uluru",
  "usb-serial",
+ "virtio-gpu",
  "x86",
  "xmas-elf",
  "zerocopy",
@@ -9233,6 +9234,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.13.2",
  "log",
+ "spinning_top",
  "thiserror 2.0.20",
  "virtio-drivers",
  "zerocopy",

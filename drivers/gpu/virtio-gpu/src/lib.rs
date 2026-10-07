@@ -1,15 +1,19 @@
-//! Focused VirtIO GPU protocol core for the TGOSKits display and virgl paths.
+//! Focused VirtIO GPU protocol core for the TGOSKits display, virgl and venus
+//! paths.
 //!
-//! The crate implements only the part of the virtio-gpu control protocol that
-//! the current display stack drives:
+//! The crate implements the part of the virtio-gpu control protocol that the
+//! current display stack drives:
 //!
 //! * the 2D display path: `GET_DISPLAY_INFO`, `RESOURCE_CREATE_2D`,
 //!   `RESOURCE_ATTACH_BACKING` / `RESOURCE_DETACH_BACKING`, `SET_SCANOUT`,
-//!   `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH` and `RESOURCE_UNREF`, and
+//!   `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH` and `RESOURCE_UNREF`,
 //! * the virgl 3D path: `GET_CAPSET_INFO`, `GET_CAPSET`, `CTX_CREATE` /
 //!   `CTX_DESTROY` / `CTX_ATTACH_RESOURCE` / `CTX_DETACH_RESOURCE`,
 //!   `RESOURCE_CREATE_3D`, `TRANSFER_TO_HOST_3D`, `TRANSFER_FROM_HOST_3D`,
-//!   `SUBMIT_3D` and `RESOURCE_CREATE_BLOB`.
+//!   `SUBMIT_3D` and `RESOURCE_CREATE_BLOB`, and
+//! * the venus 3D surface: `RESOURCE_MAP_BLOB` / `RESOURCE_UNMAP_BLOB` against
+//!   the host-visible shared memory BAR, `SET_SCANOUT_BLOB`, and fenced
+//!   submissions whose responses the host defers until the fence retires.
 //!
 //! Everything else the upstream GPU driver carries — EDID, the cursor queue
 //! and its shapes, multi-scanout helpers — is deliberately absent: nothing in
@@ -22,6 +26,14 @@
 //! [`virtio_drivers::queue::VirtQueue`], the config-space macros and
 //! [`virtio_drivers::Error`]); this crate adds the virtio-gpu domain types, the
 //! wire encoding and the response validation on top of it.
+//!
+//! # Two faces, one device
+//!
+//! OS kernels drive the 2D/virgl commands through their display adapter, and
+//! the venus surface through the [`VirtioGpu3D`] handle the probe publishes
+//! with [`register_global_3d`]. Both reach the same control queue: a second
+//! driver on the same device would keep private avail/used indices and corrupt
+//! the queue, so the crate owns one transport and serializes on it.
 //!
 //! The crate is `#![no_std]` and only needs `alloc`. It has no dependency on
 //! `rdrive`, `rdif-display`, StarryOS, ArceOS or the Linux DRM UAPI: mapping
@@ -40,6 +52,9 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
+
+use virtio_drivers::{Hal, transport::Transport};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 mod device;
@@ -47,8 +62,22 @@ mod dma;
 mod error;
 mod wire;
 
-pub use device::VirtIoGpu;
+pub use device::{BlobParams, GpuInfo, HostMemRegion, ScanoutBlobParams, VirtIoGpu};
 pub use error::Error;
+
+// --- Scanout formats and map cache hints (`VIRTIO_GPU_FORMAT_*`,
+// `VIRTIO_GPU_MAP_CACHE_*`) ---
+
+/// `VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM`: the memory-order match for DRM's
+/// little-endian `ARGB8888`.
+pub const FORMAT_B8G8R8A8_UNORM: u32 = 0x1;
+/// `VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM`: the memory-order match for DRM's
+/// little-endian `XRGB8888`.
+pub const FORMAT_B8G8R8X8_UNORM: u32 = 0x2;
+/// `VIRTIO_GPU_MAP_CACHE_MASK`: the cache bits of a `RESOURCE_MAP_BLOB` reply.
+pub const MAP_CACHE_MASK: u32 = 0x0f;
+/// `VIRTIO_GPU_MAP_CACHE_CACHED`: the mapping may be mapped cacheable.
+pub const MAP_CACHE_CACHED: u32 = 0x1;
 
 // --- Blob resource protocol values (`VIRTIO_GPU_BLOB_MEM_*`) ---
 
@@ -260,4 +289,192 @@ impl IrqEvent {
     pub const fn is_empty(&self) -> bool {
         !self.queue && !self.configuration
     }
+}
+
+/// Kernel-facing 3D operations of a virtio-gpu device.
+///
+/// Implemented by [`VirtIoGpu`] and published through [`register_global_3d`],
+/// so a kernel's DRM layer can implement the `VIRTGPU_*` ioctl family without
+/// naming the transport or HAL type. Resource and context ids are allocated by
+/// the caller (the DRM layer); 3D resource ids must stay clear of the fixed low
+/// ids the 2D scanout path occupies.
+pub trait VirtioGpu3D: Send + Sync {
+    /// Device capability summary taken at probe time.
+    fn info(&self) -> GpuInfo;
+
+    /// `GET_CAPSET_INFO` for the capset at `index`:
+    /// returns `(capset_id, max_version, max_size)`.
+    fn capset_info(&self, index: u32) -> Result<(u32, u32, u32), Error>;
+
+    /// `GET_CAPSET` for `(id, version)`. Fills up to `out.len()` bytes and
+    /// returns the total capset size the host reported.
+    fn capset(&self, id: u32, version: u32, out: &mut [u8]) -> Result<usize, Error>;
+
+    /// `CTX_CREATE` with the capset id in `context_init`'s low byte.
+    fn ctx_create(
+        &self,
+        ctx_id: u32,
+        capset_id: u32,
+        context_init: u32,
+        debug_name: &str,
+    ) -> Result<(), Error>;
+
+    /// `CTX_DESTROY`.
+    fn ctx_destroy(&self, ctx_id: u32) -> Result<(), Error>;
+
+    /// `RESOURCE_CREATE_BLOB`, preceded by the optional initialization command
+    /// stream exactly as Linux orders it.
+    fn resource_create_blob(&self, params: BlobParams, init_cmd: &[u8]) -> Result<(), Error>;
+
+    /// `RESOURCE_UNREF`.
+    fn resource_unref(&self, res_id: u32) -> Result<(), Error>;
+
+    /// `RESOURCE_MAP_BLOB` into the host-visible BAR at `bar_offset`; returns
+    /// the host's `map_info` cache hint.
+    fn map_blob(&self, res_id: u32, bar_offset: u64) -> Result<u32, Error>;
+
+    /// `RESOURCE_UNMAP_BLOB`.
+    fn unmap_blob(&self, res_id: u32) -> Result<(), Error>;
+
+    /// `SUBMIT_3D`. With `fence` the command carries the fence flag and the
+    /// call returns as soon as the command is queued — the host retires a
+    /// fenced response on its own schedule, so waiting for it would stall the
+    /// control queue. Without a fence the host answers immediately and the call
+    /// waits for that answer.
+    fn submit_3d(
+        &self,
+        ctx_id: u32,
+        cmd: &[u8],
+        ring_idx: Option<u8>,
+        fence: bool,
+    ) -> Result<(), Error>;
+
+    /// `SET_SCANOUT_BLOB` — display a blob resource on a scanout. The host
+    /// references the blob's backing memory in place (zero copy). `res_id == 0`
+    /// disables the scanout.
+    fn set_scanout_blob(&self, params: ScanoutBlobParams) -> Result<(), Error>;
+
+    /// Rebinds the fixed 2D scanout resource to scanout 0, restoring the
+    /// surface a blob scanout replaced. Fails with [`Error::NotReady`] when no
+    /// 2D surface was set up.
+    fn bind_2d_scanout(&self) -> Result<(), Error>;
+
+    /// Stops displaying whatever resource is bound to `scanout_id`.
+    fn disable_scanout(&self, scanout_id: u32) -> Result<(), Error>;
+}
+
+impl<H: Hal + 'static, T: Transport + 'static> VirtioGpu3D for VirtIoGpu<H, T> {
+    fn info(&self) -> GpuInfo {
+        VirtIoGpu::info(self)
+    }
+
+    fn capset_info(&self, index: u32) -> Result<(u32, u32, u32), Error> {
+        let info = VirtIoGpu::get_capset_info(self, index)?;
+        Ok((info.capset_id, info.max_version, info.max_size))
+    }
+
+    fn capset(&self, id: u32, version: u32, out: &mut [u8]) -> Result<usize, Error> {
+        let data = VirtIoGpu::get_capset(self, id, version, out.len() as u32)?;
+        let n = out.len().min(data.len());
+        out[..n].copy_from_slice(&data[..n]);
+        Ok(data.len())
+    }
+
+    fn ctx_create(
+        &self,
+        ctx_id: u32,
+        capset_id: u32,
+        context_init: u32,
+        debug_name: &str,
+    ) -> Result<(), Error> {
+        // `VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK`: the low byte names the
+        // capset, which is how the host selects the context protocol.
+        VirtIoGpu::ctx_create(self, ctx_id, debug_name, context_init | (capset_id & 0xff))
+    }
+
+    fn ctx_destroy(&self, ctx_id: u32) -> Result<(), Error> {
+        VirtIoGpu::ctx_destroy(self, ctx_id)
+    }
+
+    fn resource_create_blob(&self, params: BlobParams, init_cmd: &[u8]) -> Result<(), Error> {
+        // Linux order: the initialization stream runs on the context before the
+        // blob resource exists (`virtio_gpu_resource_create_blob_ioctl`).
+        if !init_cmd.is_empty() {
+            VirtIoGpu::submit_3d_unfenced(self, params.ctx_id, init_cmd)?;
+        }
+        // SAFETY: host-allocated blobs carry no guest ranges, so nothing is
+        // shared with the device beyond the resource itself.
+        unsafe {
+            VirtIoGpu::resource_create_blob(
+                self,
+                ResourceCreateBlob {
+                    ctx_id: params.ctx_id,
+                    resource_id: params.res_id,
+                    blob_mem: params.blob_mem,
+                    blob_flags: params.blob_flags,
+                    size: params.size,
+                    blob_id: params.blob_id,
+                    mem_entries: &[],
+                },
+            )
+        }
+    }
+
+    fn resource_unref(&self, res_id: u32) -> Result<(), Error> {
+        VirtIoGpu::resource_unref(self, res_id)
+    }
+
+    fn map_blob(&self, res_id: u32, bar_offset: u64) -> Result<u32, Error> {
+        VirtIoGpu::map_blob(self, res_id, bar_offset)
+    }
+
+    fn unmap_blob(&self, res_id: u32) -> Result<(), Error> {
+        VirtIoGpu::unmap_blob(self, res_id)
+    }
+
+    fn submit_3d(
+        &self,
+        ctx_id: u32,
+        cmd: &[u8],
+        ring_idx: Option<u8>,
+        fence: bool,
+    ) -> Result<(), Error> {
+        if fence {
+            VirtIoGpu::submit_3d_deferred(self, ctx_id, cmd, ring_idx).map(|_| ())
+        } else {
+            VirtIoGpu::submit_3d_unfenced(self, ctx_id, cmd)
+        }
+    }
+
+    fn set_scanout_blob(&self, params: ScanoutBlobParams) -> Result<(), Error> {
+        VirtIoGpu::set_scanout_blob(self, params)
+    }
+
+    fn bind_2d_scanout(&self) -> Result<(), Error> {
+        VirtIoGpu::bind_2d_scanout(self)
+    }
+
+    fn disable_scanout(&self, scanout_id: u32) -> Result<(), Error> {
+        VirtIoGpu::disable_scanout(self, scanout_id)
+    }
+}
+
+static GLOBAL_3D: spinning_top::Spinlock<Option<Arc<dyn VirtioGpu3D>>> =
+    spinning_top::Spinlock::new(None);
+
+/// Publishes the 3D face of the probed virtio-gpu device for the kernel's
+/// `VIRTGPU_*` ioctl layer. The first registration wins; later probes
+/// (multiple GPUs) are ignored.
+pub fn register_global_3d(dev: Arc<dyn VirtioGpu3D>) {
+    let mut slot = GLOBAL_3D.lock();
+    if slot.is_some() {
+        log::warn!("virtio-gpu 3D face already registered; ignoring later device");
+        return;
+    }
+    *slot = Some(dev);
+}
+
+/// Returns the registered 3D face, if any device was probed.
+pub fn global_3d() -> Option<Arc<dyn VirtioGpu3D>> {
+    GLOBAL_3D.lock().clone()
 }

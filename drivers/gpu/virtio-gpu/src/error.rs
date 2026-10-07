@@ -34,6 +34,19 @@ pub enum Error {
     /// DMA memory could not be allocated.
     #[error("failed to allocate DMA memory")]
     DmaError,
+    /// The control queue holds as many in-flight commands as it can carry.
+    #[error("the control queue is full")]
+    QueueFull,
+    /// The host reported that it ran out of memory for the operation.
+    #[error("the device reported out of memory")]
+    OutOfMemory,
+    /// The device refused a command; the payload is its raw response code.
+    #[error("the device refused the command with response {0:#x}")]
+    DeviceError(u32),
+    /// The device stopped servicing the control queue. Every later operation
+    /// fails without touching the transport again.
+    #[error("the device stopped servicing the control queue")]
+    DeviceFault,
     /// Failure reported by the underlying virtio transport or driver.
     #[error("virtio error: {0}")]
     VirtIo(virtio_drivers::Error),

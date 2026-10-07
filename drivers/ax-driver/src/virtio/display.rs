@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use alloc::format;
+use alloc::{format, sync::Arc};
 
 use rdif_display::{
     CapsetInfo, DisplayError, DisplayInfo, Event, FrameBuffer, PixelFormat, ResourceCreate3d,
@@ -28,10 +28,16 @@ crate::model_register!(
 
 #[cfg(feature = "pci")]
 fn probe_pci(mut probe: rdrive::probe::pci::ProbePci<'_>) -> Result<(), OnProbeError> {
-    let transport =
-        crate::pci::take_virtio_transport_masked(probe.endpoint_mut(), DeviceType::GPU)?;
+    // The hostmem shared-memory region (VIRTIO_GPU_SHM_ID_HOST_VISIBLE) backs
+    // mappable blob resources; absent on plain 2D devices, in which case the
+    // 3D face degrades to "unavailable".
+    let (transport, shm) = crate::pci::take_virtio_transport_masked_with_shm(
+        probe.endpoint_mut(),
+        DeviceType::GPU,
+        1,
+    )?;
     let info = binding_info_from_pci(probe.info(), PciIrqRequirement::Optional)?;
-    register_transport_with_info(probe.into_platform_device(), transport, info)
+    register_transport_with_shm(probe.into_platform_device(), transport, shm, info)
 }
 
 pub fn register_transport<T: Transport + 'static>(
@@ -46,31 +52,72 @@ pub fn register_transport_with_info<T: Transport + 'static>(
     transport: T,
     info: BindingInfo,
 ) -> Result<(), OnProbeError> {
+    register_transport_with_shm(plat_dev, transport, None, info)
+}
+
+/// Registers a probed virtio-gpu device together with its shared memory
+/// region, when the PCI capabilities carry one.
+///
+/// The 3D face is published for the kernel's card0 `VIRTGPU_*` ioctls in every
+/// case; a display device is only registered when the 2D scanout surface came
+/// up. On a venus-only renderer (no vrend on the host) guest 2D resources
+/// fail, and registering a display device without a working scanout would
+/// panic the axdisplay adapter — so the probe degrades to 3D-only instead.
+pub fn register_transport_with_shm<T: Transport + 'static>(
+    plat_dev: PlatformDevice,
+    transport: T,
+    shm: Option<crate::pci::VirtioShmRegion>,
+    info: BindingInfo,
+) -> Result<(), OnProbeError> {
     let irq_num = info.irq_num();
-    let dev = VirtIoDisplay::new(transport, irq_num)
+    let (dev, fb_available) = VirtIoDisplay::new(transport, shm, irq_num)
         .map_err(|err| OnProbeError::other(format!("failed to initialize virtio-gpu: {err:?}")))?;
+    if !fb_available {
+        log::warn!("virtio-gpu: no 2D scanout; display device not registered");
+        return Ok(());
+    }
     let irq = plat_dev.register_display_with_info(dev, info);
     log::info!("registered virtio GPU device irq={irq:?}");
     Ok(())
 }
 
 struct VirtIoDisplay<T: Transport + 'static> {
-    raw: VirtIoGpu<VirtIoHalImpl, T>,
+    raw: Arc<VirtIoGpu<VirtIoHalImpl, T>>,
     info: DisplayInfo,
+    /// Scanout DMA base, or null when the 2D surface is unavailable
+    /// (venus-only renderers have no vrend, so guest 2D resources fail; the
+    /// 3D face stays fully functional).
     fb_base: *mut u8,
     irq_num: Option<usize>,
     irq_enabled: bool,
-    next_fence_id: u64,
 }
 
 unsafe impl<T: Transport + 'static> Send for VirtIoDisplay<T> {}
 
 impl<T: Transport + 'static> VirtIoDisplay<T> {
-    fn new(transport: T, irq_num: Option<usize>) -> Result<Self, virtio_gpu::Error> {
-        let mut raw = VirtIoGpu::new(transport)?;
-        let framebuffer = raw.setup_framebuffer()?;
-        let fb_base = framebuffer.as_mut_ptr();
-        let fb_size = framebuffer.len();
+    fn new(
+        transport: T,
+        shm: Option<crate::pci::VirtioShmRegion>,
+        irq_num: Option<usize>,
+    ) -> Result<(Self, bool), virtio_gpu::Error> {
+        let hostmem = shm.map(|region| virtio_gpu::HostMemRegion {
+            phys_base: region.phys,
+            length: region.length,
+        });
+        log::info!("virtio-gpu: creating device (hostmem={hostmem:?})");
+        let raw = Arc::new(VirtIoGpu::new(transport, hostmem)?);
+        // Publish the 3D face for the kernel's card0 VIRTGPU_* ioctls.
+        virtio_gpu::register_global_3d(raw.clone());
+        // The 2D surface may be unavailable on venus-only renderers (no vrend
+        // on the darwin host): degrade to 3D-only instead of failing the probe.
+        let (fb_base, fb_size) = match raw.setup_framebuffer() {
+            Ok((base, size)) => (base.as_ptr(), size),
+            Err(err) => {
+                log::warn!("virtio-gpu: 2D scanout unavailable ({err:?}); continuing 3D-only");
+                (core::ptr::null_mut(), 0)
+            }
+        };
+        let fb_available = !fb_base.is_null();
         let (width, height) = raw.resolution()?;
         let info = DisplayInfo {
             width,
@@ -80,14 +127,16 @@ impl<T: Transport + 'static> VirtIoDisplay<T> {
             fb_size,
         };
         let _ = raw.ack_interrupt();
-        Ok(Self {
-            raw,
-            info,
-            fb_base,
-            irq_num,
-            irq_enabled: false,
-            next_fence_id: 1,
-        })
+        Ok((
+            Self {
+                raw,
+                info,
+                fb_base,
+                irq_num,
+                irq_enabled: false,
+            },
+            fb_available,
+        ))
     }
 }
 
@@ -103,6 +152,9 @@ impl<T: Transport + 'static> rdif_display::Interface for VirtIoDisplay<T> {
     }
 
     fn framebuffer(&mut self) -> Result<FrameBuffer<'_>, DisplayError> {
+        if self.fb_base.is_null() {
+            return Err(DisplayError::NotSupported);
+        }
         Ok(unsafe { FrameBuffer::from_raw_parts_mut(self.fb_base, self.info.fb_size) })
     }
 
@@ -115,6 +167,9 @@ impl<T: Transport + 'static> rdif_display::Interface for VirtIoDisplay<T> {
     }
 
     fn flush(&mut self) -> Result<(), DisplayError> {
+        if self.fb_base.is_null() {
+            return Err(DisplayError::NotSupported);
+        }
         self.raw.flush().map_err(map_display_err)
     }
 
@@ -343,12 +398,7 @@ impl<T: Transport + 'static> rdif_display::Interface for VirtIoDisplay<T> {
     }
 
     fn submit_cmd(&mut self, ctx_id: u32, cmds: &[u8]) -> Result<u64, DisplayError> {
-        let fence_id = self.next_fence_id;
-        self.next_fence_id = self.next_fence_id.wrapping_add(1).max(1);
-        self.raw
-            .submit_3d(ctx_id, fence_id, cmds)
-            .map_err(map_gpu3d_err)?;
-        Ok(fence_id)
+        self.raw.submit_3d(ctx_id, cmds).map_err(map_gpu3d_err)
     }
 
     fn get_capset_info(&mut self, index: u32) -> Result<CapsetInfo, DisplayError> {

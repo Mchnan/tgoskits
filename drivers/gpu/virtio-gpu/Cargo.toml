@@ -12,6 +12,7 @@ categories = ["hardware-support", "no-std"]
 [dependencies]
 bitflags.workspace = true
 log.workspace = true
+spinning_top.workspace = true
 thiserror.workspace = true
 virtio-drivers = { workspace = true, features = ["alloc"] }
 zerocopy = { workspace = true, features = ["derive"] }

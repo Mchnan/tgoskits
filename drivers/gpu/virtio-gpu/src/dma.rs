@@ -69,6 +69,35 @@ impl<H: Hal> Dma<H> {
     pub(crate) fn raw_slice(&self) -> NonNull<[u8]> {
         NonNull::slice_from_raw_parts(self.vaddr, self.len)
     }
+
+    /// The first `len` bytes of the region.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds the region, which the callers derive from the
+    /// same allocation size.
+    pub(crate) fn slice(&self, len: usize) -> &[u8] {
+        assert!(len <= self.len);
+        // SAFETY: the region holds `len` initialised bytes and `&self` keeps it
+        // alive for the borrow; the device may write into it concurrently only
+        // through `share`, which the callers gate on the response having been
+        // consumed.
+        unsafe { core::slice::from_raw_parts(self.vaddr.as_ptr(), len) }
+    }
+
+    /// Copies `src` into the region.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `src` is larger than the region.
+    pub(crate) fn write(&mut self, src: &[u8]) {
+        assert!(src.len() <= self.len);
+        // SAFETY: the region holds `len >= src.len()` bytes, `&mut self` proves
+        // no other reference to them exists, and the device only reads them
+        // after the descriptor is published.
+        unsafe { core::slice::from_raw_parts_mut(self.vaddr.as_ptr(), src.len()) }
+            .copy_from_slice(src);
+    }
 }
 
 impl<H: Hal> Drop for Dma<H> {

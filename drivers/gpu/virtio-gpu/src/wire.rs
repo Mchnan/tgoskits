@@ -44,6 +44,9 @@ bitflags! {
         const RESOURCE_BLOB = 1 << 3;
         /// Context-init protocol (virgl2 capset, per-fd context).
         const CONTEXT_INIT = 1 << 4;
+        /// The device config advertises a blob alignment requirement
+        /// (`Config::blob_alignment`).
+        const BLOB_ALIGNMENT = 1 << 5;
 
         const RING_INDIRECT_DESC = 1 << 28;
         const RING_EVENT_IDX = 1 << 29;
@@ -62,7 +65,8 @@ pub(crate) const SUPPORTED_FEATURES: Features = Features::RING_EVENT_IDX
     .union(Features::VERSION_1)
     .union(Features::VIRGL)
     .union(Features::CONTEXT_INIT)
-    .union(Features::RESOURCE_BLOB);
+    .union(Features::RESOURCE_BLOB)
+    .union(Features::BLOB_ALIGNMENT);
 
 /// A virtio-gpu control command or response code.
 #[repr(transparent)]
@@ -82,6 +86,7 @@ impl Command {
     pub(crate) const GET_CAPSET_INFO: Command = Command(0x108);
     pub(crate) const GET_CAPSET: Command = Command(0x109);
     pub(crate) const RESOURCE_CREATE_BLOB: Command = Command(0x10c);
+    pub(crate) const SET_SCANOUT_BLOB: Command = Command(0x10d);
 
     // 3D commands (VirtIO GPU spec section 5.7.5, table 5.7.5.2).
     pub(crate) const CTX_CREATE: Command = Command(0x0200);
@@ -92,16 +97,32 @@ impl Command {
     pub(crate) const TRANSFER_TO_HOST_3D: Command = Command(0x0205);
     pub(crate) const TRANSFER_FROM_HOST_3D: Command = Command(0x0206);
     pub(crate) const SUBMIT_3D: Command = Command(0x0207);
+    pub(crate) const RESOURCE_MAP_BLOB: Command = Command(0x0208);
+    pub(crate) const RESOURCE_UNMAP_BLOB: Command = Command(0x0209);
 
     // Success responses used by this driver.
     pub(crate) const OK_NODATA: Command = Command(0x1100);
     pub(crate) const OK_DISPLAY_INFO: Command = Command(0x1101);
     pub(crate) const OK_CAPSET_INFO: Command = Command(0x1102);
     pub(crate) const OK_CAPSET: Command = Command(0x1103);
+    pub(crate) const OK_MAP_INFO: Command = Command(0x1106);
+
+    // Error responses (the host reports why a command was refused).
+    pub(crate) const ERR_OUT_OF_MEMORY: Command = Command(0x1201);
+    pub(crate) const ERR_INVALID_SCANOUT_ID: Command = Command(0x1202);
+    pub(crate) const ERR_INVALID_RESOURCE_ID: Command = Command(0x1203);
+    pub(crate) const ERR_INVALID_CONTEXT_ID: Command = Command(0x1204);
+    pub(crate) const ERR_INVALID_PARAMETER: Command = Command(0x1205);
 }
 
 /// `VIRTIO_GPU_FLAG_FENCE`: signalled when the command stream has completed.
 const GPU_FLAG_FENCE: u32 = 1 << 0;
+/// `VIRTIO_GPU_FLAG_INFO_RING_IDX`: the header's `ring_idx` field is valid.
+///
+/// Linux sets this together with `VIRTIO_GPU_FLAG_FENCE` on ring-based
+/// submissions (`virtio_gpu_fence_emit`), which is how the host learns which
+/// ring's timeline the fence belongs to.
+const GPU_FLAG_INFO_RING_IDX: u32 = 1 << 1;
 
 /// The header every virtio-gpu control command and response starts with.
 #[repr(C)]
@@ -153,6 +174,28 @@ impl CtrlHeader {
         }
     }
 
+    /// A fenced `SUBMIT_3D` header naming the ring the fence belongs to.
+    ///
+    /// Ring-based contexts (venus) submit through a ring buffer rather than a
+    /// per-command stream, and the host retires one fence per ring: the ring
+    /// index travels with the fence exactly as in Linux's
+    /// `virtio_gpu_fence_emit`.
+    pub(crate) const fn with_fence_ring(
+        hdr_type: Command,
+        ctx_id: u32,
+        fence_id: u64,
+        ring_idx: u8,
+    ) -> Self {
+        Self {
+            hdr_type,
+            flags: GPU_FLAG_FENCE | GPU_FLAG_INFO_RING_IDX,
+            fence_id,
+            ctx_id,
+            ring_idx,
+            _padding: [0; 3],
+        }
+    }
+
     /// Accepts the response only if its command code is the expected one.
     pub(crate) fn check_type(&self, expected: Command) -> Result<(), Error> {
         if self.hdr_type == expected {
@@ -160,6 +203,11 @@ impl CtrlHeader {
         } else {
             Err(Error::InvalidResponse)
         }
+    }
+
+    /// The command or response code this header carries.
+    pub(crate) const fn command(&self) -> Command {
+        self.hdr_type
     }
 }
 
@@ -372,3 +420,70 @@ pub(crate) struct MemEntry {
     pub(crate) length: u32,
     pub(crate) padding: u32,
 }
+
+/// `VIRTIO_GPU_CMD_SET_SCANOUT_BLOB`.
+///
+/// The 3D counterpart of `SET_SCANOUT`: it names a blob resource plus the
+/// stride/offset of plane 0 instead of a single rect, and the host displays
+/// the blob's backing memory in place (no `TRANSFER_TO_HOST_2D`). A zero
+/// `resource_id` disables the scanout, matching `SET_SCANOUT`'s idiom.
+#[repr(C)]
+#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
+pub(crate) struct CmdSetScanoutBlob {
+    pub(crate) header: CtrlHeader,
+    pub(crate) rect: Rect,
+    pub(crate) scanout_id: u32,
+    pub(crate) resource_id: u32,
+    /// Full framebuffer geometry (the rect carries the visible sub-rect).
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// `VIRTIO_GPU_FORMAT_*` of plane 0.
+    pub(crate) format: u32,
+    pub(crate) _padding: u32,
+    pub(crate) strides: [u32; 4],
+    pub(crate) offsets: [u32; 4],
+}
+
+/// `VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB`.
+#[repr(C)]
+#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
+pub(crate) struct CmdResourceMapBlob {
+    pub(crate) header: CtrlHeader,
+    pub(crate) resource_id: u32,
+    pub(crate) _padding: u32,
+    /// Offset of the mapping inside the shared memory region.
+    pub(crate) offset: u64,
+}
+
+/// `VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB`.
+#[repr(C)]
+#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
+pub(crate) struct CmdResourceUnmapBlob {
+    pub(crate) header: CtrlHeader,
+    pub(crate) resource_id: u32,
+    pub(crate) _padding: u32,
+}
+
+/// `VIRTIO_GPU_RESP_OK_MAP_INFO`.
+///
+/// `map_info` reports how the host mapped the blob into the shared memory
+/// region (`VIRTIO_GPU_MAP_CACHE_*` in its low bits), which decides whether
+/// userspace may cache the mapping.
+#[repr(C)]
+#[derive(Debug, FromBytes, Immutable, KnownLayout)]
+pub(crate) struct RespMapInfo {
+    pub(crate) header: CtrlHeader,
+    pub(crate) map_info: u32,
+    pub(crate) _padding: u32,
+}
+
+// The layouts are ABI: every size below matches the Linux UAPI / VirtIO GPU
+// spec structure the host parses, so a field change must not shift them.
+const _: () = {
+    assert!(core::mem::size_of::<CtrlHeader>() == 24);
+    assert!(core::mem::size_of::<CmdSetScanoutBlob>() == 96);
+    assert!(core::mem::size_of::<CmdResourceMapBlob>() == 40);
+    assert!(core::mem::size_of::<CmdResourceUnmapBlob>() == 32);
+    assert!(core::mem::size_of::<RespMapInfo>() == 32);
+    assert!(core::mem::size_of::<CmdResourceCreateBlob>() == 56);
+};
