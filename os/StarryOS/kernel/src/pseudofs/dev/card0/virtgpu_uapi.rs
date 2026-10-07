@@ -1,8 +1,6 @@
 //! VirtIO GPU private DRM ioctl ABI.
 //!
-//! Layout and ioctl numbers follow Linux v7.1 `include/uapi/drm/virtgpu_drm.h`,
-//! except `DrmVirtgpuResourceCreateBlob`, whose `blob_hints` tail follows
-//! linux master (see the struct docs for the version basis).
+//! Layout and ioctl numbers follow Linux v7.1 `include/uapi/drm/virtgpu_drm.h`.
 
 use bytemuck::{AnyBitPattern, NoUninit};
 
@@ -91,11 +89,11 @@ pub const VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK: u64 = 0x0003;
 pub const VIRTGPU_CONTEXT_PARAM_DEBUG_NAME: u64 = 0x0004;
 
 // ---- CAPSET IDs (VIRTGPU_DRM_CAPSET_*) ----
+//
+// Virgl capsets are 1 (v1) and 2 (v2, Mesa's preference); CONTEXT_INIT
+// accepts whatever the host's capset list contains, so the named constants
+// the virgl handlers used to check against are not needed here.
 
-/// Virgl capset v1.
-pub const VIRTGPU_DRM_CAPSET_VIRGL: u32 = 1;
-/// Virgl capset v2 (Mesa prefers this).
-pub const VIRTGPU_DRM_CAPSET_VIRGL2: u32 = 2;
 /// gfxstream Vulkan capset.
 #[allow(dead_code)]
 pub const VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN: u32 = 3;
@@ -121,7 +119,6 @@ pub const VIRTGPU_BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
 // ---- BLOB flags (VIRTGPU_BLOB_FLAG_*) ----
 
 /// Blob can be mmap'd (Mesa uses this).
-#[allow(dead_code)]
 pub const VIRTGPU_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 /// Blob can be shared.
 #[allow(dead_code)]
@@ -132,6 +129,13 @@ pub const VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE: u32 = 0x0004;
 /// Hint: defer mapping.
 #[allow(dead_code)]
 pub const DRM_VIRTGPU_BLOB_FLAG_HINT_DEFER_MAPPING: u32 = 0x0001;
+
+// ---- MAP_BLOB cache hints (`VIRTIO_GPU_MAP_CACHE_*`) ----
+
+/// Mask of the cache bits in a blob mapping's host-reported `map_info`.
+pub const VIRTGPU_MAP_CACHE_MASK: u32 = 0x0f;
+/// `VIRTIO_GPU_MAP_CACHE_CACHED`: the mapping may be mapped cacheable.
+pub const VIRTGPU_MAP_CACHE_CACHED: u32 = 0x1;
 
 // ---- Event codes ----
 
@@ -337,26 +341,14 @@ pub struct DrmVirtgpuGetCaps {
 }
 
 /// Creates a blob resource for coherent memory sharing.
-/// Linux: `struct drm_virtgpu_resource_create_blob` (56 bytes). The
-/// `blob_hints`/`pad2` tail is the only deliberate deviation from the v7.1
-/// reference in the module header: it comes from linux master (merged after
-/// v7.1 together with the deferred-mapping hints; absent from every tagged
-/// release up to and including v7.1), because Mesa 26.2+ is built against
-/// the new header.
+/// Linux: `struct drm_virtgpu_resource_create_blob` (56 bytes, v6.15 UAPI).
 ///
 /// Mesa virgl calls this when `supports_coherent=true` (i.e. both
-/// RESOURCE_BLOB and HOST_VISIBLE are reported as supported). The ioctl
-/// number encodes the struct size, so the 48-byte pre-hints layout makes a
-/// userspace built against the new header (Mesa 26.2+) issue a command word
-/// this driver cannot match and the whole BLOB ioctl stays unreachable.
-///
-/// Compatibility: this *replaces* the previously accepted 48-byte command
-/// word (`0xC030644A`) with `0xC038644A`. Linux dispatches driver ioctls by
-/// number and reconciles sizes (a 48-byte request is zero-extended), so old
-/// userspace keeps working there; this driver matches the full command word
-/// exactly, so userspace built against pre-hints headers gets `-ENOTSUP`
-/// here. The same tradeoff was already taken for EXECBUFFER (40-byte v5.x
-/// layout replaced by the 64-byte v6.6 layout current Mesa expects).
+/// RESOURCE_BLOB and HOST_VISIBLE are reported as supported); Mesa venus
+/// calls it for every host-visible memory allocation. The `blob_hints` tail
+/// was added in v6.15: the ioctl number encodes the struct size, so the
+/// 48-byte pre-hints layout would make current Mesa's command word land in
+/// the dispatch's reject arm and the whole BLOB ioctl would be unreachable.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmVirtgpuResourceCreateBlob {
@@ -370,6 +362,7 @@ pub struct DrmVirtgpuResourceCreateBlob {
     pub res_handle: u32,
     /// Blob size in bytes.
     pub size: u64,
+    /// Must be zero for anything but `HOST3D_GUEST` (Linux `verify_blob`).
     pub pad: u32,
     /// VIRGL command size in bytes.
     pub cmd_size: u32,
@@ -377,20 +370,10 @@ pub struct DrmVirtgpuResourceCreateBlob {
     pub cmd: u64,
     /// Blob unique identifier.
     pub blob_id: u64,
-    /// `DRM_VIRTGPU_BLOB_FLAG_HINT_*`. Accepted to match the linux-master
-    /// layout; no behavior on this code path — the driver neither eagerly
-    /// maps blobs (`HOST_VISIBLE` reports 0 and there is no
-    /// `RESOURCE_MAP_BLOB` path) nor validates the value, matching Linux
-    /// `verify_blob()`, which only stores the hints in the object params.
+    /// `DRM_VIRTGPU_BLOB_FLAG_*` hints (Linux v6.15+).
     pub blob_hints: u32,
     pub pad2: u32,
 }
-
-// The blob_hints tail is linux-master-only (absent from every tag through
-// v7.1); Mesa 26.2+ encodes this 56-byte layout into the ioctl number.
-const _: () = assert!(core::mem::size_of::<DrmVirtgpuResourceCreateBlob>() == 56);
-const _: () = assert!(core::mem::offset_of!(DrmVirtgpuResourceCreateBlob, blob_hints) == 48);
-const _: () = assert!(DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB == 0xc038_644a);
 
 /// Initializes a rendering context on this file descriptor.
 /// Linux: `struct drm_virtgpu_context_init` (16 bytes)
@@ -429,23 +412,4 @@ pub struct DrmVirtgpuExecbufferSyncobj {
     pub handle: u32,
     pub flags: u32,
     pub point: u64,
-}
-
-#[cfg(all(test, not(axtest)))]
-mod tests {
-    use super::{DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, DrmVirtgpuResourceCreateBlob};
-
-    /// The 56-byte linux-master layout and the command word it encodes;
-    /// on the 48-byte pre-hints layout every assertion fails (the ioctl
-    /// word evaluates to `0xC030644A`), which keeps the tail regression-
-    /// proof without a GPU or Mesa in the loop.
-    #[test]
-    fn resource_create_blob_matches_linux_master_layout() {
-        assert_eq!(core::mem::size_of::<DrmVirtgpuResourceCreateBlob>(), 56);
-        assert_eq!(
-            core::mem::offset_of!(DrmVirtgpuResourceCreateBlob, blob_hints),
-            48
-        );
-        assert_eq!(DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, 0xc038_644a);
-    }
 }
