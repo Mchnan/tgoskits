@@ -148,10 +148,10 @@ export default function VenusIntoDevCard0(): JSX.Element {
       <H2>三、遗留与下一步</H2>
       <TodoListCard
         todos={[
-          { id: "1", content: "fence 语义：内核把 out-syncobj 置位挪到宿主 fenced response 到达时；宿主 vkr 把 ring seqno 推进挪到 Metal 完成之后（9-24 起的旧账，两端各欠一半）", status: "pending" },
-          { id: "2", content: "桌面级 venus e2e：deniald + zink 握手停摆是独立问题（引擎/合成器层，非内核）；venus 栈当前仍开着（/tmp/starry-vgpu-mon.sock）可直接续", status: "pending" },
-          { id: "3", content: "接装分支收尾：跑 grouped system 回归确认无跨用例状态泄漏，再决定推 PR 还是先叠 fence 修复", status: "pending" },
-          { id: "4", content: "换装分支 local/venus-dev-0923 退役：其研究文档 §9.11/§9.11.1 与画布保留作历史证据，不再作为 venus 进 dev 的载体", status: "pending" },
+          { id: "1", content: "fence 语义：内核把 out-syncobj 置位挪到宿主 fenced response 到达时；宿主 vkr 把 ring seqno 推进挪到 Metal 完成之后（9-24 起的旧账，两端各欠一半）；EVENTFD 唤醒链已就位，等接入真实 retire 事件", status: "pending" },
+          { id: "2", content: "桌面级 venus e2e：内核 panic 已修（axdisplay 全入口守卫 + syncobj per-fd + EVENTFD 0xCF），deniald 稳定运行（scheduler 2s 拍、零 panic）；Dart 引擎 frames=0 是 skia/Impeller raster 层的下一个独立问题", status: "completed" },
+          { id: "3", content: "接装分支收尾：DRM 四用例干净 guest 直跑 265/0 全绿（modeset 85、atomic 125、version 14、perbuf-dumb 41），modeset 复跑一致无跨用例状态泄漏；clippy 18/18 aarch64", status: "completed" },
+          { id: "4", content: "换装分支 local/venus-dev-0923 退役：研究文档 §9.11/§9.11.1 与画布保留作历史证据，不再作为 venus 进 dev 的载体", status: "completed" },
         ]}
       />
 

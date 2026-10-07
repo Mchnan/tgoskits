@@ -37,12 +37,12 @@ use linux_raw_sys::general::O_RDWR;
 
 use super::drm::{
     DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DRM_SYNCOBJ_CREATE_SIGNALED,
-    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, DrmGemClose,
-    DrmPrimeHandle, DrmSyncobjArray, DrmSyncobjCreate, DrmSyncobjDestroy,
-    DrmSyncobjTimelineArray, DrmSyncobjTimelineWait, DrmSyncobjWait, DrmVirtgpuExecbuffer,
-    DrmVirtgpuExecbufferSyncobj, DrmVirtgpuGetCaps, DrmVirtgpuGetparam, DrmVirtgpuMap,
-    DrmVirtgpuResourceCreateBlob, DrmVirtgpuResourceInfo,
-    DRM_VIRTGPU_BLOB_FLAG_HINT_DEFER_MAPPING, VIRTGPU_BLOB_FLAG_USE_MASK,
+    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, DrmGemClose, DrmPrimeHandle, DrmSyncobjArray,
+    DrmSyncobjCreate, DrmSyncobjDestroy, DrmSyncobjEventfd, DrmSyncobjTimelineArray,
+    DrmSyncobjTimelineWait, DrmSyncobjWait, DrmVirtgpuExecbuffer, DrmVirtgpuExecbufferSyncobj,
+    DrmVirtgpuGetCaps, DrmVirtgpuGetparam, DrmVirtgpuMap, DrmVirtgpuResourceCreateBlob,
+    DrmVirtgpuResourceInfo, DRM_VIRTGPU_BLOB_FLAG_HINT_DEFER_MAPPING, VIRTGPU_BLOB_FLAG_USE_MASK,
     VIRTGPU_BLOB_FLAG_USE_MAPPABLE, VIRTGPU_BLOB_MEM_HOST3D, VIRTGPU_MAP_CACHE_CACHED,
     VIRTGPU_MAP_CACHE_MASK, VIRTGPU_PARAM_3D_FEATURES, VIRTGPU_PARAM_BLOB_ALIGNMENT,
     VIRTGPU_PARAM_CAPSET_QUERY_FIX, VIRTGPU_PARAM_CONTEXT_INIT, VIRTGPU_PARAM_CROSS_DEVICE,
@@ -127,19 +127,23 @@ struct VgpuResource {
 struct SyncobjState {
     /// Timeline watermark: every point `<= signaled_point` is complete.
     signaled_point: u64,
+    /// Eventfds registered via `DRM_IOCTL_SYNCOBJ_EVENTFD`, with the point
+    /// each waits for. Drained by `wake_syncobj_eventfds`.
+    eventfds: Vec<(u64, Arc<crate::file::event::EventFd>)>,
 }
 
-/// Per-open-file venus state: the rendering context and its syncobjs.
+/// Per-open-file venus rendering context (CONTEXT_INIT).
 struct VgpuFd {
     ctx_id: u32,
     num_rings: u32,
-    /// Syncobjs keyed by handle, per open file description like Linux's
-    /// `drm_file.syncobj_idr`.
-    syncobjs: Mutex<BTreeMap<u32, Arc<Mutex<SyncobjState>>>>,
 }
 
 /// Cached GET_CAPSET payloads keyed by `(capset_id, version)`.
 type CapsetCache = BTreeMap<(u32, u32), Arc<[u8]>>;
+
+/// Per-fd syncobj table: `(file_id, handle)` → shared state. Lives on
+/// [`Vgpu`] rather than [`VgpuFd`] so syncobjs exist on context-less fds.
+type SyncobjTable = BTreeMap<(u64, u32), Arc<Mutex<SyncobjState>>>;
 
 /// Per-card venus state. Cheap to construct; all device access happens
 /// lazily through [`virtio_gpu::global_3d`].
@@ -149,6 +153,12 @@ pub(crate) struct Vgpu {
     next_bar_offset: AtomicU64,
     /// Per-fd state keyed by card0's stable `file_id`.
     fds: Mutex<BTreeMap<u64, VgpuFd>>,
+    /// Syncobjs keyed by `(file_id, handle)`, per open file description like
+    /// Linux's `drm_file.syncobj_idr`. Lives outside [`VgpuFd`] because
+    /// syncobjs are GEM-level objects on any drm fd — they exist without a
+    /// venus context and outlive one (Linux `drm_release` is what reaps
+    /// them, i.e. our `close_fd`, not context teardown).
+    syncobjs: Mutex<SyncobjTable>,
     /// Blob resources keyed by GEM handle. Device-global so the KMS present
     /// path can resolve an fb's backing after the creating ioctl returned;
     /// lookups still check `owner`.
@@ -166,6 +176,7 @@ impl Vgpu {
             next_mmap_key: AtomicU64::new(BLOB_MMAP_KEY_BASE),
             next_bar_offset: AtomicU64::new(0),
             fds: Mutex::new(BTreeMap::new()),
+            syncobjs: Mutex::new(BTreeMap::new()),
             resources: Mutex::new(BTreeMap::new()),
             capsets: Mutex::new(None),
             capset_cache: Mutex::new(BTreeMap::new()),
@@ -197,6 +208,12 @@ impl Vgpu {
         } else {
             fds.remove(&owner);
         }
+        // Reap the fd's syncobjs. Linux does this unconditionally in
+        // `drm_release` — syncobjs belong to the file description, not to
+        // any context, so drop them even if CONTEXT_INIT never ran.
+        self.syncobjs
+            .lock()
+            .retain(|&(fd_owner, _), _| fd_owner != owner);
         // Drop the fd's blob resources: unmap and unref them on the host.
         let mut resources = self.resources.lock();
         let owned: Vec<u32> = resources
@@ -311,7 +328,6 @@ impl Vgpu {
             VgpuFd {
                 ctx_id,
                 num_rings,
-                syncobjs: Mutex::new(BTreeMap::new()),
             },
         );
         Ok(())
@@ -665,18 +681,35 @@ impl Vgpu {
             return Err(vfs_err(err));
         }
 
-        let fds = self.fds.lock();
+        let syncobjs = self.syncobjs.lock();
+        let mut woken: Vec<Arc<crate::file::event::EventFd>> = Vec::new();
         for (handle, point) in out_syncobjs {
-            let Some(state) = fds.get(&owner).and_then(|fd| fd.syncobjs.lock().get(&handle).cloned())
-            else {
+            let Some(state) = syncobjs.get(&(owner, handle)).cloned() else {
                 return Err(VfsError::NotFound);
             };
             let mut state = state.lock();
             state.signaled_point = state.signaled_point.max(point);
+            let mut i = 0;
+            while i < state.eventfds.len() {
+                if state.signaled_point >= state.eventfds[i].0 {
+                    woken.push(state.eventfds.swap_remove(i).1);
+                } else {
+                    i += 1;
+                }
+            }
         }
+        drop(syncobjs);
+        // Signal outside the syncobj table lock.
+        self.signal_eventfds(&woken);
         Ok(0)
     }
 
+    /// Signals a batch of eventfds collected under a syncobj lock.
+    fn signal_eventfds(&self, eventfds: &[Arc<crate::file::event::EventFd>]) {
+        for eventfd in eventfds {
+            let _ = eventfd.signal_kernel(1);
+        }
+    }
     /// `DRM_IOCTL_PRIME_HANDLE_TO_FD` for a mapped HOST3D blob: installs a
     /// kernel-local dma-buf stand-in fd that names the blob's GEM handle.
     /// Mesa's gbm/EGL paths export render buffers this way before feeding
@@ -797,14 +830,14 @@ impl Vgpu {
             return Err(VfsError::InvalidInput);
         }
         let handle = self.next_syncobj_handle();
-        let fds = self.fds.lock();
-        let Some(fd) = fds.get(&owner) else {
-            return Err(VfsError::InvalidInput);
-        };
-        fd.syncobjs.lock().insert(
-            handle,
+        // Syncobjs are GEM-level objects: any drm fd may create them, with
+        // or without a venus rendering context (Linux has no context check
+        // in `drm_syncobj_create`).
+        self.syncobjs.lock().insert(
+            (owner, handle),
             Arc::new(Mutex::new(SyncobjState {
                 signaled_point: u64::from(args.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0),
+                eventfds: Vec::new(),
             })),
         );
         store_arg(current, arg, &DrmSyncobjCreate {
@@ -821,13 +854,9 @@ impl Vgpu {
         arg: usize,
     ) -> VfsResult<usize> {
         let args: DrmSyncobjDestroy = load_arg(current, arg)?;
-        let fds = self.fds.lock();
-        let Some(fd) = fds.get(&owner) else {
-            return Err(VfsError::NotFound);
-        };
-        fd.syncobjs
+        self.syncobjs
             .lock()
-            .remove(&args.handle)
+            .remove(&(owner, args.handle))
             .ok_or(VfsError::NotFound)?;
         Ok(0)
     }
@@ -914,7 +943,81 @@ impl Vgpu {
             let mut state = state.lock();
             state.signaled_point = state.signaled_point.max(point);
         }
+        self.wake_syncobj_eventfds(owner, &handles);
         Ok(0)
+    }
+
+    /// `DRM_IOCTL_SYNCOBJ_EVENTFD` (v6.7 UAPI): registers an eventfd that
+    /// the kernel signals when a syncobj point completes. Mesa's DRM sync
+    /// provider uses this as its completion wakeup, so a missing handler
+    /// makes every Vulkan fence wait fall back to polling or fail outright.
+    ///
+    /// With the v1 synchronous fence model the point is either already
+    /// signaled (signal the eventfd right away) or can only be reached by a
+    /// later EXECBUFFER/TIMELINE_SIGNAL on this fd — both funnel through
+    /// [`Self::wake_syncobj_eventfds`], which drains the registered list.
+    pub(crate) fn handle_syncobj_eventfd(
+        &self,
+        owner: u64,
+        current: &UserTaskRef,
+        arg: usize,
+    ) -> VfsResult<usize> {
+        let args: DrmSyncobjEventfd = load_arg(current, arg)?;
+        if args.pad != 0 || args.flags & !DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0 {
+            return Err(VfsError::InvalidInput);
+        }
+        let file = get_file_like(args.fd).map_err(|_| VfsError::BadFileDescriptor)?;
+        let eventfd = file
+            .downcast_arc::<crate::file::event::EventFd>()
+            .map_err(|_| VfsError::InvalidInput)?;
+
+        let state = self
+            .syncobjs
+            .lock()
+            .get(&(owner, args.handle))
+            .cloned()
+            .ok_or(VfsError::NotFound)?;
+        let mut state = state.lock();
+        // WAIT_AVAILABLE asks to be woken when a fence *attaches* to the
+        // point; with v1's immediate signaling the point is always backed
+        // by a fence the moment it is signaled, so the two conditions
+        // coincide and the flag needs no separate tracking.
+        if state.signaled_point >= args.point {
+            drop(state);
+            let _ = eventfd.signal_kernel(1);
+        } else {
+            state.eventfds.push((args.point, eventfd));
+        }
+        Ok(0)
+    }
+
+    /// Signals eventfds registered on any of `handles` whose registered
+    /// point is now satisfied. Called after every path that advances a
+    /// syncobj's `signaled_point`.
+    fn wake_syncobj_eventfds(&self, owner: u64, handles: &[u32]) {
+        let mut woken: Vec<Arc<crate::file::event::EventFd>> = Vec::new();
+        {
+            let table = self.syncobjs.lock();
+            for &handle in handles {
+                let Some(state) = table.get(&(owner, handle)) else {
+                    continue;
+                };
+                let mut state = state.lock();
+                let mut i = 0;
+                while i < state.eventfds.len() {
+                    let (point, eventfd) = &state.eventfds[i];
+                    if state.signaled_point >= *point {
+                        woken.push(eventfd.clone());
+                        state.eventfds.swap_remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        // Signal outside the syncobj lock: signal_kernel takes the
+        // eventfd's own state and wakes pollers.
+        self.signal_eventfds(&woken);
     }
 
     pub(crate) fn handle_syncobj_timeline_wait(
@@ -1045,14 +1148,15 @@ impl Vgpu {
         owner: u64,
         handles: &[u32],
     ) -> VfsResult<Vec<Arc<Mutex<SyncobjState>>>> {
-        let fds = self.fds.lock();
-        let Some(fd) = fds.get(&owner) else {
-            return Err(VfsError::NotFound);
-        };
-        let table = fd.syncobjs.lock();
+        let table = self.syncobjs.lock();
         handles
             .iter()
-            .map(|handle| table.get(handle).cloned().ok_or(VfsError::NotFound))
+            .map(|handle| {
+                table
+                    .get(&(owner, *handle))
+                    .cloned()
+                    .ok_or(VfsError::NotFound)
+            })
             .collect()
     }
 

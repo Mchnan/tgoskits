@@ -37,39 +37,71 @@ pub fn has_display() -> bool {
     MAIN_DISPLAY.is_inited()
 }
 
+// A 3D-only probe (venus without a 2D scanout) leaves `MAIN_DISPLAY`
+// uninitialized; every entry point below downgrades instead of dereferencing
+// the lazy cell, which would panic the kernel from arbitrary userspace
+// trigger paths (the denial desktop hits this on boot).
+
 /// Gets the framebuffer information.
+///
+/// Returns a zeroed placeholder when no display device was probed; callers
+/// use [`has_display`] to tell the two apart.
 pub fn framebuffer_info() -> DisplayInfo {
-    MAIN_DISPLAY.lock_irqsave().info()
+    match MAIN_DISPLAY.get() {
+        Some(display) => display.lock_irqsave().info(),
+        None => DisplayInfo {
+            width: 0,
+            height: 0,
+            fb_base_vaddr: 0,
+            fb_size: 0,
+            stride: 0,
+            format: PixelFormat::Unknown,
+        },
+    }
 }
 
 /// Flushes the framebuffer, i.e. show on the screen.
 pub fn framebuffer_flush() -> bool {
-    MAIN_DISPLAY.lock_irqsave().flush().is_ok()
+    MAIN_DISPLAY
+        .get()
+        .is_some_and(|display| display.lock_irqsave().flush().is_ok())
 }
 
 /// Restore the driver's own framebuffer as the active scanout.
 pub fn framebuffer_restore_scanout() -> DisplayResult {
-    MAIN_DISPLAY.lock_irqsave().restore_framebuffer_scanout()
+    match MAIN_DISPLAY.get() {
+        Some(display) => display.lock_irqsave().restore_framebuffer_scanout(),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Returns the resolved main display IRQ, if the runtime provided one.
 pub fn framebuffer_irq_id() -> Option<irq_framework::IrqId> {
-    MAIN_DISPLAY.lock_irqsave().irq_id()
+    MAIN_DISPLAY
+        .get()
+        .and_then(|display| display.lock_irqsave().irq_id())
 }
 
 /// Enables IRQ handling in the main display driver.
 pub fn framebuffer_enable_irq() {
-    MAIN_DISPLAY.lock_irqsave().enable_irq();
+    if let Some(display) = MAIN_DISPLAY.get() {
+        display.lock_irqsave().enable_irq();
+    }
 }
 
 /// Disables IRQ handling in the main display driver.
 pub fn framebuffer_disable_irq() {
-    MAIN_DISPLAY.lock_irqsave().disable_irq();
+    if let Some(display) = MAIN_DISPLAY.get() {
+        display.lock_irqsave().disable_irq();
+    }
 }
 
 /// Acknowledges the main display IRQ source.
 pub fn framebuffer_handle_irq() -> bool {
-    let mut display = MAIN_DISPLAY.lock_irqsave();
+    let Some(display) = MAIN_DISPLAY.get() else {
+        return false;
+    };
+    let mut display = display.lock_irqsave();
     display.is_irq_enabled() && display.handle_irq()
 }
 
@@ -85,60 +117,84 @@ pub fn framebuffer_handle_irq() -> bool {
 
 /// Checks if the display device supports virgl 3D.
 pub fn has_virgl() -> bool {
-    MAIN_DISPLAY.lock_irqsave().has_virgl()
+    MAIN_DISPLAY
+        .get()
+        .is_some_and(|display| display.lock_irqsave().has_virgl())
 }
 
 /// Checks if `VIRTIO_GPU_F_RESOURCE_BLOB` was negotiated (blob resources /
 /// dma-buf sharing).
 pub fn has_resource_blob() -> bool {
-    MAIN_DISPLAY.lock_irqsave().has_resource_blob()
+    MAIN_DISPLAY
+        .get()
+        .is_some_and(|display| display.lock_irqsave().has_resource_blob())
 }
 
 /// Checks if `VIRTIO_GPU_F_CONTEXT_INIT` was negotiated.
 pub fn has_context_init() -> bool {
-    MAIN_DISPLAY.lock_irqsave().has_context_init()
+    MAIN_DISPLAY
+        .get()
+        .is_some_and(|display| display.lock_irqsave().has_context_init())
 }
 
 /// Create a 3D rendering context.
 pub fn gpu3d_ctx_create(ctx_id: u32, name: &str, context_init: u32) -> DisplayResult {
-    MAIN_DISPLAY
-        .lock_irqsave()
-        .ctx_create(ctx_id, name, context_init)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display
+            .lock_irqsave()
+            .ctx_create(ctx_id, name, context_init),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Destroy a 3D rendering context.
 pub fn gpu3d_ctx_destroy(ctx_id: u32) -> DisplayResult {
-    MAIN_DISPLAY.lock_irqsave().ctx_destroy(ctx_id)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display.lock_irqsave().ctx_destroy(ctx_id),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Attach a 3D resource to a rendering context.
 pub fn gpu3d_ctx_attach_resource(ctx_id: u32, resource_id: u32) -> DisplayResult {
-    MAIN_DISPLAY
-        .lock_irqsave()
-        .ctx_attach_resource(ctx_id, resource_id)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display
+            .lock_irqsave()
+            .ctx_attach_resource(ctx_id, resource_id),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Detach a 3D resource from a rendering context.
 pub fn gpu3d_ctx_detach_resource(ctx_id: u32, resource_id: u32) -> DisplayResult {
-    MAIN_DISPLAY
-        .lock_irqsave()
-        .ctx_detach_resource(ctx_id, resource_id)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display
+            .lock_irqsave()
+            .ctx_detach_resource(ctx_id, resource_id),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 // --- 2D resource / scanout forwarding ---
 
 /// Create a 2D resource on the host (for dumb buffer backing).
 pub fn gpu3d_resource_create_2d(resource_id: u32, width: u32, height: u32) -> DisplayResult {
-    MAIN_DISPLAY
-        .lock_irqsave()
-        .resource_create_2d(resource_id, width, height)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display
+            .lock_irqsave()
+            .resource_create_2d(resource_id, width, height),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Attach guest memory backing to a resource.
 pub fn gpu3d_attach_backing(resource_id: u32, paddr: u64, length: u32) -> DisplayResult {
-    MAIN_DISPLAY
-        .lock_irqsave()
-        .resource_attach_backing(resource_id, paddr, length)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display
+            .lock_irqsave()
+            .resource_attach_backing(resource_id, paddr, length),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Bind a resource as the display output (scanout) for a given scanout ID.
@@ -153,9 +209,12 @@ pub fn gpu3d_set_scanout(
     w: u32,
     h: u32,
 ) -> DisplayResult {
-    MAIN_DISPLAY
-        .lock_irqsave()
-        .set_scanout(scanout_id, resource_id, x, y, w, h)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display
+            .lock_irqsave()
+            .set_scanout(scanout_id, resource_id, x, y, w, h),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Transfer a rectangular region of a 2D resource from guest to host.
@@ -169,9 +228,12 @@ pub fn gpu3d_transfer_to_host_2d(
     w: u32,
     h: u32,
 ) -> DisplayResult {
-    MAIN_DISPLAY
-        .lock_irqsave()
-        .transfer_to_host_2d(resource_id, x, y, w, h)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display
+            .lock_irqsave()
+            .transfer_to_host_2d(resource_id, x, y, w, h),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Flush a resource's contents to the display.
@@ -180,9 +242,12 @@ pub fn gpu3d_transfer_to_host_2d(
 /// optionally binding with [`gpu3d_set_scanout`], call this to make
 /// the host display the contents.
 pub fn gpu3d_resource_flush(resource_id: u32, x: u32, y: u32, w: u32, h: u32) -> DisplayResult {
-    MAIN_DISPLAY
-        .lock_irqsave()
-        .resource_flush(resource_id, x, y, w, h)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display
+            .lock_irqsave()
+            .resource_flush(resource_id, x, y, w, h),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Create a 3D resource.
@@ -190,12 +255,18 @@ pub fn gpu3d_resource_flush(resource_id: u32, x: u32, y: u32, w: u32, h: u32) ->
 /// The caller must explicitly call [`gpu3d_ctx_attach_resource`] after creation
 /// before using the resource in rendering commands.
 pub fn gpu3d_resource_create(params: ResourceCreate3d) -> DisplayResult {
-    MAIN_DISPLAY.lock_irqsave().resource_create_3d(params)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display.lock_irqsave().resource_create_3d(params),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Unreference a 3D resource.
 pub fn gpu3d_resource_unref(resource_id: u32) -> DisplayResult {
-    MAIN_DISPLAY.lock_irqsave().resource_unref(resource_id)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display.lock_irqsave().resource_unref(resource_id),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Create a blob resource (host-visible memory / dma-buf sharing).
@@ -205,30 +276,48 @@ pub fn gpu3d_resource_unref(resource_id: u32) -> DisplayResult {
 /// for the blob's initial state (submitted before RESOURCE_CREATE_BLOB,
 /// matching Linux ordering).
 pub fn gpu3d_resource_create_blob(params: ResourceCreateBlob<'_>) -> DisplayResult {
-    MAIN_DISPLAY.lock_irqsave().resource_create_blob(params)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display.lock_irqsave().resource_create_blob(params),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Transfer data from guest to host for a 3D resource.
 pub fn gpu3d_transfer_to_host(params: Transfer3d) -> DisplayResult {
-    MAIN_DISPLAY.lock_irqsave().transfer_to_host_3d(params)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display.lock_irqsave().transfer_to_host_3d(params),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Transfer data from host to guest for a 3D resource.
 pub fn gpu3d_transfer_from_host(params: Transfer3d) -> DisplayResult {
-    MAIN_DISPLAY.lock_irqsave().transfer_from_host_3d(params)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display.lock_irqsave().transfer_from_host_3d(params),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Submit a virgl command buffer. Returns a monotonically increasing fence ID.
 pub fn gpu3d_submit_cmd(ctx_id: u32, cmds: &[u8]) -> Result<u64, DisplayError> {
-    MAIN_DISPLAY.lock_irqsave().submit_cmd(ctx_id, cmds)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display.lock_irqsave().submit_cmd(ctx_id, cmds),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Query capset information by index.
 pub fn gpu3d_capset_info(index: u32) -> Result<CapsetInfo, DisplayError> {
-    MAIN_DISPLAY.lock_irqsave().capset_info(index)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display.lock_irqsave().capset_info(index),
+        None => Err(DisplayError::NotAvailable),
+    }
 }
 
 /// Retrieve capset data.
 pub fn gpu3d_capset(id: u32, ver: u32, size: u32) -> Result<alloc::vec::Vec<u8>, DisplayError> {
-    MAIN_DISPLAY.lock_irqsave().capset(id, ver, size)
+    match MAIN_DISPLAY.get() {
+        Some(display) => display.lock_irqsave().capset(id, ver, size),
+        None => Err(DisplayError::NotAvailable),
+    }
 }

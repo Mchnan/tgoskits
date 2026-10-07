@@ -95,7 +95,16 @@ pub struct FrameBuffer {
     size: usize,
 }
 impl FrameBuffer {
+    /// Builds the fb device from the probed display. Only dev/mod.rs calls
+    /// this behind `ax_display::has_display()`, but a 3D-only probe (venus
+    /// without a 2D scanout) leaves `MAIN_DISPLAY` uninitialized and any
+    /// deref here would panic the kernel — keep the guard local so the
+    /// invariant cannot regress silently.
     pub fn new() -> Self {
+        assert!(
+            ax_display::has_display(),
+            "fb0 constructed without a display device"
+        );
         crate::task::kernel_thread_builder("fb-refresh".into())
             .spawn(|| crate::task::future::block_on(refresh_task()))
             .expect("failed to spawn kernel thread");

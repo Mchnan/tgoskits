@@ -60,6 +60,8 @@ net = [
   "ax-driver/net",
 ]
 vsock = ["net", "ax-net/vsock", "ax-driver/vsock"]
+# Raw frame-pointer panic backtrace through the emergency console.
+backtrace = ["axbacktrace/alloc"]
 
 [dependencies]
 ax-alloc = {workspace = true}

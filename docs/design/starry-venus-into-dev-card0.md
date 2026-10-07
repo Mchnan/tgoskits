@@ -115,3 +115,49 @@
 - 桌面级 venus e2e（deniald + zink）未跑：本轮交付的是内核面接装 + 内核面
   验证；桌面握手停摆是上一轮收敛出的独立问题（引擎/合成器握手，非内核）。
 - TEMP-PROBE 仪表已全部拆除（本轮排查用的 ioctl trace 在提交前移除）。
+
+## 复测闭环补记（2026-10-07，Phase 42 收尾）
+
+四项遗留待办在本轮收敛三项半：
+
+1. **deniald 桌面 panic 根因修复（venus-only 下 axdisplay 全入口守卫）**。
+   桌面级 e2e 首跑发现 deniald 启动即把内核打 panic（`LazyInit<RawSpinLock
+   <ErasedDisplayDevice>>` 未初始化解引用，ax-lazyinit lib.rs:241）——不是
+   上一轮收敛的"引擎/合成器握手停摆"，而是 venus-only 探测（2D 面不可用、
+   display 设备不注册）下 `MAIN_DISPLAY` 永不初始化，而 axdisplay 的
+   `framebuffer_*`/`gpu3d_*` 转发全部直接 `lock_irqsave()` 解引用，任何
+   userspace 触发路径（deniald 经 smithay/gbm 的任意调用序）都能打死内核。
+   修复：axdisplay 28 个入口全部改为 `MAIN_DISPLAY.get()` 判空降级——
+   `framebuffer_info` 返回零尺寸占位、`framebuffer_flush` 返回 false、
+   `DisplayResult` 系返回 `NotAvailable`、`has_virgl`/`has_resource_blob`/
+   `has_context_init` 返回 false。fb0 的 `FrameBuffer::new` 另加断言防回归。
+   修复后 deniald 在 venus 栈上稳定运行（Volition output scheduler 每 2s
+   一拍、presentations=1、missed_vblanks=0、无 backing-store 错误循环），
+   Dart 引擎 `frames=0`（shell 内容未上屏）是**引擎 raster 层的下一个独立
+   问题**，内核面已闭环。
+2. **syncobj 语义对齐 Linux + 补 `DRM_IOCTL_SYNCOBJ_EVENTFD`**。实测抓到
+   两个 UAPI 偏差：(a) syncobj 原挂在 `VgpuFd`（CONTEXT_INIT 才存在），
+   任何无 context 的 fd 上 CREATE 都 EINVAL——Linux 里 syncobj 是 per-fd
+   GEM 级对象、与 context 无关；现挪为 `Vgpu` 的独立 per-fd 表
+   `(file_id, handle)` 键控，CREATE/DESTROY/WAIT/QUERY/SIGNAL 全族不再
+   要求 context，`close_fd` 无条件回收（Linux `drm_release` 语义）。
+   (b) mesa 25.2 的 `util_sync_provider_drm` 用 `SYNCOBJ_EVENTFD`（0xCF，
+   v6.7 UAPI）注册完成唤醒，此前落入 unsupported 分支返回 ENOSYS；现已
+   实现（点已 signal 立即 `signal_kernel(1)`，未到点登记进 `SyncobjState.
+   eventfds`，EXECBUFFER/TIMELINE_SIGNAL 推进水位时统一唤醒）。
+3. **grouped system 等效回归 + 无跨用例状态泄漏**。`cargo xtask starry
+   test qemu -c qemu/system` 在 macOS 缺 qemu-user 跑不起来（上一轮已
+   确认的环境限制），按上轮口径把四个 DRM 用例交叉编译注入干净 guest
+   直跑：modeset 85/0、atomic 125/0、version 14/0、perbuf-dumb 41/0
+   （合计 265/0；与接装分支首跑记录合计一致，modeset/atomic 数值为同一
+   套件的两次统计口径差），**换装分支的 69/16、90/35、40/1 缺口全部为
+   零**——dev card0 per-fd/属性/KMS 语义完整保留的实证；modeset 复跑
+   85/0 一致，无跨用例状态泄漏。
+4. **换装分支 `local/venus-dev-0923` 正式退役**：其研究文档
+   （`docs/research-host-vulkan-acceleration.md`）§9.11/§9.11.1 与 §9
+   的对照数据保留作历史证据，不再作为 venus 进 dev 的载体；后续 venus
+   工作全部基于本分支的接装形态。
+5. **仍遗留**：fence 完成语义（内核 submit 即置位 + 宿主 vkr ring 解析
+   即推进，两端都不等 Metal 完成——上一轮 §9.11 的账，本轮的 EVENTFD
+   唤醒链为未来接入真实 retire 事件留好了口子）；deniald Dart 引擎
+   `frames=0`（skia/Impeller raster 层，独立问题）。

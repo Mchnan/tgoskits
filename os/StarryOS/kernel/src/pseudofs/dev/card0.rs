@@ -203,6 +203,7 @@ use super::drm::{
     DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
     DRM_IOCTL_SYNCOBJ_QUERY,
     DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+    DRM_IOCTL_SYNCOBJ_EVENTFD,
     DRM_CAP_SYNCOBJ,
     DRM_CAP_SYNCOBJ_TIMELINE,
     VIRTGPU_DRM_CAPSET_VENUS,
@@ -1258,6 +1259,9 @@ impl Card0File {
             DRM_IOCTL_SYNCOBJ_QUERY => card.vgpu.handle_syncobj_query(self.file_id, current, arg),
             DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL => {
                 card.vgpu.handle_syncobj_timeline_signal(self.file_id, current, arg)
+            }
+            DRM_IOCTL_SYNCOBJ_EVENTFD => {
+                card.vgpu.handle_syncobj_eventfd(self.file_id, current, arg)
             }
             // Sync_file export/import of a syncobj stays unsupported (as in
             // Linux drivers without in-fence export): venus uses the

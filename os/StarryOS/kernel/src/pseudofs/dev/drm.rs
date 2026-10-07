@@ -670,6 +670,9 @@ pub const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: u32 = iowr::<DrmSyncobjTimelineWait>(
 pub const DRM_IOCTL_SYNCOBJ_QUERY: u32 = iowr::<DrmSyncobjTimelineArray>(DRM_TYPE, 0xCB);
 pub const DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL: u32 =
     iowr::<DrmSyncobjTimelineArray>(DRM_TYPE, 0xCD);
+/// Registers an eventfd on a syncobj point (v6.7 UAPI). Mesa's sync
+/// provider (util_sync_provider_drm) uses this as its completion wakeup.
+pub const DRM_IOCTL_SYNCOBJ_EVENTFD: u32 = iowr::<DrmSyncobjEventfd>(DRM_TYPE, 0xCF);
 
 // ---- GETPARAM parameter IDs (VIRTGPU_PARAM_*) ----
 
@@ -1144,12 +1147,31 @@ pub struct DrmSyncobjTimelineWait {
     pub deadlines_nsec: u64,
 }
 
+/// Registers an eventfd to be signalled when a syncobj point completes.
+/// Linux: `struct drm_syncobj_eventfd` (24 bytes, v6.7 UAPI).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmSyncobjEventfd {
+    pub handle: u32,
+    /// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE` waits for a fence to become
+    /// available rather than for the point to signal.
+    pub flags: u32,
+    /// Timeline point (0 for binary syncobjs).
+    pub point: u64,
+    /// Existing eventfd to signal.
+    pub fd: i32,
+    pub pad: u32,
+}
+
 /// `DRM_SYNCOBJ_CREATE_SIGNALED`: create the syncobj in the signaled state.
 pub const DRM_SYNCOBJ_CREATE_SIGNALED: u32 = 1 << 0;
 /// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL`: wait for every handle, not any one.
 pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
 /// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT`: allow waiting on a future point.
 pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 1 << 1;
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE`: wait for a fence to become
+/// available at the point rather than for the point to signal.
+pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 1 << 2;
 
 #[cfg(all(test, not(axtest), feature = "rknpu"))]
 mod tests {
