@@ -161,3 +161,67 @@
    即推进，两端都不等 Metal 完成——上一轮 §9.11 的账，本轮的 EVENTFD
    唤醒链为未来接入真实 retire 事件留好了口子）；deniald Dart 引擎
    `frames=0`（skia/Impeller raster 层，独立问题）。
+
+## zink 加速推进补记（2026-10-08，第三轮）
+
+目标「加速桌面到 60Hz」的内核侧路径在本轮打通到 Flutter output pools
+导入，剩余阻塞收敛到 deniald 用户态。
+
+**内核四组增量（9 文件 +288/−20）**：
+
+1. **legacy `DRM_IOCTL_MODE_ADDFB`（0xAE，28B `drm_mode_fb_cmd`）**。
+   zink 分配的 gbm buffer 让 smithay 走 legacy ADDFB 入口，此前只有
+   ADDFB2，命令字 0xc01c64ae 落 unsupported 返回 ENOTSUP(95) 直接打死
+   deniald。实现为 28B 结构到 ADDFB2 核心的合成（bpp/depth 映射到
+   fourcc，未知组合按 Linux 语义 EINVAL），`add_fb2_core` 与两条入口
+   共用一套注册路径；命令字有单元断言。
+2. **PRIME 跨 fd 导入别名（Linux per-fd 句柄语义）**。`PRIME_FD_TO_
+   HANDLE` 此前把创建者的 bo_handle 原样返回给导入方，而 vgpu 资源表按
+   `owner`（file_id）过滤，跨 fd 导入必落「no backing」EINVAL。现改为
+   在导入方名下克隆资源条目（同宿主资源、同 BAR 窗口、新 GEM 句柄，
+   `imported` 标记），GEM_CLOSE/close_fd 对导入条目只释放本地引用、
+   不 unmap 宿主 BAR 槽不 unref 宿主资源——与 Linux dma-buf 导入引用
+   语义一致（perbuf-dumb "handle is private to one open file
+   description" 正是这条语义）。
+3. **`SYNCOBJ_HANDLE_TO_FD` sync file 导出/导入**。zink 的 EGL
+   native-fence 路径经 mesa venus 用 **24 字节（带 timeline point 的
+   `drm_syncobj_handle`）** 导出 sync file（0xc01864c1），旧 16B 结构
+   因 ioctl 号编码结构大小而根本路由不进；无此导出时 deniald 的
+   output-pool buffer 生命周期失去 fence，present 目标耗尽、屏幕全黑。
+   实现于 vgpu syncobj：已到点导出立即 signaled，未来点登记
+   `SyncobjState.sync_files`、水位推进时统一 `mark_signaled`；
+   `FD_TO_HANDLE` 支持已 signaled 的导出文件导入（pending 文件按
+   Linux 无异步完成路径的语义拒绝）。
+4. **栈环境考古**：QEMU 宿主侧需要 `qstart-alpine.sh` 的三件套
+   （`VK_DRIVER_FILES`/`VK_ICD_FILENAMES` 指向 MoltenVK ICD、
+   `DYLD_LIBRARY_PATH=/opt/homebrew/lib:.../prefix/lib`），否则
+   virgl_render_server `dlopen(libMoltenVK.dylib)` 失败，guest 侧
+   venus 一律 VK_ERROR_OUT_OF_HOST_MEMORY——vkprobe/deniald 全灭。
+   guest 侧需要上一轮 venus 分支脚本集（venus-stack/mirror/
+   start-denial-zink*.sh）里的 `MESA_GLES_VERSION_OVERRIDE=3.2`、
+   `GALLIUM_DRIVER=zink`+`MESA_LOADER_DRIVER_OVERRIDE=zink` 双开关、
+   `/root/.drirc` 的 `venus_implicit_fencing=true`。
+
+**验证**：vkprobe 21 步 PASS；DRM 四用例干净 guest 直跑 265/0
+（modeset 85/0、atomic 125/0、version 14/0、perbuf-dumb 41/0，
+modeset 复跑一致）——三组 UAPI 增量对 dev card0 语义零回归；
+clippy aarch64 18/18、fmt 干净（loongarch/riscv 仍是 lwprintf 需
+Linux gcc 的已知环境缺口）。
+
+**zink 桌面推进与剩余阻塞**：`GL Renderer: "zink Vulkan 1.4
+(Virtio-GPU Venus (Apple M4) (MOLTENVK))"` 全部四个 GLES 3.2 上下文
+（compositor/screencopy/Flutter raster/resource）创建成功，
+linux-dmabuf v4 + native fence 上线，Flutter output pools（buffers=3）
+成功导入 Flutter EGL 上下文——**这是 dev card0 内核上加速桌面第一次
+走到这一步**。剩余阻塞全部在 deniald 用户态：(1) shell 子进程在
+VA:0x15c SIGSEGV（llvmpipe 时期同形态，非本轮引入，但 zink 下死得更
+早，`render_requests` 恒 0）；(2) output target unavailable，池状态
+`[(Free,1),(Rendering,0),(Free,0)]` 有一个 buffer 卡 Rendering；
+(3) 屏幕未出画，60Hz 帧率无法测量。Impeller 路径另有
+`GL_FRAMEBUFFER_UNSUPPORTED`（status 0x8CD6，Apple GPU/MoltenVK 不支持
+D24_UNORM_S8_UINT——宿主直查 `vkGetPhysicalDeviceFormatProperties`
+为 0——Impeller stencil 附加失败）；`--flutter-offscreen-blit` 模式被
+gbm modifier=Invalid 卡住（`gbm_bo_create_with_modifiers2` 在本栈
+EINVAL）；`--flutter-renderer skia` 模式走通 pools 导入后死于上述
+shell 子进程崩溃。下一手是 deniald 侧：mini-strace/ptrace 取
+0x15c 崩溃栈，以及排查 Rendering 池 buffer 的 fence 释放路径。

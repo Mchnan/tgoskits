@@ -30,7 +30,7 @@ pub(super) mod pwm;
 #[cfg(feature = "rga")]
 pub(crate) mod rga;
 mod rtc;
-mod sync_file;
+pub(crate) mod sync_file;
 pub(crate) mod vgpu;
 #[cfg(feature = "sg2002")]
 pub mod tpu;

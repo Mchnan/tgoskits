@@ -252,6 +252,11 @@ pub const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = iowr::<DrmModeDestroyDumb>(DRM_TYPE
 pub const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = iowr::<DrmModeGetPlaneRes>(DRM_TYPE, 0xB5);
 pub const DRM_IOCTL_MODE_GETPLANE: u32 = iowr::<DrmModeGetPlane>(DRM_TYPE, 0xB6);
 pub const DRM_IOCTL_MODE_ADDFB2: u32 = iowr::<DrmModeFbCmd2>(DRM_TYPE, 0xB8);
+/// Legacy single-plane ADDFB (`struct drm_mode_fb_cmd`, 28 bytes). GBM
+/// userspaces still reach for it when handing modifier-less buffers to
+/// the compositor, so it must decode with the legacy 28-byte size even
+/// though `ADDFB2` carries the same semantics.
+pub const DRM_IOCTL_MODE_ADDFB: u32 = iowr::<DrmModeFbCmd>(DRM_TYPE, 0xAE);
 pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = iowr::<DrmModeObjGetProperties>(DRM_TYPE, 0xB9);
 pub const DRM_IOCTL_MODE_ATOMIC: u32 = iowr::<DrmModeAtomic>(DRM_TYPE, 0xBC);
 pub const DRM_IOCTL_MODE_CREATEPROPBLOB: u32 = iowr::<DrmModeCreateBlob>(DRM_TYPE, 0xBD);
@@ -377,6 +382,23 @@ pub struct DrmModeFbCmd2 {
     /// Explicit ABI alignment bytes before the modifier array.
     pub _padding: u32,
     pub modifier: [u64; 4],
+}
+
+/// Linux's `struct drm_mode_fb_cmd` — legacy ADDFB payload. The field
+/// order differs from [`DrmModeFbCmd2`]: `bpp`/`depth` replace the
+/// fourcc, and `handle`/`pitch` are scalars instead of per-plane arrays.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmModeFbCmd {
+    /// Out: the new framebuffer id.
+    pub fb_id: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Row stride in bytes.
+    pub pitch: u32,
+    pub bpp: u32,
+    pub depth: u32,
+    pub handle: u32,
 }
 
 #[repr(C)]
@@ -1084,7 +1106,10 @@ pub struct DrmSyncobjDestroy {
 }
 
 /// Exports/imports a syncobj as a sync_file fd.
-/// Linux: `struct drm_syncobj_handle` (16 bytes)
+/// `struct drm_syncobj_handle` as the userspace headers define it for this
+/// stack: 24 bytes, with a trailing timeline point (the new-style
+/// handle-to-fd export carries the point to export at; 0 means the binary
+/// view of the syncobj).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmSyncobjHandle {
@@ -1092,6 +1117,7 @@ pub struct DrmSyncobjHandle {
     pub flags: u32,
     pub fd: i32,
     pub pad: u32,
+    pub point: u64,
 }
 
 /// Waits on binary syncobjs. Linux: `struct drm_syncobj_wait` (32 bytes)
@@ -1185,6 +1211,28 @@ mod tests {
         assert_eq!(ioctl_nr(DRM_IOCTL_GET_UNIQUE), 0x01);
         assert_eq!(ioctl_nr(DRM_IOCTL_PRIME_HANDLE_TO_FD), 0x2d);
         assert_eq!(ioctl_nr(DRM_IOCTL_MODE_GETRESOURCES), 0xA0);
+    }
+
+    #[test]
+    fn legacy_addfb_matches_linux_command_word() {
+        // GBM userspaces issue the legacy ADDFB with the 28-byte
+        // `drm_mode_fb_cmd`; the packed command must be the exact word
+        // observed on real clients, or the dispatch never sees it.
+        assert_eq!(DRM_IOCTL_MODE_ADDFB, 0xc01c_64ae);
+        assert_eq!(
+            io_size(DRM_IOCTL_MODE_ADDFB),
+            core::mem::size_of::<DrmModeFbCmd>() as u32
+        );
+        assert_eq!(core::mem::size_of::<DrmModeFbCmd>(), 28);
+    }
+
+    #[test]
+    fn syncobj_handle_to_fd_matches_userspace_command_word() {
+        // Mesa's EGL native-fence path exports syncobjs with the 24-byte
+        // (point-carrying) `drm_syncobj_handle`; the size is part of the
+        // command word, so a 16-byte struct silently misses the dispatch.
+        assert_eq!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, 0xc018_64c1);
+        assert_eq!(core::mem::size_of::<DrmSyncobjHandle>(), 24);
     }
 
     #[test]

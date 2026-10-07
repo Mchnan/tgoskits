@@ -69,6 +69,7 @@ use super::drm::{
     DRM_IOCTL_GET_CAP,
     DRM_IOCTL_GET_MAGIC,
     DRM_IOCTL_GET_UNIQUE,
+    DRM_IOCTL_MODE_ADDFB,
     DRM_IOCTL_MODE_ADDFB2,
     DRM_IOCTL_MODE_ATOMIC,
     DRM_IOCTL_MODE_CREATE_DUMB,
@@ -145,6 +146,7 @@ use super::drm::{
     DrmModeDestroyBlob,
     DrmModeDestroyDumb,
     DrmModeDirtyFB,
+    DrmModeFbCmd,
     DrmModeFbCmd2,
     DrmModeGetBlob,
     DrmModeGetConnector,
@@ -1143,6 +1145,7 @@ impl Card0File {
             DRM_IOCTL_MODE_SETCRTC => card.handle_set_crtc(current, arg),
             DRM_IOCTL_MODE_GETENCODER => handle_get_encoder(current, arg),
             DRM_IOCTL_MODE_GETCONNECTOR => handle_get_connector(current, arg),
+            DRM_IOCTL_MODE_ADDFB => card.handle_addfb(self, current, arg),
             DRM_IOCTL_MODE_ADDFB2 => card.handle_addfb2(self, current, arg),
             DRM_IOCTL_MODE_RMFB => card.handle_rmfb(self, current, arg),
             DRM_IOCTL_MODE_CREATE_DUMB => card.handle_create_dumb(self, current, arg),
@@ -1181,7 +1184,7 @@ impl Card0File {
                 }
             }
             DRM_IOCTL_PRIME_FD_TO_HANDLE => {
-                match card.vgpu.handle_prime_fd_to_handle(current, arg) {
+                match card.vgpu.handle_prime_fd_to_handle(self.file_id, current, arg) {
                     Some(result) => result,
                     None => card.handle_prime_fd_to_handle(self, current, arg),
                 }
@@ -1263,13 +1266,21 @@ impl Card0File {
             DRM_IOCTL_SYNCOBJ_EVENTFD => {
                 card.vgpu.handle_syncobj_eventfd(self.file_id, current, arg)
             }
-            // Sync_file export/import of a syncobj stays unsupported (as in
-            // Linux drivers without in-fence export): venus uses the
-            // timeline path exclusively, so keep the requests explicitly
-            // ENOSYS instead of letting them fall into the generic
-            // unsupported-ioctl arm.
-            DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD | DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => {
-                Err(VfsError::OperationNotSupported)
+            // Sync_file export/import of a syncobj drives the EGL
+            // native-fence path (mesa's zink/venus exports per-frame
+            // completion to release output-pool buffers); without it the
+            // desktop pipeline exhausts its present targets.
+            DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD => {
+                match card.vgpu.handle_syncobj_handle_to_fd(self.file_id, current, arg) {
+                    Some(result) => result,
+                    None => Err(VfsError::OperationNotSupported),
+                }
+            }
+            DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => {
+                match card.vgpu.handle_syncobj_fd_to_handle(self.file_id, current, arg) {
+                    Some(result) => result,
+                    None => Err(VfsError::OperationNotSupported),
+                }
             }
 
             _ => {
@@ -2362,6 +2373,45 @@ fn handle_get_connector(current: &crate::task::UserTaskRef, arg: usize) -> VfsRe
 }
 
 impl Card0 {
+    /// Legacy `DRM_IOCTL_MODE_ADDFB`: translate the 28-byte
+    /// `drm_mode_fb_cmd` (bpp/depth instead of a fourcc) into the ADDFB2
+    /// core, so modifier-less single-plane GBM buffers (mesa's zink
+    /// allocations reach for the legacy entry) share one registration
+    /// path with `ADDFB2`.
+    fn handle_addfb(
+        &self,
+        file: &Card0File,
+        current: &UserTaskRef,
+        arg: usize,
+    ) -> VfsResult<usize> {
+        let ptr = arg as *mut DrmModeFbCmd;
+        let mut legacy: DrmModeFbCmd = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
+        let pixel_format =
+            bpp_depth_to_format(legacy.bpp, legacy.depth).ok_or_else(|| {
+                warn!(
+                    "ADDFB(legacy): unmapped bpp {} depth {}",
+                    legacy.bpp, legacy.depth
+                );
+                VfsError::InvalidInput
+            })?;
+        let mut f = DrmModeFbCmd2 {
+            fb_id: 0,
+            width: legacy.width,
+            height: legacy.height,
+            pixel_format,
+            flags: 0,
+            handles: [legacy.handle, 0, 0, 0],
+            pitches: [legacy.pitch, 0, 0, 0],
+            offsets: [0; 4],
+            _padding: 0,
+            modifier: [0; 4],
+        };
+        self.add_fb2_core(file, &mut f)?;
+        legacy.fb_id = f.fb_id;
+        ptr.vm_write(current, legacy).map_err(|_| VfsError::BadAddress)?;
+        Ok(0)
+    }
+
     fn handle_addfb2(
         &self,
         file: &Card0File,
@@ -2370,6 +2420,12 @@ impl Card0 {
     ) -> VfsResult<usize> {
         let ptr = arg as *mut DrmModeFbCmd2;
         let mut f: DrmModeFbCmd2 = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
+        self.add_fb2_core(file, &mut f)?;
+        ptr.vm_write(current, f).map_err(|_| VfsError::BadAddress)?;
+        Ok(0)
+    }
+
+    fn add_fb2_core(&self, file: &Card0File, f: &mut DrmModeFbCmd2) -> VfsResult<()> {
         let handle = f.handles[0];
         // Resolve the backing kind + capacity under the resource/dumb
         // locks so a concurrent DESTROY_DUMB can't race the fb's
@@ -2408,6 +2464,10 @@ impl Card0 {
                     .get(&handle)
                     .filter(|buffer| buffer.owner == file.file_id)
                 else {
+                    warn!(
+                        "ADDFB: no backing for handle {} (file {})",
+                        handle, file.file_id
+                    );
                     return Err(VfsError::InvalidInput);
                 };
                 if let Some(resource) = &buffer.resource {
@@ -2439,14 +2499,14 @@ impl Card0 {
         let bpp = match fb_pixel_format {
             DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 => 32u32,
             _ => {
-                warn!("ADDFB2: unsupported pixel_format {:#x}", fb_pixel_format);
+                warn!("ADDFB: unsupported pixel_format {:#x}", fb_pixel_format);
                 return Err(VfsError::InvalidInput);
             }
         };
         let visible_bytes = fb_width * (bpp / 8);
         if fb_stride < visible_bytes {
             warn!(
-                "ADDFB2: stride {} < visible bytes {} ({}bpp, {}px)",
+                "ADDFB: stride {} < visible bytes {} ({}bpp, {}px)",
                 fb_stride, visible_bytes, bpp, fb_width
             );
             return Err(VfsError::InvalidInput);
@@ -2458,7 +2518,7 @@ impl Card0 {
         // skip the capacity check there.
         if matches!(&kind, FbBacking::Dumb { .. }) && size < fb_total {
             warn!(
-                "ADDFB2: buffer size {} < fb_total {} ({}stride × {}height)",
+                "ADDFB: buffer size {} < fb_total {} ({}stride × {}height)",
                 size, fb_total, fb_stride, fb_height
             );
             return Err(VfsError::InvalidInput);
@@ -2470,6 +2530,7 @@ impl Card0 {
                 }
                 let m = f.modifier[i];
                 if m != DRM_FORMAT_MOD_LINEAR && m != DRM_FORMAT_MOD_INVALID {
+                    warn!("ADDFB: rejected modifier {:#x} on plane {}", m, i);
                     return Err(VfsError::InvalidInput);
                 }
             }
@@ -2485,9 +2546,8 @@ impl Card0 {
             kind,
         };
         f.fb_id = fb_id;
-        ptr.vm_write(current, f).map_err(|_| VfsError::BadAddress)?;
         self.fbs.lock().insert(fb_id, framebuffer);
-        Ok(0)
+        Ok(())
     }
 
     fn handle_rmfb(&self, file: &Card0File, current: &UserTaskRef, arg: usize) -> VfsResult<usize> {
@@ -2511,6 +2571,17 @@ impl Card0 {
             *state = ModesetState::default();
         }
         Ok(0)
+    }
+}
+
+/// Linux's `drm_get_format_from_bpp_depth`, restricted to the fourccs
+/// card0 accepts: legacy ADDFB callers speak bpp+depth instead of a
+/// fourcc, so unknown combos fail with `EINVAL` just like Linux.
+fn bpp_depth_to_format(bpp: u32, depth: u32) -> Option<u32> {
+    match (bpp, depth) {
+        (32, 24) => Some(DRM_FORMAT_XRGB8888),
+        (32, 32) => Some(DRM_FORMAT_ARGB8888),
+        _ => None,
     }
 }
 

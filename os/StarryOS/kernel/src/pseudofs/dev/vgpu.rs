@@ -39,7 +39,8 @@ use super::drm::{
     DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DRM_SYNCOBJ_CREATE_SIGNALED,
     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, DrmGemClose, DrmPrimeHandle, DrmSyncobjArray,
-    DrmSyncobjCreate, DrmSyncobjDestroy, DrmSyncobjEventfd, DrmSyncobjTimelineArray,
+    DrmSyncobjCreate, DrmSyncobjDestroy, DrmSyncobjEventfd, DrmSyncobjHandle,
+    DrmSyncobjTimelineArray,
     DrmSyncobjTimelineWait, DrmSyncobjWait, DrmVirtgpuExecbuffer, DrmVirtgpuExecbufferSyncobj,
     DrmVirtgpuGetCaps, DrmVirtgpuGetparam, DrmVirtgpuMap, DrmVirtgpuResourceCreateBlob,
     DrmVirtgpuResourceInfo, DRM_VIRTGPU_BLOB_FLAG_HINT_DEFER_MAPPING, VIRTGPU_BLOB_FLAG_USE_MASK,
@@ -54,6 +55,7 @@ use crate::{
     file::{FileLike, Kstat, add_file_like, dma_buf_seek, get_file_like},
     mm::{vm_load, vm_write_slice},
     pseudofs::DeviceMmap,
+    pseudofs::dev::sync_file::SyncFile,
     sync::Mutex,
     task::{UserTaskRef, yield_now},
 };
@@ -102,6 +104,7 @@ const BAR_SLOT_ALIGN: u64 = 0x4000;
 const FIRST_VGPU_HANDLE: u32 = 0x0100_0000;
 
 /// A blob resource's host-visible mapping.
+#[derive(Clone, Copy)]
 struct BlobMapping {
     /// Guest-physical start of the mapping (hostmem base + bar_offset).
     phys: u64,
@@ -112,13 +115,19 @@ struct BlobMapping {
     map_info: u32,
 }
 
-/// A blob resource created through the venus face.
+/// A blob resource created through the venus face. One host resource may
+/// be visible under several GEM handles: the creator's own handle and one
+/// clone per `PRIME_FD_TO_HANDLE` import (Linux gives each open file
+/// description its own handle namespace, so an import gets a fresh handle
+/// pointing at the same object). Import clones share the BAR window but
+/// release it only through the creator's entry — `imported` marks which.
 struct VgpuResource {
     owner: u64,
     res_handle: u32,
     size: u64,
     blob_mem: u32,
     map: Option<BlobMapping>,
+    imported: bool,
 }
 
 /// v1 syncobjs are pure timelines (the only form venus exercises); binary
@@ -130,6 +139,10 @@ struct SyncobjState {
     /// Eventfds registered via `DRM_IOCTL_SYNCOBJ_EVENTFD`, with the point
     /// each waits for. Drained by `wake_syncobj_eventfds`.
     eventfds: Vec<(u64, Arc<crate::file::event::EventFd>)>,
+    /// Sync-file exports registered via `DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD`,
+    /// each with the point it represents. A future point fires when the
+    /// watermark passes it; an already-reached point exports signaled.
+    sync_files: Vec<(u64, Arc<SyncFile>)>,
 }
 
 /// Per-open-file venus rendering context (CONTEXT_INIT).
@@ -215,6 +228,8 @@ impl Vgpu {
             .lock()
             .retain(|&(fd_owner, _), _| fd_owner != owner);
         // Drop the fd's blob resources: unmap and unref them on the host.
+        // Imported clones only release the local reference — the host
+        // resource and its BAR slot belong to the creator's entry.
         let mut resources = self.resources.lock();
         let owned: Vec<u32> = resources
             .iter()
@@ -224,6 +239,9 @@ impl Vgpu {
         if let Some(dev) = dev.as_ref() {
             for handle in &owned {
                 let res = resources.get(handle).unwrap();
+                if res.imported {
+                    continue;
+                }
                 if res.map.is_some() {
                     let _ = dev.unmap_blob(res.res_handle);
                 }
@@ -469,6 +487,7 @@ impl Vgpu {
                 size: args.size,
                 blob_mem: args.blob_mem,
                 map,
+                imported: false,
             },
         );
 
@@ -535,10 +554,16 @@ impl Vgpu {
             resources
                 .get(&args.handle)
                 .filter(|res| res.owner == owner)
-                .map(|res| (res.res_handle, res.map.is_some()))
+                .map(|res| (res.res_handle, res.map.is_some(), res.imported))
         }?;
-        let (res_handle, mapped) = removed;
+        let (res_handle, mapped, imported) = removed;
         self.resources.lock().remove(&args.handle);
+        // An imported clone only ever held a local reference to the blob
+        // (Linux: the import side drops its dma-buf reference); touching
+        // the host resource here would kill the creator's BAR slot.
+        if imported {
+            return Some(Ok(0));
+        }
         if let Ok(dev) = self.dev() {
             if mapped {
                 let _ = dev.unmap_blob(res_handle);
@@ -683,6 +708,7 @@ impl Vgpu {
 
         let syncobjs = self.syncobjs.lock();
         let mut woken: Vec<Arc<crate::file::event::EventFd>> = Vec::new();
+        let mut woken_files: Vec<Arc<SyncFile>> = Vec::new();
         for (handle, point) in out_syncobjs {
             let Some(state) = syncobjs.get(&(owner, handle)).cloned() else {
                 return Err(VfsError::NotFound);
@@ -697,10 +723,21 @@ impl Vgpu {
                     i += 1;
                 }
             }
+            let mut j = 0;
+            while j < state.sync_files.len() {
+                if state.signaled_point >= state.sync_files[j].0 {
+                    woken_files.push(state.sync_files.swap_remove(j).1);
+                } else {
+                    j += 1;
+                }
+            }
         }
         drop(syncobjs);
         // Signal outside the syncobj table lock.
         self.signal_eventfds(&woken);
+        for file in woken_files {
+            file.mark_signaled();
+        }
         Ok(0)
     }
 
@@ -749,16 +786,44 @@ impl Vgpu {
     /// [`Self::handle_prime_handle_to_fd`] (possibly after SCM_RIGHTS
     /// sharing) back to its GEM handle. `None` when the fd is not one of
     /// ours, so card0 can try its own import paths.
+    ///
+    /// GEM handles are private to one open file description: importing
+    /// into a different fd must hand back a handle valid *there*, so a
+    /// cross-fd import clones the resource entry under the importing
+    /// file's ownership (same host resource, same BAR window). The clone
+    /// is marked `imported` — it releases only the local reference; the
+    /// host resource and its BAR slot die with the creator's entry.
     pub(crate) fn handle_prime_fd_to_handle(
         &self,
+        owner: u64,
         current: &UserTaskRef,
         arg: usize,
     ) -> Option<VfsResult<usize>> {
         let args: DrmPrimeHandle = load_arg(current, arg).ok()?;
         let file = get_file_like(args.fd).ok()?;
         let blob = file.downcast_arc::<VgpuBlobFd>().ok()?;
+
+        let mut resources = self.resources.lock();
+        let source = resources.get(&blob.bo_handle)?;
+        let handle = if source.owner == owner {
+            // Same file description — the handle is already valid here.
+            blob.bo_handle
+        } else {
+            let alias = VgpuResource {
+                owner,
+                res_handle: source.res_handle,
+                size: source.size,
+                blob_mem: source.blob_mem,
+                map: source.map,
+                imported: true,
+            };
+            let bo_handle = self.next_bo_handle.fetch_add(1, Ordering::Relaxed);
+            resources.insert(bo_handle, alias);
+            bo_handle
+        };
+        drop(resources);
         let out = DrmPrimeHandle {
-            handle: blob.bo_handle,
+            handle,
             ..args
         };
         Some(store_arg(current, arg, &out).map(|_| 0))
@@ -838,6 +903,7 @@ impl Vgpu {
             Arc::new(Mutex::new(SyncobjState {
                 signaled_point: u64::from(args.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0),
                 eventfds: Vec::new(),
+                sync_files: Vec::new(),
             })),
         );
         store_arg(current, arg, &DrmSyncobjCreate {
@@ -996,6 +1062,7 @@ impl Vgpu {
     /// syncobj's `signaled_point`.
     fn wake_syncobj_eventfds(&self, owner: u64, handles: &[u32]) {
         let mut woken: Vec<Arc<crate::file::event::EventFd>> = Vec::new();
+        let mut woken_files: Vec<Arc<SyncFile>> = Vec::new();
         {
             let table = self.syncobjs.lock();
             for &handle in handles {
@@ -1013,11 +1080,93 @@ impl Vgpu {
                         i += 1;
                     }
                 }
+                let mut j = 0;
+                while j < state.sync_files.len() {
+                    let (point, file) = &state.sync_files[j];
+                    if state.signaled_point >= *point {
+                        woken_files.push(file.clone());
+                        state.sync_files.swap_remove(j);
+                    } else {
+                        j += 1;
+                    }
+                }
             }
         }
         // Signal outside the syncobj lock: signal_kernel takes the
         // eventfd's own state and wakes pollers.
         self.signal_eventfds(&woken);
+        for file in woken_files {
+            file.mark_signaled();
+        }
+    }
+
+    /// `DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD`: exports the syncobj's fence as a
+    /// sync_file fd — the EGL native-fence path (mesa's zink/venus exports
+    /// per-frame completion this way to drive the output-pool buffer
+    /// lifecycle). With v1's immediate signaling an already-reached point
+    /// exports signaled; a future point fires when a submit pushes the
+    /// watermark past it.
+    pub(crate) fn handle_syncobj_handle_to_fd(
+        &self,
+        owner: u64,
+        current: &UserTaskRef,
+        arg: usize,
+    ) -> Option<VfsResult<usize>> {
+        const EXPORT_SYNC_FILE: u32 = 1;
+        let args: DrmSyncobjHandle = load_arg(current, arg).ok()?;
+        if args.flags & !EXPORT_SYNC_FILE != 0 {
+            return Some(Err(VfsError::InvalidInput));
+        }
+        let state = self
+            .syncobjs
+            .lock()
+            .get(&(owner, args.handle))
+            .cloned()?;
+        let file = Arc::new(SyncFile::new());
+        {
+            let mut state = state.lock();
+            if state.signaled_point >= args.point {
+                file.mark_signaled();
+            } else {
+                state.sync_files.push((args.point, file.clone()));
+            }
+        }
+        let fd = match add_file_like(file, true) {
+            Ok(fd) => fd,
+            Err(_) => return Some(Err(VfsError::Io)),
+        };
+        let out = DrmSyncobjHandle { fd, ..args };
+        Some(store_arg(current, arg, &out).map(|_| 0))
+    }
+
+    /// `DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE`: imports a sync_file fd — the other
+    /// half of the native-fence round trip. Only files this kernel exported
+    /// are honored: an already-signaled file turns into the binary-signaled
+    /// syncobj view; a still-pending file has no async completion path here
+    /// and is rejected rather than left silently stuck.
+    pub(crate) fn handle_syncobj_fd_to_handle(
+        &self,
+        owner: u64,
+        current: &UserTaskRef,
+        arg: usize,
+    ) -> Option<VfsResult<usize>> {
+        let args: DrmSyncobjHandle = load_arg(current, arg).ok()?;
+        let file = get_file_like(args.fd).ok()?;
+        let file = file.downcast_arc::<SyncFile>().ok()?;
+        if !file.is_signaled() {
+            return Some(Err(VfsError::InvalidInput));
+        }
+        let handle = self.next_syncobj_handle();
+        self.syncobjs.lock().insert(
+            (owner, handle),
+            Arc::new(Mutex::new(SyncobjState {
+                signaled_point: 1,
+                eventfds: Vec::new(),
+                sync_files: Vec::new(),
+            })),
+        );
+        let out = DrmSyncobjHandle { handle, ..args };
+        Some(store_arg(current, arg, &out).map(|_| 0))
     }
 
     pub(crate) fn handle_syncobj_timeline_wait(
