@@ -225,3 +225,36 @@ gbm modifier=Invalid 卡住（`gbm_bo_create_with_modifiers2` 在本栈
 EINVAL）；`--flutter-renderer skia` 模式走通 pools 导入后死于上述
 shell 子进程崩溃。下一手是 deniald 侧：mini-strace/ptrace 取
 0x15c 崩溃栈，以及排查 Rendering 池 buffer 的 fence 释放路径。
+
+## 引擎 present 跳过根因闭合（2026-10-08，第五轮，denial 源码到位）
+
+用户指认 deniald 源码在 `~/denial`（main@85b2303，工作树带本地诊断仪表与
+open_gl.rs 软件 fence 兜底）；tgoskits 其他分支（local/venus-dev-0923）的
+AGENTS.md §3 含 9-24 时代的完整调试记忆。基于源码把黑屏根因闭合：
+
+1. **输出槽状态机**（`output_pipeline.rs`）：`Free→Rendering→Ready→Pending
+   →Free`；`target_available()` 要求授权空闲 + **全部 slot Free** + 存在
+   `output_refs==0` 的 Free——单个卡 Rendering 的 slot 即永久断供；
+   `mark_ready` 盖当前事务号，`finish_transaction`（raster_idle 哨兵）只收
+   集戳号相等者；`begin_transaction` 只回收 Rendering+无引用。
+2. **volition-kms 的 futex 停等是正常空闲**：它是 sync_channel 作业
+   worker，`recv()` 阻塞属预期——9-24 记忆「volition-kms 卡 futex」的
+   死锁结论修正为「空闲误读」；判定基准是 llvmpipe 对照。
+3. **实测定锤**：`output target authorized: 12`（授权在发）、
+   `present_callback_avg_us=0.0`（llvmpipe 790µs——引擎从未调用 root
+   present）、一次 `nested Flutter output presentation`（ext-view 在
+   pending 未消费时再触发→返回 false→引擎放弃出帧）、槽稳态
+   `(Rendering,0)`（每 tick 重授权重 acquire、present 永不来）、
+   mark_ready 零失败、fence 导出全部 signaled、真实 ATOMIC 成功。
+   **deniald 状态机与内核 UAPI 全部正常；断点在引擎内部：ext-view 之后、
+   present-with-info 之前被跳过。**
+4. **待验证假设**：引擎在 zink 上的 FBO/外部纹理校验静默失败（与 Impeller
+   的 `GL_FRAMEBUFFER_UNSUPPORTED` 同族——MoltenVK/Apple M4 无
+   D24_UNORM_S8_UINT，Impeller stencil 附加失败的 skia 静默版），使引擎
+   丢弃帧而不调 present。验证需 instrument Flutter fork 的
+   present-with-info 路径——fork 在 Linux 构建机
+   `/mnt/exty/denial-flutter-fork-3.44.7`，本机不可达；远端验证主机
+   192.168.1.18/.183 可作部署目标。
+5. **60Hz 结论**：llvmpipe 4 线程 raster 实测 20–32ms/帧超 16.6ms 预算
+   （上限 <40fps），60Hz 必须 zink；调度节拍 60Hz、管线与内核链路均就绪，
+   引擎 present 链修复后立即可测。
