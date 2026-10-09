@@ -364,6 +364,7 @@ impl PciCapabilityLayout {
         Ok(matched)
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn intersects_effect(&self, config_offset: usize, size: usize) -> bool {
         let capability_start = usize::from(self.offset.value());
         let access_end = config_offset.saturating_add(size);
@@ -401,7 +402,7 @@ pub(crate) fn layout_capabilities(
             .ok_or(PciError::InvalidCapability {
                 detail: "capability placement overflows conventional config space".into(),
             })?;
-        if end > config_layout::CONFIG_SPACE_SIZE {
+        if end > config_layout::CONVENTIONAL_CONFIG_SPACE_SIZE {
             return Err(PciError::InvalidCapability {
                 detail: "capability declarations exceed conventional config space".into(),
             });

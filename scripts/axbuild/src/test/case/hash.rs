@@ -67,15 +67,19 @@ fn case_asset_cache_key_with_lookup(
                 "binutils-native-v1"
             },
         );
+        if matches!(pipeline, CasePipeline::C | CasePipeline::Grouped) {
+            for flag in spec.clang_target_flags {
+                hash_token(&mut hasher, flag);
+            }
+        }
     }
     for var in &config.cache_env_vars {
         hash_token(&mut hasher, var);
         hash_token(&mut hasher, std::env::var(var).unwrap_or_default().as_str());
     }
-    // Only the C pipeline uses the CMake toolchain template; include it in the
-    // key only when relevant so that changes to the template don't invalidate
-    // caches for unrelated pipelines.
-    if pipeline == CasePipeline::C {
+    // C and grouped-C pipelines use the CMake toolchain template. Keep it out
+    // of unrelated pipeline keys while invalidating every compiled C image.
+    if matches!(pipeline, CasePipeline::C | CasePipeline::Grouped) {
         hash_file(
             &mut hasher,
             &Path::new(env!("CARGO_MANIFEST_DIR")).join(CMAKE_TOOLCHAIN_TEMPLATE_PATH),
@@ -90,6 +94,10 @@ fn case_asset_cache_key_with_lookup(
     if pipeline == CasePipeline::Grouped {
         hash_grouped_execution(&mut hasher, &config.grouped_execution);
         hash_grouped_subcase_filter(&mut hasher, case.grouped_subcase_filter.as_ref());
+        if let Some(ltp_case_id) = case.ltp_case_id.as_deref() {
+            hash_token(&mut hasher, "ltp-case-select-v1");
+            hash_token(&mut hasher, ltp_case_id);
+        }
     }
 
     hash_rootfs_fingerprint(&mut hasher, shared_rootfs)?;

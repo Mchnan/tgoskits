@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use super::*;
 
 static TASK_SYSTEM: LazyInit<Pin<Box<TaskSystem>>> = LazyInit::new();
@@ -66,7 +68,10 @@ pub(crate) fn initialize_primary(cpu_id: usize) -> Result<(), TaskError> {
     // of leaving an independent hard-coded 10 ms balance deadline active.
     let config = TaskSystemConfig::new(ax_hal::cpu_num())
         .with_balance_interval_ns(crate::build_info::SCHEDULER_TICK_INTERVAL_NANOS);
-    let system = Box::pin(TaskSystem::new(config)?);
+    let capacities = (0..config.cpu_count())
+        .map(|cpu| ax_hal::topology::cpu_capacity(cpu).ok_or(TaskError::InvalidConfiguration))
+        .collect::<Result<Vec<_>, _>>()?;
+    let system = Box::pin(TaskSystem::new_with_cpu_capacities(config, &capacities)?);
     TASK_SYSTEM.init_once(system);
     let bootstrap = initialize_current_cpu(cpu_id)?;
     PRIMARY_BOOTSTRAP_THREAD.init_once(PrimaryBootstrapThread(bootstrap));
@@ -370,7 +375,9 @@ mod tests {
     #[test]
     fn scheduler_remote_handle_uses_pre_pin_current_cpu_area() {
         std::thread::spawn(|| {
-            const TEST_REMOTE_HANDLE: usize = 0x1000;
+            let system = TaskSystem::new(TaskSystemConfig::new(1)).unwrap();
+            let expected = system.runtime_cpu_remote_handle(CpuId::new(0));
+            assert!(!expected.is_none());
 
             ax_hal::percpu::initialize_host_test_cpu();
             // SAFETY: this fresh host thread models one offline, non-migrating
@@ -378,7 +385,7 @@ mod tests {
             unsafe {
                 with_current_cpu_pin(|pin| {
                     CPU_REMOTE_HANDLE.with_current(pin, |slot| {
-                        slot.call_once(|| TEST_REMOTE_HANDLE);
+                        slot.call_once(|| expected.into_raw());
                     });
                 })
             };
@@ -387,7 +394,7 @@ mod tests {
             // SAFETY: the modeled CPU cannot migrate, switch context, or take
             // interrupts for the complete observation.
             let handle = unsafe { scheduler_current_cpu_remote_handle() };
-            assert_eq!(handle.into_raw(), TEST_REMOTE_HANDLE);
+            assert_eq!(handle, expected);
             assert_eq!(
                 cpu_local::host_test::register_read_counts(),
                 cpu_local::host_test::RegisterReadCounts {

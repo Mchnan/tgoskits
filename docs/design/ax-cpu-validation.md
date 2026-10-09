@@ -73,12 +73,24 @@ cycle counter 只计入 EL0 执行，并触发真实溢出 PPI。回调断言 pr
 
 阶段一 MMU 配置也按本核 `ID_AA64MMFR0_EL1.PARange` 和当前描述符的 48-bit 上限选择 IPS/PS。旧 EL1 固定 48-bit 配置在 Cortex-A53 上被新用例确定性拒绝，调整后同一 `paging` 用例通过。
 
+### 4.4 无故障内核拷贝
+
+`user-entry/src/kernel_access.rs` 通过 `ax_cpu::kernel_access::copy_from_kernel_nofault` 验证三类结果：两个已映射区间整段拷贝成功且内容一致；源不可访问时不复制任何字节、目的地保持原内容并返回 `Fault`；目的地不可访问时同样返回 `Fault`。不可访问地址取位 63:57 不是位 56 符号扩展的地址：任何翻译宽度都不覆盖它，各架构据此产生各自的故障类别（AArch64 地址长度故障、LoongArch 访存地址错误、RISC-V 页错误），与当前页表映射了什么无关。AArch64 另做一次翻译故障探测，装入空用户页表使整个用户地址段无映射；空页表与 TTBR0 的保存恢复由该用例目录的 `empty_user_table.rs` 提供，`fixup.rs` 的既有缺页恢复断言改用同一守卫，两处共用一份窗口管理。
+
+2026-09-30 在四核 AArch64 QEMU 执行 `cpu` 组，9/9 通过；2026-10-01 补上 RISC-V 配置后执行四核 RISC-V QEMU `cpu` 组，7/7 通过。RISC-V 侧此前只覆盖拷贝的成功路径，这些断言只有在汇编恢复标签确实被跳到时才成立，恢复分支因此在 RISC-V 上也有运行证据。
+
+2026-10-02 补上 LoongArch 配置并改用上述地址后，该用例在 LoongArch 上确定性失败：非规范地址产生访存地址错误，而分派的致命路径之前没有查询 nofault 表（`Unhandled trap Exception(MemoryAccessAddressError) … BADV=0xfe00000000000000`）。为该例外与 AArch64 的同类例外各补一次查表后，四核 LoongArch QEMU 与四核 AArch64 QEMU 的该用例均通过，RISC-V 组保持 7/7。
+
+AArch64 的 QEMU 模型对同一地址给出的是 level-0 翻译故障（实测 ESR 的 ISS 低六位为 `0x04`），所以该架构修复前后都通过；按体系结构定义同一地址属于地址长度故障，与 LoongArch 一样落在致命路径上，两个架构的分派因此都补了查表。这些结果都不覆盖 x86_64 的 `#GP` 恢复分支，也不替代实体板卡执行。
+
 
 ## 5. 启动与映射生命周期补充
 
 x86 启动 IDT 在低地址映射下创建后不能直接用于已经移除该映射的运行期。ArceOS `paging` 真实 INT3 用例在这种复用下超时重启；改为当前映射构造、调用方持有的 `BootVectorTable` 后同一用例通过，日志 `ax-cpu-x86-boot-int3.log` 与 `ax-cpu-x86-boot-int3-2.log`。CR0、NXE、XSAVE、栈交接及 TSC_ADJUST 读取已集中到 CPU 功能入口，PIT 校准和 PIC 屏蔽仍由 someboot 管理。
 
 LoongArch `guest-entry` 增加相同 guest ID、相同根下的实际数据页替换，验证第二次进入读取新物理页。当前 LVZ 模拟器在原指令下也通过，因此本用例不能独立证明 INVTLB 的 guest-ID 选择域；该域按 Linux KVM 的 `INVTLB_ALLGID` 核对。实体 LVZ 仍是未验证环境。
+
+该用例还固定宿主 `ECFG` 的所有权：`bind` 前使能、`bind` 后屏蔽宿主 timer line，并在第一次真实同步退出与 `unbind` 之后都断言仍保持屏蔽。退出路径 `RESTORE_HOST_TRANSLATION` 与 `Vcpu::unbind` 只把宿主快照的 `ECFG.VS` 写回、保留实时 `LIE`，因此一次客户机往返不会撤销宿主设置的 IRQ 屏蔽；若整寄存器写回绑定期快照，屏蔽会被回滚，断言在旧实现上必然失败。
 
 ## 6. Starry 消费者授权回归
 

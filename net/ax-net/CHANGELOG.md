@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.6](https://github.com/rcore-os/tgoskits/compare/ax-net-v0.13.5...ax-net-v0.13.6) - 2026-09-22
+
+### Other
+
+- updated the following local packages: ax-hal
+
+## [0.13.5](https://github.com/rcore-os/tgoskits/compare/ax-net-v0.13.4...ax-net-v0.13.5) - 2026-09-21
+
+### Other
+
+- updated the following local packages: ax-hal
+
+## [0.13.4](https://github.com/rcore-os/tgoskits/compare/ax-net-v0.13.3...ax-net-v0.13.4) - 2026-09-18
+
+### Fixed
+
+- *(ax-net)* allow sleeping in Unix pathname socket operations ([#2443](https://github.com/rcore-os/tgoskits/pull/2443))
+- *(starry)* align syscall and Unix socket semantics with Linux ([#2270](https://github.com/rcore-os/tgoskits/pull/2270))
+
 ## [0.13.3](https://github.com/rcore-os/tgoskits/compare/ax-net-v0.13.2...ax-net-v0.13.3) - 2026-09-13
 
 ### Fixed

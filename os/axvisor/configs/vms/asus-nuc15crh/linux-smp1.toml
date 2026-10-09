@@ -20,17 +20,15 @@ phys_cpu_sets = [2]
 # The entry point of the kernel image.
 # Linux direct boot uses the Linux-specific boot stub at this GPA.
 entry_point = 0x8000
-# The location of image: "memory" | "fs".
-# The ASUS NUC15CRH HTTP Boot flow embeds the Linux guest images into AxVisor.
-image_location = "memory"
+# The ASUS NUC15CRH HTTP Boot flow packages the Linux guest images in the host initramfs.
 # The file path of the kernel image.
-kernel_path = "../../../../../tmp/qemu-x86_64/linux/linux-qemu"
+kernel_path = "${workspace}/target/axbuild/board-assets/asus-nuc15crh-linux/qemu-x86_64/linux/linux-qemu"
 # The load address of the kernel image.
 kernel_load_addr = 0x20_0000
 # Whether to enable BIOS boot flow.
 enable_bios = false
 # The file path of the initramfs image.
-ramdisk_path = "../../../../../tmp/initramfs-x86_64-busybox.cpio"
+ramdisk_path = "${workspace}/target/axbuild/board-assets/asus-nuc15crh-linux/initramfs-x86_64-busybox.cpio.gz/initramfs-x86_64-busybox.cpio.gz"
 # The load address of the initramfs image.
 ramdisk_load_addr = 0x0600_0000
 # Linux kernel command line.
@@ -39,7 +37,7 @@ cmdline = "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200 ignore_logle
 # Memory regions with format (`base_paddr`, `size`, `flags`, `map_type`).
 # For `map_type`, 0 means `MAP_ALLOC`, 1 means `MAP_IDENTICAL`, 2 means `MAP_RESERVED`.
 memory_regions = [
-  [0x0000_0000, 0x0800_0000, 0x7, 0], # System RAM 128M
+  [0x0000_0000, 0x1000_0000, 0x7, 0], # System RAM 256M
 ]
 
 #

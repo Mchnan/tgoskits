@@ -6,11 +6,15 @@
 
 use std::{
     format,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::JoinHandle,
     vec::Vec,
 };
 
+use ax_std::os::arceos::sync::IrqSafeMutex;
 use axvirtio_blk::{BlockBackend, VirtioBlockConfig};
 use axvirtio_common::{VirtioError, VirtioResult};
 
@@ -22,8 +26,9 @@ const IO_CHUNK_BYTES: usize = 4096;
 const WORKER_STACK_BYTES: usize = 1024 * 1024;
 
 pub(super) struct FileBackend {
-    shared: Arc<Mutex<Shared>>,
+    shared: Arc<IrqSafeMutex<Shared>>,
     worker: Option<JoinHandle<()>>,
+    queue_pending: Arc<AtomicBool>,
     pub(super) capacity_sectors: u64,
 }
 
@@ -135,7 +140,7 @@ impl FileBackend {
         capacity_sectors: u64,
         vm_id: usize,
     ) -> axdevice::DeviceManagerResult<Self> {
-        Self::spawn(AxStorage(file), capacity_sectors, pin_worker, move || {
+        Self::spawn(AxStorage(file), capacity_sectors, pin_worker, move |_| {
             // notify_vm publishes device work and requests execution on vCPU0.
             if let Err(error) = crate::AxvmRuntime::notify_vm(vm_id) {
                 log::warn!("failed to notify VM[{vm_id}] of file I/O completion: {error}");
@@ -151,10 +156,12 @@ impl FileBackend {
         mut storage: S,
         capacity_sectors: u64,
         start: fn(),
-        notify: impl Fn() + Send + 'static,
+        notify: impl Fn(&AtomicBool) + Send + 'static,
     ) -> std::io::Result<Self> {
-        let shared = Arc::new(Mutex::new(Shared::default()));
+        let shared = Arc::new(IrqSafeMutex::new(Shared::default()));
         let worker_shared = shared.clone();
+        let queue_pending = Arc::new(AtomicBool::new(false));
+        let worker_queue_pending = Arc::clone(&queue_pending);
         let worker = std::thread::Builder::new()
             .name("virtio-blk-file".into())
             .stack_size(WORKER_STACK_BYTES)
@@ -163,7 +170,7 @@ impl FileBackend {
                 loop {
                     // Never hold the state lock across storage I/O or notification.
                     let operation = {
-                        let mut shared = worker_shared.lock().expect("file state mutex poisoned");
+                        let mut shared = worker_shared.lock();
                         let work = shared.take_work();
                         if work.is_none() && shared.stopping {
                             break;
@@ -172,11 +179,11 @@ impl FileBackend {
                     };
                     if let Some(mut operation) = operation {
                         let result = execute(&mut storage, &mut operation);
-                        worker_shared
-                            .lock()
-                            .expect("file state mutex poisoned")
-                            .finish(operation, result);
-                        notify();
+                        worker_shared.lock().finish(operation, result);
+                        // A wake is only a hint. Publish the level state first
+                        // so an immediately running poller observes the work.
+                        worker_queue_pending.store(true, Ordering::Release);
+                        notify(&worker_queue_pending);
                     } else {
                         // unpark retains a token when it races this call.
                         std::thread::park();
@@ -189,6 +196,7 @@ impl FileBackend {
         Ok(Self {
             shared,
             worker: Some(worker),
+            queue_pending,
             capacity_sectors,
         })
     }
@@ -212,7 +220,7 @@ impl FileBackend {
     }
 
     fn poll(&self, key: RequestKey, write_bytes: Option<&[u8]>) -> VirtioResult<Operation> {
-        let mut shared = self.shared.lock().expect("file state mutex poisoned");
+        let mut shared = self.shared.lock();
         if shared.stopping {
             return Err(VirtioError::DeviceNotReady);
         }
@@ -261,6 +269,10 @@ impl FileBackend {
             worker.thread().unpark();
         }
     }
+
+    pub(super) fn queue_pending(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.queue_pending)
+    }
 }
 
 fn pin_worker() {
@@ -293,7 +305,7 @@ fn execute(storage: &mut impl Storage, operation: &mut Operation) -> VirtioResul
 
 impl BlockBackend for FileBackend {
     fn pending_request_ready(&self) -> bool {
-        let shared = self.shared.lock().expect("file state mutex poisoned");
+        let shared = self.shared.lock();
         shared.stopping || matches!(shared.state, State::Idle | State::Complete { .. })
     }
 
@@ -327,19 +339,13 @@ impl BlockBackend for FileBackend {
     }
 
     fn cancel_pending_request(&self) {
-        self.shared
-            .lock()
-            .expect("file state mutex poisoned")
-            .cancel();
+        self.shared.lock().cancel();
     }
 }
 
 impl Drop for FileBackend {
     fn drop(&mut self) {
-        self.shared
-            .lock()
-            .expect("file state mutex poisoned")
-            .stopping = true;
+        self.shared.lock().stopping = true;
         self.wake_worker();
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
@@ -357,16 +363,32 @@ mod tests {
 
     fn manual_backend() -> FileBackend {
         FileBackend {
-            shared: Arc::new(Mutex::new(Shared::default())),
+            shared: Arc::new(IrqSafeMutex::new(Shared::default())),
             worker: None,
+            queue_pending: Arc::new(AtomicBool::new(false)),
             capacity_sectors: (1 << 40) / 512,
         }
+    }
+
+    /// Compile-time contract only: the shared backend state must stay behind an
+    /// IRQ-safe mutex so the deferred virtio-blk queue path can lock it while
+    /// the virtqueue lease already keeps local interrupts disabled. This is a
+    /// bare function signature check, so it never constructs a backend and
+    /// never acquires the privileged IRQ-save lock; regressing the field to a
+    /// sleeping mutex fails to compile here instead of resurfacing as a
+    /// `TaskError::UnsafeContext` at runtime.
+    #[test]
+    fn shared_state_stays_an_irq_safe_mutex() {
+        fn state_is_irq_safe(backend: &FileBackend) -> &IrqSafeMutex<Shared> {
+            &*backend.shared
+        }
+        let _contract: fn(&FileBackend) -> &IrqSafeMutex<Shared> = state_is_irq_safe;
     }
 
     #[test]
     fn failed_retry_cannot_complete_a_later_write_with_old_data() {
         use axvirtio_blk::{BlockDeviceEvent, VirtioMmioBlockDevice};
-        use axvirtio_common::{GuestMemory, NoGuestMemoryAccessor};
+        use axvirtio_common::{GuestMemory, NoGuestMemoryAccessor, constants as vc};
         use axvm_types::{AccessWidth, GuestPhysAddr};
 
         struct Memory {
@@ -427,6 +449,34 @@ mod tests {
             memory.bytes[0x400..0x600].fill(0x11);
             memory.bytes[0x202..0x204].copy_from_slice(&1_u16.to_le_bytes());
             for (register, value) in [
+                (vc::VIRTIO_MMIO_STATUS, vc::VIRTIO_STATUS_ACKNOWLEDGE),
+                (
+                    vc::VIRTIO_MMIO_STATUS,
+                    vc::VIRTIO_STATUS_ACKNOWLEDGE | vc::VIRTIO_STATUS_DRIVER,
+                ),
+                (vc::VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0),
+                (vc::VIRTIO_MMIO_DRIVER_FEATURES, 0),
+                (
+                    vc::VIRTIO_MMIO_STATUS,
+                    vc::VIRTIO_STATUS_ACKNOWLEDGE
+                        | vc::VIRTIO_STATUS_DRIVER
+                        | vc::VIRTIO_STATUS_FEATURES_OK,
+                ),
+            ] {
+                model
+                    .mmio_write(
+                        GuestPhysAddr::from(0x1000 + register),
+                        AccessWidth::Dword,
+                        value as usize,
+                    )
+                    .unwrap();
+            }
+            assert_ne!(
+                model.get_status() & vc::VIRTIO_STATUS_FEATURES_OK,
+                0,
+                "the zero-feature negotiation should be sealed"
+            );
+            for (register, value) in [
                 (0x30, 0),
                 (0x38, 4),
                 (0x80, 0x100),
@@ -443,12 +493,21 @@ mod tests {
                     )
                     .unwrap();
             }
-            model.set_status(4);
+            model
+                .mmio_write(
+                    GuestPhysAddr::from(0x1000 + vc::VIRTIO_MMIO_STATUS),
+                    AccessWidth::Dword,
+                    (vc::VIRTIO_STATUS_ACKNOWLEDGE
+                        | vc::VIRTIO_STATUS_DRIVER
+                        | vc::VIRTIO_STATUS_FEATURES_OK
+                        | vc::VIRTIO_STATUS_DRIVER_OK) as usize,
+                )
+                .unwrap();
             assert_eq!(
                 model.process_pending_queue(0, &mut memory),
                 Ok(BlockDeviceEvent::QueuePending(0))
             );
-            let mut old = Some(shared.lock().unwrap().take_work().unwrap());
+            let mut old = Some(shared.lock().take_work().unwrap());
             let reads_before_wait = memory.read_calls;
             for _ in 0..32 {
                 assert_eq!(
@@ -461,7 +520,7 @@ mod tests {
                 "waiting for storage must not reread descriptors or copy guest data"
             );
             if complete_before_failure {
-                shared.lock().unwrap().finish(old.take().unwrap(), Ok(()));
+                shared.lock().finish(old.take().unwrap(), Ok(()));
             }
             memory.fail_data = true;
             if !complete_before_failure {
@@ -469,12 +528,12 @@ mod tests {
                     model.process_pending_queue(0, &mut memory),
                     Ok(BlockDeviceEvent::QueuePending(0))
                 );
-                shared.lock().unwrap().finish(old.take().unwrap(), Ok(()));
+                shared.lock().finish(old.take().unwrap(), Ok(()));
             }
             model.process_pending_queue(0, &mut memory).unwrap();
             assert_eq!(memory.bytes[0x800], 1, "the failed retry must report IOERR");
             if let Some(old) = old {
-                shared.lock().unwrap().finish(old, Ok(()));
+                shared.lock().finish(old, Ok(()));
             }
             // Reuse the returned descriptor with the same range but new contents.
             memory.fail_data = false;
@@ -487,13 +546,9 @@ mod tests {
                 "a later write must issue fresh I/O, not consume the abandoned result"
             );
             assert_eq!(memory.bytes[0x800], 0xff);
-            let fresh = shared
-                .lock()
-                .unwrap()
-                .take_work()
-                .expect("new storage write");
+            let fresh = shared.lock().take_work().expect("new storage write");
             assert_eq!(fresh.bytes, vec![0x22; 512]);
-            shared.lock().unwrap().finish(fresh, Ok(()));
+            shared.lock().finish(fresh, Ok(()));
             model.process_pending_queue(0, &mut memory).unwrap();
             assert_eq!(memory.bytes[0x800], 0);
         }
@@ -505,15 +560,15 @@ mod tests {
         let mut bytes = [0xcc; 512];
         assert_eq!(backend.read(100, &mut bytes), Err(VirtioError::WouldBlock));
         assert_eq!(bytes, [0xcc; 512]);
-        let mut work = backend.shared.lock().unwrap().take_work().unwrap();
+        let mut work = backend.shared.lock().take_work().unwrap();
         assert_eq!(work.key.offset, 100 * 512);
         assert_eq!(work.bytes.len(), 512);
         assert_eq!(backend.read(100, &mut bytes), Err(VirtioError::WouldBlock));
         work.bytes.fill(0x42);
-        backend.shared.lock().unwrap().finish(work, Ok(()));
+        backend.shared.lock().finish(work, Ok(()));
         assert_eq!(backend.read(100, &mut bytes), Ok(512));
         assert_eq!(bytes, [0x42; 512]);
-        assert!(matches!(backend.shared.lock().unwrap().state, State::Idle));
+        assert!(matches!(backend.shared.lock().state, State::Idle));
     }
 
     #[test]
@@ -523,29 +578,27 @@ mod tests {
         assert_eq!(backend.write(7, &bytes), Err(VirtioError::WouldBlock));
         bytes.fill(0x99);
         assert_eq!(backend.write(7, &bytes), Err(VirtioError::WouldBlock));
-        let work = backend.shared.lock().unwrap().take_work().unwrap();
+        let work = backend.shared.lock().take_work().unwrap();
         assert_eq!(work.bytes, [0x31; 512]);
         backend
             .shared
             .lock()
-            .unwrap()
             .finish(work, Err(VirtioError::BackendError));
         assert_eq!(backend.write(7, &bytes), Err(VirtioError::BackendError));
-        assert!(matches!(backend.shared.lock().unwrap().state, State::Idle));
+        assert!(matches!(backend.shared.lock().state, State::Idle));
     }
 
     #[test]
     fn flush_waits_for_sync_and_propagates_failure() {
         let backend = manual_backend();
         assert_eq!(backend.flush(), Err(VirtioError::WouldBlock));
-        let work = backend.shared.lock().unwrap().take_work().unwrap();
+        let work = backend.shared.lock().take_work().unwrap();
         assert_eq!(work.key.kind, Kind::Flush);
         assert!(work.bytes.is_empty());
         assert_eq!(backend.flush(), Err(VirtioError::WouldBlock));
         backend
             .shared
             .lock()
-            .unwrap()
             .finish(work, Err(VirtioError::BackendError));
         assert_eq!(backend.flush(), Err(VirtioError::BackendError));
     }
@@ -556,16 +609,16 @@ mod tests {
         let mut bytes = [0; 512];
         assert_eq!(backend.read(0, &mut bytes), Err(VirtioError::WouldBlock));
         backend.reset();
-        assert!(backend.shared.lock().unwrap().take_work().is_none());
+        assert!(backend.shared.lock().take_work().is_none());
         assert_eq!(backend.read(0, &mut bytes), Err(VirtioError::WouldBlock));
-        let old = backend.shared.lock().unwrap().take_work().unwrap();
+        let old = backend.shared.lock().take_work().unwrap();
         backend.reset();
         assert_eq!(backend.read(0, &mut bytes), Err(VirtioError::WouldBlock));
-        backend.shared.lock().unwrap().finish(old, Ok(()));
+        backend.shared.lock().finish(old, Ok(()));
         // Even an identical request after reset must issue fresh storage I/O.
         assert_eq!(backend.read(0, &mut bytes), Err(VirtioError::WouldBlock));
-        let fresh = backend.shared.lock().unwrap().take_work().unwrap();
-        backend.shared.lock().unwrap().finish(fresh, Ok(()));
+        let fresh = backend.shared.lock().take_work().unwrap();
+        backend.shared.lock().finish(fresh, Ok(()));
         backend.reset();
         assert_eq!(backend.read(0, &mut bytes), Err(VirtioError::WouldBlock));
     }
@@ -585,7 +638,7 @@ mod tests {
             backend.read(backend.capacity_sectors, &mut [0; 512]),
             Err(VirtioError::InvalidAddress)
         );
-        assert!(matches!(backend.shared.lock().unwrap().state, State::Idle));
+        assert!(matches!(backend.shared.lock().state, State::Idle));
     }
 
     struct PartialStorage {
@@ -696,7 +749,11 @@ mod tests {
             HostFile(file),
             capacity / 512,
             || {},
-            move || {
+            move |queue_pending| {
+                assert!(
+                    queue_pending.load(Ordering::Acquire),
+                    "completion state must be published before the wake callback"
+                );
                 let _ = send.send(());
             },
         )
@@ -707,9 +764,14 @@ mod tests {
             Err(VirtioError::WouldBlock)
         );
         receive.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            backend.queue_pending.swap(false, Ordering::Acquire),
+            "completion state must be published before the wake callback"
+        );
         assert_eq!(backend.write(sector, &[0x4b; 512]), Ok(512));
         assert_eq!(backend.flush(), Err(VirtioError::WouldBlock));
         receive.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(backend.queue_pending.swap(false, Ordering::Acquire));
         assert_eq!(backend.flush(), Ok(()));
         let mut bytes = [0; 512];
         assert_eq!(observer.read_at(&mut bytes, capacity - 512).unwrap(), 512);
@@ -719,6 +781,7 @@ mod tests {
             Err(VirtioError::WouldBlock)
         );
         receive.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(backend.queue_pending.swap(false, Ordering::Acquire));
         assert_eq!(backend.read(sector, &mut bytes), Ok(512));
         assert_eq!(bytes, [0x4b; 512]);
         drop(backend);

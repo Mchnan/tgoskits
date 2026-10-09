@@ -10,7 +10,7 @@ args = [
   "-device",
   "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
   "-drive",
-  "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-alpine.img",
+  "id=disk0,if=none,format=raw,file=${workspace}/target/axbuild/rootfs/rootfs-aarch64-alpine.img",
   "-append",
   "root=/dev/nvme0n1 rw init=/bin/sh",
   "-m",
@@ -18,6 +18,8 @@ args = [
 ]
 fail_regex = [
     "(?m)^VIRTIO_BLK_MOUNT_FAIL:",
+    "(?i)I/O error",
+    "(?i)filesystem resource is busy",
     "(?i)\\bpanic(?:ked)?\\b",
     "(?i)login incorrect",
     "(?i)permission denied",
@@ -26,6 +28,38 @@ fail_regex = [
 timeout = 300
 to_bin = true
 uefi = false
+
+# Drive the real serial editor; match command output, never its redraw/echo.
+[[shell_check_steps]]
+shell_prefix = "axvisor:/$"
+shell_cmd = "echox\u001b[999999999999999999999~\u001b[<0;16;41M\u001b[D\u001b[3~ SHELL_CSI_OK"
+success_regex = ['(?m)^SHELL_CSI_OK\s*$']
+timeout = 15
+
+[[shell_check_steps]]
+shell_cmd = "SHELL_HOME_END_\u001b[Hecho \u001b[FOK"
+success_regex = ['(?m)^SHELL_HOME_END_OK\s*$']
+
+[[shell_check_steps]]
+# QEMU -nographic consumes Ctrl+A as its escape prefix; double it to send one.
+shell_cmd = "discard\u0015SHELL_CTRL_OK wrong\u0017\u0001\u0001echo \u0005tail\u001b[D\u001b[D\u001b[D\u001b[D\u000b"
+success_regex = ['(?m)^SHELL_CTRL_OK\s*$']
+
+[[shell_check_steps]]
+shell_cmd = "bad-command\u0003ech\t SHELL_COMPLETE_OK"
+success_regex = ['(?m)^SHELL_COMPLETE_OK\s*$']
+
+[[shell_check_steps]]
+shell_cmd = "ech SHELL_MID_OK\u001b[H\u001b[C\u001b[C\u001b[C\t\u001b[F"
+success_regex = ['(?m)^SHELL_MID_OK\s*$']
+
+[[shell_check_steps]]
+shell_cmd = "echo SHELL_WORD_OK\u001b[H\u001b[C\u001b[C\u001b[C\t\u001b[F"
+success_regex = ['(?m)^SHELL_WORD_OK\s*$']
+
+[[shell_check_steps]]
+shell_cmd = "bad-command\u001b[\u0003echo SHELL_CANCEL_OK"
+success_regex = ['(?m)^SHELL_CANCEL_OK\s*$']
 
 [[shell_check_steps]]
 shell_prefix = "axvisor:/$"
@@ -44,7 +78,7 @@ success_regex = ['(?m)^Error: Invalid command syntax\s*$']
 shell_cmd = "echo AXVISOR_NVME_RW_PAYLOAD > /tmp/axvisor-nvme-rw"
 
 [[shell_check_steps]]
-shell_cmd = "cat /tmp/axvisor-nvme-rw"
+shell_cmd = "cat /tmp/axvisor-nvme-r\t"
 success_regex = ['(?m)^AXVISOR_NVME_RW_PAYLOAD\s*$']
 
 [[shell_check_steps]]
@@ -64,13 +98,84 @@ shell_prefix = "~ #"
 shell_cmd = "mkdir -p /mnt/v"
 
 [[shell_check_steps]]
-shell_cmd = "mount -t ext4 -o ro /dev/vda /mnt/v"
-success_regex = ['EXT4-fs \(vda\): mounted filesystem .* ro ']
+shell_cmd = "mount -t ext4 -o rw /dev/vda /mnt/v"
+success_regex = ['EXT4-fs \(vda\): mounted filesystem .* r/w ']
 fail_regex = ['mount:']
 timeout = 60
 
 [[shell_check_steps]]
 shell_cmd = "cat /mnt/v/etc/alpine-release"
-success_regex = ['(?m)^3\.23\.5\s*$']
+success_regex = ['(?m)^3\.23\.6\s*$']
 fail_regex = ['cat:']
 timeout = 60
+
+[[shell_check_steps]]
+shell_cmd = "mkdir -p /tmp /mnt/v/tmp"
+
+[[shell_check_steps]]
+shell_cmd = "dd if=/dev/zero of=/tmp/av-ref bs=4096 count=1024 2>/tmp/av-dd-ref.log; echo AXVISOR_REF_STATUS=$?"
+success_regex = ['(?m)^AXVISOR_REF_STATUS=0\s*$']
+fail_regex = ['(?m)^AXVISOR_REF_STATUS=[^0]\s*$']
+timeout = 120
+
+[[shell_check_steps]]
+shell_cmd = "dd if=/tmp/av-ref of=/mnt/v/tmp/av-rw bs=4096 conv=fsync 2>/tmp/av-dd-copy.log; echo AXVISOR_COPY_STATUS=$?"
+success_regex = ['(?m)^AXVISOR_COPY_STATUS=0\s*$']
+fail_regex = ['(?m)^AXVISOR_COPY_STATUS=[^0]\s*$']
+timeout = 120
+
+[[shell_check_steps]]
+shell_cmd = "wc -c < /mnt/v/tmp/av-rw"
+success_regex = ['(?m)^4194304\s*$']
+timeout = 60
+
+[[shell_check_steps]]
+shell_cmd = "cmp /tmp/av-ref /mnt/v/tmp/av-rw >/dev/null 2>&1; echo AXVISOR_CMP_STATUS=$?"
+success_regex = ['(?m)^AXVISOR_CMP_STATUS=0\s*$']
+fail_regex = ['(?m)^AXVISOR_CMP_STATUS=[^0]\s*$']
+timeout = 60
+
+[[shell_check_steps]]
+shell_cmd = "rm -f /tmp/av-ref /tmp/av-dd-ref.log /tmp/av-dd-copy.log /mnt/v/tmp/av-rw"
+
+[[shell_check_steps]]
+shell_cmd = "echo AXVISOR_VIRTIO_BLK_RW_PASSED"
+success_regex = ['(?m)^AXVISOR_VIRTIO_BLK_RW_PASSED\s*$']
+
+[[shell_check_steps]]
+shell_cmd = 'printf VM1 > /mnt/v/tmp/axvisor-vm1-isolation && sync && test "$(cat /mnt/v/tmp/axvisor-vm1-isolation)" = VM1; echo AXVISOR_VM1_MARKER_STATUS=$?'
+success_regex = ['(?m)^AXVISOR_VM1_MARKER_STATUS=0\s*$']
+fail_regex = ['(?m)^AXVISOR_VM1_MARKER_STATUS=[^0]\s*$']
+
+[[shell_check_steps]]
+shell_prefix = "~ #"
+shell_cmd = "\u0018h"
+success_regex = ['detached VM\[1\] console']
+timeout = 30
+
+[[shell_check_steps]]
+shell_prefix = "axvisor:/$"
+shell_cmd = "vm console 2"
+success_regex = ['Attached VM\[2\] console']
+timeout = 30
+
+[[shell_check_steps]]
+shell_prefix = "~ #"
+shell_cmd = "mkdir -p /mnt/v"
+
+[[shell_check_steps]]
+shell_cmd = "mount -t ext4 -o rw /dev/vda /mnt/v"
+success_regex = ['EXT4-fs \(vda\): mounted filesystem .* r/w ']
+fail_regex = ['mount:']
+timeout = 60
+
+[[shell_check_steps]]
+shell_cmd = "cat /mnt/v/etc/alpine-release"
+success_regex = ['(?m)^3\.23\.6\s*$']
+fail_regex = ['cat:']
+timeout = 60
+
+[[shell_check_steps]]
+shell_cmd = "test ! -e /mnt/v/tmp/axvisor-vm1-isolation; echo AXVISOR_VM2_ISOLATED=$?"
+success_regex = ['(?m)^AXVISOR_VM2_ISOLATED=0\s*$']
+fail_regex = ['(?m)^AXVISOR_VM2_ISOLATED=[^0]\s*$']

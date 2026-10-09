@@ -34,15 +34,9 @@ use crate::architecture::sysreg::{self, SysRegReadExit, SysRegWriteExit};
 
 pub(crate) struct Aarch64Arch;
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Aarch64DeferredRunWork {
-    ExternalInterrupt { token: Option<usize> },
-}
-
 impl ArchOps for Aarch64Arch {
     type VCpu = AxvmArmVcpu;
     type PerCpu = AxvmArmPerCpu;
-    type DeferredRunWork = Aarch64DeferredRunWork;
     type NestedPageTable = npt::NestedPageTable<crate::HostPagingHandler>;
 
     fn has_hardware_support() -> bool {
@@ -80,7 +74,7 @@ impl ArchOps for Aarch64Arch {
         vm: &crate::AxVMRef,
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
         exit: <Self::VCpu as VmArchVcpuOps>::Exit,
-    ) -> AxVmResult<BoundVcpuExit<Self::DeferredRunWork>> {
+    ) -> AxVmResult<VcpuExitAction> {
         match exit {
             ArmVmExit::Hypercall { nr, args } => super::handle_hypercall(
                 vm,
@@ -136,16 +130,13 @@ impl ArchOps for Aarch64Arch {
             } => {
                 let value = vcpu.get_arch_vcpu().read_icc(register)?;
                 vcpu.set_gpr(destination, value as usize);
-                Ok(BoundVcpuExit::Continue)
+                Ok(VcpuExitAction::Continue)
             }
             ArmVmExit::GicCpuInterfaceWrite { register, value } => {
                 vcpu.get_arch_vcpu().write_icc(register, value)?;
-                Ok(BoundVcpuExit::Continue)
+                Ok(VcpuExitAction::Continue)
             }
-            ArmVmExit::ExternalInterrupt { token } => Ok(BoundVcpuExit::Defer(
-                Aarch64DeferredRunWork::ExternalInterrupt { token },
-            )),
-            ArmVmExit::WaitForInterrupt => Ok(BoundVcpuExit::Complete(VcpuRunAction {
+            ArmVmExit::WaitForInterrupt => Ok(VcpuExitAction::Complete(VcpuRunAction {
                 waits_for_event: true,
                 stop_reason: None,
                 resets_vm: false,
@@ -153,13 +144,13 @@ impl ArchOps for Aarch64Arch {
             })),
             ArmVmExit::SendIPI { value } => {
                 vcpu.get_arch_vcpu().write_sgi1r(value)?;
-                Ok(BoundVcpuExit::Continue)
+                Ok(VcpuExitAction::Continue)
             }
             ArmVmExit::DeactivateInterrupt { intid } => {
                 vcpu.get_arch_vcpu().deactivate(intid)?;
-                Ok(BoundVcpuExit::Continue)
+                Ok(VcpuExitAction::Continue)
             }
-            ArmVmExit::Nothing => Ok(BoundVcpuExit::Complete(VcpuRunAction {
+            ArmVmExit::Nothing => Ok(VcpuExitAction::Complete(VcpuRunAction {
                 waits_for_event: false,
                 stop_reason: None,
                 resets_vm: false,
@@ -168,40 +159,16 @@ impl ArchOps for Aarch64Arch {
         }
     }
 
-    fn finish_deferred_run_work(
-        _vm: &crate::AxVMRef,
-        vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
-        work: Self::DeferredRunWork,
-    ) -> AxVmResult<VcpuRunAction> {
-        match work {
-            Aarch64DeferredRunWork::ExternalInterrupt { token } => {
-                if let Some(token) = token {
-                    if !vcpu.get_arch_vcpu().accept_host_timer_irq(token) {
-                        gic::route_acknowledged_host_irq(token).map_err(|error| {
-                            crate::AxVmError::interrupt("route acknowledged host IRQ", error)
-                        })?;
-                    }
-                }
-            }
-        }
-        Ok(VcpuRunAction {
-            waits_for_event: false,
-            stop_reason: None,
-            resets_vm: false,
-            exits_vcpu: false,
-        })
-    }
-
     fn wait_for_vcpu_event(
         vm: &crate::AxVMRef,
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
         runtime: &crate::vm::VmRuntimeHandle,
     ) {
-        let wait_snapshot = runtime.vcpu_event_wait_snapshot();
+        let wait_snapshot = runtime.vcpu_event_wait_snapshot(vcpu.run_state());
         if !vm.running() {
             return;
         }
-        if wait_snapshot.has_pending_event(runtime) {
+        if wait_snapshot.take_pending_event(runtime) {
             return;
         }
         match vcpu.get_arch_vcpu().has_pending_interrupt() {
@@ -428,7 +395,7 @@ impl VmArchVcpuOps for AxvmArmVcpu {
     type Exit = ArmVmExit;
 
     fn guest_mpidr_from_create_config(config: &Self::CreateConfig) -> Option<u64> {
-        Some(config.mpidr_el1 as u64)
+        Some(config.mpidr_el1)
     }
 
     fn new(vm_id: VMId, vcpu_id: VCpuId, config: Self::CreateConfig) -> BackendResult<Self> {
@@ -465,6 +432,23 @@ impl VmArchVcpuOps for AxvmArmVcpu {
         let run_result = arm_result(self.inner.run(&host_irq_guard));
         let timer_result = self.synchronize_timer();
         let save_result = vgic_backend_result(binding.save());
+        // IRQ tokens are CPU-local resources, not durable guest exits. Resolve
+        // them even when timer/VGIC saving fails, while the original IRQ mask
+        // and CPU binding are still held.
+        let run_result = run_result.and_then(|exit| match exit {
+            ArmRunExit::Guest(exit) => Ok(exit),
+            ArmRunExit::HostInterrupt(token) => {
+                if let Some(token) = token
+                    && !self.accept_host_timer_irq(token)
+                {
+                    gic::route_acknowledged_host_irq(token).map_err(|error| {
+                        error!("failed to route acknowledged host IRQ: {error:?}");
+                        BackendError::InvalidState
+                    })?;
+                }
+                Ok(ArmVmExit::Nothing)
+            }
+        });
         drop(host_irq_guard);
         match run_result {
             Ok(exit) => {
@@ -539,11 +523,11 @@ impl VmArchPerCpuOps for AxvmArmPerCpu {
 
     fn hardware_enable(&mut self) -> BackendResult {
         arm_result(self.0.hardware_enable())?;
-        if let Err(error) = gic::enable_maintenance_interrupt() {
+        if let Err(error) = gic::enable_current_cpu() {
             if let Err(rollback_error) = self.0.hardware_disable() {
                 warn!(
-                    "failed to roll back AArch64 virtualization after maintenance IRQ setup \
-                     failed: {rollback_error:?}"
+                    "failed to roll back AArch64 virtualization after host GIC setup failed: \
+                     {rollback_error:?}"
                 );
             }
             return Err(error);
@@ -552,7 +536,7 @@ impl VmArchPerCpuOps for AxvmArmPerCpu {
     }
 
     fn hardware_disable(&mut self) -> BackendResult {
-        gic::disable_maintenance_interrupt()?;
+        gic::disable_current_cpu()?;
         arm_result(self.0.hardware_disable())
     }
 

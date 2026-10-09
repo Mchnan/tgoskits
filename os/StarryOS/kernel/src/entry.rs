@@ -22,6 +22,11 @@ use crate::{
 
 /// Initialize and run initproc.
 pub fn init(args: &[String], envs: &[String]) {
+    init_candidates(&[args[0].clone()], &args[1..], envs);
+}
+
+/// Starts an init candidate on the root already selected during boot.
+pub fn init_candidates(paths: &[String], init_args: &[String], envs: &[String]) {
     // Install task-context diagnostics and contention backoff before userspace.
     crate::rdrive_osal::init();
 
@@ -37,6 +42,7 @@ pub fn init(args: &[String], envs: &[String]) {
     crate::kmod::init_kmod();
 
     pseudofs::mount_all().expect("Failed to mount pseudofs");
+    crate::file::epoll::start_epoll_notify_worker();
     spawn_alarm_task();
     crate::mm::spawn_reclaimer_task();
     // DVFS: a one-shot OPP-calibration boot runs the sweep and skips the governor;
@@ -53,26 +59,37 @@ pub fn init(args: &[String], envs: &[String]) {
 
     ax_alloc::register_page_reclaim_fn(ax_fs_ng::vfs::page_cache_reclaim);
 
-    let loc = current_fs_context()
-        .lock()
-        .resolve(&args[0])
-        .expect("Failed to resolve executable path");
+    let mut selected = None;
+    for candidate in paths {
+        let Ok(loc) = current_fs_context().lock().resolve(candidate) else {
+            continue;
+        };
+        let mut builder = new_user_image_builder()
+            .expect("Failed to create unpublished user address space");
+        let mut args = alloc::vec![candidate.clone()];
+        args.extend_from_slice(init_args);
+        match load_user_app(
+            &mut builder,
+            loc.clone(),
+            candidate,
+            &args,
+            envs,
+            &crate::task::Cred::root(),
+        ) {
+            Ok(image) => {
+                selected = Some((loc, builder, image, args));
+                break;
+            }
+            Err(error) => warn!("Failed to execute init {candidate}: {error:?}"),
+        }
+    }
+    let (loc, image_builder, loaded_image, args) = selected
+        .unwrap_or_else(|| panic!("No working init found among candidates: {paths:?}"));
     let path = loc
         .absolute_path()
         .expect("Failed to get executable absolute path");
     let name = loc.name().into_owned();
 
-    let mut image_builder =
-        new_user_image_builder().expect("Failed to create unpublished user address space");
-    let loaded_image = load_user_app(
-        &mut image_builder,
-        loc,
-        &args[0],
-        args,
-        envs,
-        &crate::task::Cred::root(),
-    )
-    .unwrap_or_else(|error| panic!("Failed to load user app: {error}"));
     let prepared_image = image_builder
         .finish(loaded_image)
         .expect("loaded init image token no longer matches its address space");
@@ -106,9 +123,8 @@ pub fn init(args: &[String], envs: &[String]) {
     let proc = Process::new_init(identity.clone()).expect("failed to prepare init process");
     proc.add_thread(TidNumber::try_from(pid).expect("init TID must be non-zero"));
 
-    if let Err(error) = tty::bind_console_to(&proc) {
-        warn!("Failed to bind console tty: {error:?}");
-    }
+    // Initial console descriptors do not assign a controlling terminal to
+    // PID 1. A userspace session leader claims it with TIOCSCTTY.
 
     let proc = ProcessData::new(
         proc,
@@ -168,24 +184,12 @@ pub fn init(args: &[String], envs: &[String]) {
     tty::arm_console_irq();
     let task = staged_task.activate();
 
-    // TODO: wait for all processes to finish
-    let exit_code = task.join();
-    info!("Init process exited with code: {exit_code:?}");
-
-    let fs_context = current_fs_context();
-    let cx = fs_context.lock();
-    // Best-effort teardown, matching Linux's shutdown path. A process that exited while
-    // holding a mount namespace (bind mounts, pivot_root) can leave the mount tree in a
-    // state `unmount_all` rejects; at shutdown that must be logged, not turned into a
-    // kernel panic that fails an otherwise clean run. The rootfs flush below is what
-    // matters for on-disk integrity.
-    if let Err(err) = cx.root_dir().unmount_all() {
-        warn!("shutdown: unmount_all failed (best-effort): {err:?}");
-    }
-    cx.root_dir()
-        .filesystem()
-        .flush()
-        .expect("Failed to flush rootfs");
+    // Reap the initial scheduler thread, which may exit while init's peers
+    // remain alive. Only do_exit's last-thread owner decides that init died.
+    // Userspace owns normal shutdown through reboot(2); the bootstrap thread
+    // must neither return nor poll a second process-lifecycle state here.
+    let _exit_code = task.join();
+    match crate::task::future::block_on(core::future::pending::<core::convert::Infallible>()) {}
 }
 
 /// Run the one-shot DVFS OPP calibration sweep (gated by the driver's `CALIBRATE`

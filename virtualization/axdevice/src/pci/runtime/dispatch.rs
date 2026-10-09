@@ -19,6 +19,25 @@ use crate::{
 };
 
 impl PciRootBinding {
+    /// Runs one runtime-owned endpoint poll while its current IRQ admission is held.
+    pub(crate) fn with_endpoint_irq_permit(
+        &self,
+        device: DeviceId,
+        callback: &mut dyn FnMut() -> DeviceManagerResult,
+    ) -> DeviceManagerResult {
+        let _permit = self
+            .router
+            .acquire_irq_permit(device)
+            .map_err(DeviceManagerError::Device)?;
+        // Admit each poll against the root-owned current Command register,
+        // just as BAR notification dispatch snapshots BME. A disabled
+        // function keeps its deferred work until a later admitted poll.
+        if !self.root.endpoint_bus_master_enabled(device) {
+            return Ok(());
+        }
+        callback()
+    }
+
     pub(super) fn queue_irq_withdrawal(&self, withdrawal: PendingIrqWithdrawal) {
         self.pending_irq_withdrawals.lock_irqsave().push(withdrawal);
     }
@@ -310,7 +329,7 @@ impl PciRootBinding {
         )
     }
 
-    /// Dispatches one complete conventional config read.
+    /// Dispatches one complete config-space read.
     pub fn read_config(
         &self,
         bdf: PciBdf,
@@ -350,6 +369,7 @@ impl PciRootBinding {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn config_access_intersects_effect(
         &self,
         bdf: PciBdf,
@@ -361,7 +381,7 @@ impl PciRootBinding {
             .map_err(pci_config_error)
     }
 
-    /// Dispatches one complete conventional config write.
+    /// Dispatches one complete config-space write.
     pub fn write_config(
         &self,
         bdf: PciBdf,

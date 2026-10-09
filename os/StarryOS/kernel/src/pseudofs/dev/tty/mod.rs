@@ -9,7 +9,6 @@ use alloc::{
     format,
     string::String,
     sync::{Arc, Weak},
-    vec::Vec,
 };
 use core::{
     any::Any,
@@ -17,7 +16,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use axfs_ng_vfs::{Location, NodeFlags, VfsError, VfsResult};
+use axfs_ng_vfs::{DeviceId, Location, NodeFlags, VfsError, VfsResult};
 use axpoll::{IoEvents, Pollable};
 use starry_signal::{SignalInfo, Signo};
 
@@ -31,7 +30,7 @@ pub use self::{
     ptm::Ptmx,
     pts::PtsDir,
     pty::PtyDriver,
-    serial::{arm_console_irq, bind_console_to, console_device, serial_tty_entries},
+    serial::{arm_console_irq, console_device, serial_tty_entries},
     usb_serial::usb_serial_tty,
 };
 use crate::{
@@ -39,14 +38,9 @@ use crate::{
     mm::{VmMutPtr, VmPtr},
     pseudofs::{Device, DeviceOps},
     sync::{IrqMutex, Mutex},
-    task::{
-        PgidNumber, Process, current_user_task, get_process_group_by_number,
-        send_signal_to_process_group,
-    },
+    task::{PgidNumber, PidView, Process, current_user_task, send_signal_to_process_group},
 };
 
-const ANSI_CURSOR_POSITION_REQUEST: &[u8] = b"\x1b[6n";
-const ANSI_CURSOR_POSITION_RESPONSE: &[u8] = b"\x1b[1;1R";
 const TCIFLUSH: usize = 0;
 const TCOFLUSH: usize = 1;
 const TCIOFLUSH: usize = 2;
@@ -149,6 +143,17 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
         self.terminal.pty_number.load(Ordering::Acquire)
     }
 
+    /// Every refusal is silent, as in Linux `tty_open_proc_set_tty()`: the
+    /// caller must lead a session that has no terminal, and no other session
+    /// may own this one.
+    fn acquire_on_open(&self, proc: &Process, location: Option<Location>) {
+        if !self.is_ptm
+            && let Some(this) = self.this.upgrade()
+        {
+            let _ = this.bind_to_at(proc, location);
+        }
+    }
+
     fn bind_current_to_at(&self, location: Location) -> StarryResult<()> {
         self.this.upgrade().unwrap().bind_to_at(
             &current_user_task().as_thread().proc_data.proc,
@@ -163,13 +168,53 @@ pub(crate) fn bind_pty_at_location(location: Location) -> Option<StarryResult<us
     Some(pty.bind_current_to_at(location).map(|()| 0))
 }
 
+/// Linux `tty_open()` makes a tty opened for reading without `O_NOCTTY` the
+/// caller's controlling terminal. Pty masters and `/dev/console` never are.
+pub(crate) fn set_controlling_terminal_on_open(
+    current: &crate::task::UserTaskRef,
+    location: &Location,
+) {
+    let Ok(device) = location.entry().downcast::<Device>() else {
+        return;
+    };
+    if location
+        .metadata()
+        .is_ok_and(|metadata| metadata.rdev == DeviceId::new(5, 1))
+    {
+        return;
+    }
+    let proc = &current.as_thread().proc_data.proc;
+    let inner = device.inner().as_any();
+    if let Some(pty) = inner.downcast_ref::<PtyDriver>() {
+        pty.acquire_on_open(proc, Some(location.clone()));
+    } else if let Some(tty) = inner.downcast_ref::<serial::SerialTtyDriver>() {
+        tty.acquire_on_open(proc, None);
+    } else if let Some(tty) = inner.downcast_ref::<usb_serial::UsbSerialTtyDriver>() {
+        tty.acquire_on_open(proc, None);
+    }
+}
+
+/// The PID namespace the caller sees; Linux resolves job control ids in it.
+fn caller_view(current: &crate::task::UserTaskRef) -> PidView {
+    PidView::new(current.as_thread().active_pid_namespace())
+}
+
 impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
     fn open(&self, _exclusive: bool) -> VfsResult<()> {
+        // The writer accounts for the open before the count moves: a pty refuses
+        // an open whose peer is already gone, and a refused open must not count.
+        self.writer.opened().map_err(VfsError::from)?;
         self.open_count.fetch_add(1, Ordering::AcqRel);
-        self.writer.open().map_err(VfsError::from)
+        if let Err(error) = self.writer.open() {
+            self.open_count.fetch_sub(1, Ordering::AcqRel);
+            self.writer.closing();
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     fn close(&self, _exclusive: bool) {
+        self.writer.closing();
         // On the last fd close, notify the writer side so the peer reader can
         // observe POLLHUP / EOF. Without this, a PTY master/slave close never
         // wakes the peer and poll()/read() hang.
@@ -196,15 +241,8 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
         if self.is_ptm {
             self.writer.write(buf);
         } else {
-            let (output, response_count) = filter_cursor_position_requests(buf);
             let term = self.terminal.load_termios();
-            write_output_bytes(&self.writer, term.as_ref(), &output);
-            if response_count > 0 {
-                let mut ldisc = self.ldisc.lock();
-                for _ in 0..response_count {
-                    ldisc.inject_input(ANSI_CURSOR_POSITION_RESPONSE);
-                }
-            }
+            write_output_bytes(&self.writer, term.as_ref(), buf);
         }
         Ok(buf.len())
     }
@@ -257,11 +295,17 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                         .job_control
                         .foreground()
                         .ok_or(StarryError::NoSuchProcess)?;
-                    (arg as *mut u32).vm_write(current, foreground.pgid().get())?;
+                    // Linux tiocgpgrp() answers with pid_vnr(): the number the
+                    // caller's PID namespace shows, and 0 when that namespace
+                    // cannot name the group at all.
+                    let pgid = caller_view(current)
+                        .visible_group_number(&foreground.identity())
+                        .map_or(0, |pgid| pgid.get());
+                    (arg as *mut u32).vm_write(current, pgid)?;
                 }
                 TIOCSPGRP => {
                     let pgid: u32 = (arg as *const u32).vm_read(current)?;
-                    let pg = get_process_group_by_number(PgidNumber::try_from(pgid)?)?;
+                    let pg = caller_view(current).resolve_group(PgidNumber::try_from(pgid)?)?;
                     self.terminal.job_control.set_foreground(&pg)?;
                 }
                 TIOCGWINSZ => {
@@ -378,24 +422,6 @@ fn apply_termios_update<W: TtyWrite>(
     })
 }
 
-fn filter_cursor_position_requests(bytes: &[u8]) -> (Vec<u8>, usize) {
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut count = 0;
-    let mut rest = bytes;
-
-    while let Some(pos) = rest
-        .windows(ANSI_CURSOR_POSITION_REQUEST.len())
-        .position(|window| window == ANSI_CURSOR_POSITION_REQUEST)
-    {
-        output.extend_from_slice(&rest[..pos]);
-        count += 1;
-        rest = &rest[pos + ANSI_CURSOR_POSITION_REQUEST.len()..];
-    }
-
-    output.extend_from_slice(rest);
-    (output, count)
-}
-
 impl<R: TtyRead, W: TtyWrite> Pollable for Tty<R, W> {
     fn poll(&self) -> IoEvents {
         let _ = self.writer.open();
@@ -470,9 +496,7 @@ mod tests {
     use alloc::{sync::Arc, vec, vec::Vec};
     use std::sync::Mutex;
 
-    use super::{
-        Terminal, Termios2, TtyWrite, apply_termios_update, filter_cursor_position_requests,
-    };
+    use super::{Terminal, Termios2, TtyWrite, apply_termios_update};
     use crate::StarryResult;
 
     struct TermiosOrderWriter {
@@ -557,48 +581,4 @@ mod tests {
         assert_eq!(terminal.load_termios().baudrate(), old_baudrate);
     }
 
-    #[test]
-    fn cursor_position_request_matcher_does_not_buffer_partial_writes() {
-        assert_eq!(
-            filter_cursor_position_requests(b"\x1b["),
-            (b"\x1b[".to_vec(), 0)
-        );
-        assert_eq!(filter_cursor_position_requests(b"6"), (b"6".to_vec(), 0));
-        assert_eq!(filter_cursor_position_requests(b"n"), (b"n".to_vec(), 0));
-    }
-
-    #[test]
-    fn cursor_position_request_matcher_recovers_after_partial_mismatch() {
-        assert_eq!(
-            filter_cursor_position_requests(b"\x1bX"),
-            (b"\x1bX".to_vec(), 0)
-        );
-        assert_eq!(filter_cursor_position_requests(b"\x1b[6n"), (Vec::new(), 1));
-        assert_eq!(
-            filter_cursor_position_requests(b"\x1b[6n\x1b[6n"),
-            (Vec::new(), 2)
-        );
-    }
-
-    #[test]
-    fn cursor_position_request_filter_preserves_other_output() {
-        assert_eq!(
-            filter_cursor_position_requests(b"ab\x1b[6ncd"),
-            (b"abcd".to_vec(), 1)
-        );
-    }
-
-    #[test]
-    fn cursor_position_request_filter_flushes_unmatched_prefix() {
-        assert_eq!(
-            filter_cursor_position_requests(b"\x1b[31mred"),
-            (b"\x1b[31mred".to_vec(), 0)
-        );
-
-        assert_eq!(
-            filter_cursor_position_requests(b"\x1b["),
-            (b"\x1b[".to_vec(), 0)
-        );
-        assert_eq!(filter_cursor_position_requests(b"A"), (b"A".to_vec(), 0));
-    }
 }

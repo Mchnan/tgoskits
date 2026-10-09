@@ -33,8 +33,8 @@
 .equ CSR_GSTAT_PVM,    0x2
 .equ CSR_TLBRPRMD_PGM, 0x8
 .equ CSR_GTLBC_TGID,   0xff0000
-.equ CSR_TIMER_IE,     0x800
 .equ CSR_CRMD_IE,      0x4
+.equ CSR_PRMD_PIE,     0x4
 .equ STAGE2_PWCL,      0x13e4d52c
 .equ STAGE2_PWCH,      0x267
 .equ STAGE2_STLBPS,    12
@@ -70,8 +70,17 @@
 .macro RESTORE_HOST_TRANSLATION
     ld.d    $t0, $sp, {host_eentry}
     csrwr   $t0, CSR_EENTRY
-    ld.d    $t0, $sp, {host_ecfg}
-    csrwr   $t0, CSR_ECFG
+    // The host snapshot of ECFG is authoritative only for the borrowed VS
+    // field. LIE belongs to the host interrupt manager and may have changed
+    // while the guest was bound (for example masking the clockevent line), so
+    // exiting must keep every live field and write back only the VS value.
+    csrrd   $t1, CSR_ECFG
+    li.d    $t0, ECFG_VS_MASK
+    andn    $t1, $t1, $t0
+    ld.d    $t2, $sp, {host_ecfg}
+    and     $t2, $t2, $t0
+    or      $t1, $t1, $t2
+    csrwr   $t1, CSR_ECFG
     ld.d    $t0, $sp, {host_tlbrentry}
     csrwr   $t0, CSR_TLBRENTRY
     ld.d    $t0, $sp, {host_asid}
@@ -285,30 +294,19 @@
     csrwr   $t1, CSR_GTLBC
 .endm
 
-.macro DISABLE_TIMER_IRQ_WITH_SAVED_GUEST_T0_T1
-    csrwr   $t1, HOST_TRAP_T1_KS
-    csrrd   $t0, CSR_ECFG
-    li.d    $t1, CSR_TIMER_IE
-    andn    $t0, $t0, $t1
-    csrwr   $t0, CSR_ECFG
-    csrrd   $t1, HOST_TRAP_T1_KS
-.endm
-
 .macro PREPARE_GUEST_ENTRY
     li.d    $t0, CSR_CRMD_IE
     csrxchg $zero, $t0, CSR_CRMD
 
-    csrwr   $zero, CSR_PRMD
+    // ERTN must enable root interrupts while the guest executes. Guest IE
+    // belongs to GCSR_CRMD and is independent of this host return state.
+    li.d    $t0, CSR_PRMD_PIE
+    csrwr   $t0, CSR_PRMD
 
     csrrd   $t1, CSR_TLBRERA
     li.d    $t0, -2
     and     $t1, $t1, $t0
     csrwr   $t1, CSR_TLBRERA
-
-    csrrd   $t0, CSR_ECFG
-    li.d    $t1, CSR_TIMER_IE
-    andn    $t0, $t0, $t1
-    csrwr   $t0, CSR_ECFG
 .endm
 
 .macro RESTORE_GUEST_REGS
@@ -525,7 +523,6 @@ __ax_cpu_lvz_guest_tlb_refill_vector:
 .Lguest_stage2_tlb_invalid:
     csrrd   $t0, CSR_TLBRSAVE
     csrwr   $t0, HOST_VCPU_TMP_KS
-    DISABLE_TIMER_IRQ_WITH_SAVED_GUEST_T0_T1
     csrwr   $sp, 0x502
     csrrd   $sp, HOST_VCPU_KS
     addi.d  $sp, $sp, -{ctx_size}
@@ -664,7 +661,6 @@ __ax_cpu_lvz_exception_vectors:
 
 __ax_cpu_lvz_irq_handler_vector:
     csrwr   $t0, HOST_VCPU_TMP_KS
-    DISABLE_TIMER_IRQ_WITH_SAVED_GUEST_T0_T1
     csrwr   $sp, 0x502
     csrrd   $sp, HOST_VCPU_KS
     addi.d  $sp, $sp, -{ctx_size}
@@ -676,7 +672,6 @@ __ax_cpu_lvz_irq_handler_vector:
 
 __ax_cpu_lvz_sync_handler_vector:
     csrwr   $t0, HOST_VCPU_TMP_KS
-    DISABLE_TIMER_IRQ_WITH_SAVED_GUEST_T0_T1
     csrwr   $sp, 0x502
     csrrd   $sp, HOST_VCPU_KS
     addi.d  $sp, $sp, -{ctx_size}
@@ -688,7 +683,6 @@ __ax_cpu_lvz_sync_handler_vector:
 
 __ax_cpu_lvz_hvc_handler_vector:
     csrwr   $t0, HOST_VCPU_TMP_KS
-    DISABLE_TIMER_IRQ_WITH_SAVED_GUEST_T0_T1
     csrwr   $sp, 0x502
     csrrd   $sp, HOST_VCPU_KS
     addi.d  $sp, $sp, -{ctx_size}

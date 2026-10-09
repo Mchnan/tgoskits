@@ -1,0 +1,75 @@
+name: AxVisor Nightly
+
+on:
+  schedule:
+    # 03:20 Beijing time, offset from the Starry Apps schedule.
+    - cron: "20 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: axvisor-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan AxVisor Nightly
+    if: github.repository == 'rcore-os/tgoskits'
+    runs-on: ubuntu-latest
+    outputs:
+      revision: ${{ steps.revision.outputs.sha }}
+      axvisor_matrix: ${{ steps.matrix.outputs.axvisor_matrix }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Pin triggering revision
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Plan AxVisor nightly checks
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 scripts/test/ci_plan.py \
+            --mode axvisor-nightly \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-owner "$GITHUB_REPOSITORY_OWNER" \
+            --event-name "$EVENT_NAME" \
+            --output-file "$GITHUB_OUTPUT"
+
+  checks:
+    name: AxVisor
+    needs: [plan]
+    uses: ./.github/workflows/reusable-check-matrix.yml
+    with:
+      checkout_ref: ${{ needs.plan.outputs.revision }}
+      matrix_json: ${{ needs.plan.outputs.axvisor_matrix }}
+      fail_fast: false
+      save_cache: ${{ github.event_name == 'schedule' }}
+
+  result:
+    name: Nightly Result
+    if: always() && github.repository == 'rcore-os/tgoskits'
+    needs: [plan, checks]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report result
+        env:
+          REVISION: ${{ needs.plan.outputs.revision }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          CHECKS_RESULT: ${{ needs.checks.result }}
+        run: |
+          {
+            echo "## AxVisor Nightly"
+            echo ""
+            echo "tested revision: ${REVISION}"
+            echo ""
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "| Plan | ${PLAN_RESULT} |"
+            echo "| Checks | ${CHECKS_RESULT} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$PLAN_RESULT" = success
+          test "$CHECKS_RESULT" = success

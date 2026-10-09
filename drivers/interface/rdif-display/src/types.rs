@@ -1,62 +1,120 @@
-use core::ops::{Deref, DerefMut};
+use alloc::{string::String, sync::Arc, vec::Vec};
+use core::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PixelFormat {
-    Rgb565,
-    Rgb888,
-    Xrgb8888,
-    Argb8888,
-    Bgr888,
-    Xbgr8888,
+use rdif_gpu::{Backing, BufferHandle, Completion, PixelFormat};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OutputId(u32);
+
+impl OutputId {
+    pub const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    pub const fn id(self) -> u32 {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DisplayInfo {
+pub struct Mode {
     pub width: u32,
     pub height: u32,
-    pub stride: usize,
-    pub format: PixelFormat,
-    pub fb_size: usize,
+    /// Zero means the device does not report a refresh rate.
+    pub refresh_millihz: u32,
 }
 
-pub struct FrameBuffer<'a> {
-    raw: &'a mut [u8],
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputInfo {
+    pub id: OutputId,
+    pub name: String,
+    pub kind: OutputKind,
+    pub connected: bool,
+    pub physical_size_mm: Option<(u32, u32)>,
+    pub modes: Vec<Mode>,
+    pub preferred_mode: Option<Mode>,
+    pub formats: Vec<PixelFormat>,
 }
 
-impl<'a> FrameBuffer<'a> {
-    /// # Safety
-    ///
-    /// The caller must ensure that `ptr..ptr + len` is valid, uniquely
-    /// borrowed for the lifetime `'a`, and points to framebuffer memory.
-    pub unsafe fn from_raw_parts_mut(ptr: *mut u8, len: usize) -> Self {
-        Self {
-            raw: unsafe { core::slice::from_raw_parts_mut(ptr, len) },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputKind {
+    Unknown,
+    Virtual,
+    Internal,
+    Hdmi,
+    DisplayPort,
+    Vga,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Scanout may refer to a GPU-owned resource or a display-only allocation.
+#[derive(Clone)]
+pub enum ScanoutBuffer {
+    Gpu(BufferHandle),
+    Backing(Arc<dyn Backing>),
+}
+
+impl fmt::Debug for ScanoutBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gpu(handle) => f.debug_tuple("Gpu").field(handle).finish(),
+            Self::Backing(backing) => f
+                .debug_struct("Backing")
+                .field("len", &backing.len())
+                .field("domain_id", &backing.domain_id())
+                .finish(),
         }
     }
+}
 
-    pub fn from_slice(slice: &'a mut [u8]) -> Self {
-        Self { raw: slice }
-    }
+#[derive(Debug, Clone)]
+pub struct Framebuffer {
+    pub buffer: ScanoutBuffer,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub offset: usize,
+    pub format: PixelFormat,
+}
 
-    pub fn as_slice(&self) -> &[u8] {
-        self.raw
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.raw
+impl Framebuffer {
+    /// Minimum allocation size for the visible plane, or `None` on overflow
+    /// or impossible geometry. The display driver still checks its own limits.
+    pub fn required_len(&self) -> Option<usize> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let row = (self.width as usize).checked_mul(self.format.bytes_per_pixel())?;
+        if (self.stride as usize) < row {
+            return None;
+        }
+        self.offset
+            .checked_add((self.height as usize - 1).checked_mul(self.stride as usize)?)?
+            .checked_add(row)
     }
 }
 
-impl Deref for FrameBuffer<'_> {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.raw
-    }
+/// Complete state of one output. `framebuffer: None` disables scanout.
+#[derive(Debug, Clone)]
+pub struct DisplayState {
+    pub output: OutputId,
+    pub mode: Option<Mode>,
+    pub framebuffer: Option<Framebuffer>,
+    pub damage: Vec<Rect>,
 }
 
-impl DerefMut for FrameBuffer<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.raw
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayEvent {
+    OutputChanged(OutputId),
+    CommitCompleted {
+        output: OutputId,
+        completion: Completion,
+    },
 }

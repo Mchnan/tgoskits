@@ -86,7 +86,7 @@ rootfs used by the app runner.
 
 ```bash
 mkdir -p tmp/wayland-manual
-cp "tmp/axbuild/rootfs/rootfs-${ARCH}-alpine.img" "tmp/wayland-manual/${ARCH}.img"
+cp "target/axbuild/rootfs/rootfs-${ARCH}-alpine.img" "tmp/wayland-manual/${ARCH}.img"
 ```
 
 ### Step 3: Start QEMU with a VNC Display
@@ -286,7 +286,7 @@ STARRY_VNC=9 ./apps/starry/wayland/run-hvf.sh --no-build --vnc-only
 ```
 
 Use `--reprovision` to discard and recreate
-`tmp/axbuild/rootfs/rootfs-aarch64-wayland.img`. Set
+`target/axbuild/rootfs/rootfs-aarch64-wayland.img`. Set
 `STARRY_WAYLAND_ROOTFS_MB` if the default 4096 MiB manual image is not suitable.
 The helper requires host `debugfs`, `e2fsck`, `resize2fs`, `python3`, and
 `qemu-system-aarch64`; on macOS with Homebrew, the script adds the usual
@@ -307,7 +307,7 @@ This app requires:
 - `memfd_create` and file-descriptor passing over Unix sockets for Wayland SHM.
 - `eventfd` for the compositor event loop.
 - udev seed data under `/run/udev/data/` for libinput device discovery.
-- `starry-kernel/input` and `ax-runtime/display` in the app build config.
+- `ax-runtime/display` in the app build config.
 
 The optional manual package-install flow additionally needs a kernel/QEMU launch
 with working guest networking if the packages are not already present in the

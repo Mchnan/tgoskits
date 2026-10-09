@@ -1,7 +1,7 @@
 use alloc::{string::String, sync::Arc};
 use core::ffi::c_char;
 
-use ax_fs_ng::vfs::{OpenOptions, current_fs_context};
+use ax_fs_ng::vfs::{CachedFile, FileBackend, FileFlags, current_fs_context};
 use linux_raw_sys::general::{MFD_CLOEXEC, O_RDWR};
 
 pub(crate) use crate::file::memfd::{
@@ -9,6 +9,7 @@ pub(crate) use crate::file::memfd::{
     check_write_seal_for_shared_file_backend as memfd_check_write_seal_for_shared_file_backend,
     collect_metas_touching_mprotect_range as memfd_collect_metas_touching_mprotect_range,
     on_after_map as memfd_on_after_map,
+    prepare_new_mapping_delta as memfd_prepare_new_mapping_delta,
     prepare_aspace_replace_deltas as memfd_prepare_aspace_replace_deltas,
     prepare_aspace_unmap_deltas as memfd_prepare_aspace_unmap_deltas,
     resync_shared_writable_counts_after_mprotect as memfd_resync_shared_writable_counts_after_mprotect,
@@ -83,11 +84,12 @@ pub fn sys_memfd_create(
     );
     let loc = axfs_ng_vfs::Location::new(mountpoint, entry);
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open_loc(loc.clone())?
-        .into_file()?;
+    // Like Linux alloc_file_pseudo(), the initial anonymous file does not
+    // acquire pathname-open write access. A later open of its procfs fd does.
+    let file = ax_fs_ng::File::new(
+        FileBackend::Cached(CachedFile::get_or_create(loc.clone())?),
+        FileFlags::READ | FileFlags::WRITE,
+    );
 
     let inner = Arc::new(File::new(file, O_RDWR));
     let memfd = Memfd::new(inner, name_str, allow_sealing);

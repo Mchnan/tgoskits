@@ -10,7 +10,7 @@ use ax_lazyinit::OnceLock;
 use axpoll::{IoEvents, Pollable};
 use axpoll_set::PollSet;
 
-use super::{File, FileLike, IoDst, IoSrc, Kstat};
+use super::{File, FileLike, InodeKey, IoDst, IoSrc, Kstat};
 use crate::{StarryResult, sync::IrqMutex};
 
 const MOUNT_CHANGE_EVENTS: IoEvents = IoEvents::PRI.union(IoEvents::ERR);
@@ -108,6 +108,10 @@ impl MountTableFile {
 }
 
 impl FileLike for MountTableFile {
+    fn validate_write_access(&self) -> StarryResult {
+        self.file.validate_write_access()
+    }
+
     fn read(&self, dst: &mut IoDst) -> StarryResult<usize> {
         self.file.read(dst)
     }
@@ -120,7 +124,7 @@ impl FileLike for MountTableFile {
         self.file.stat()
     }
 
-    fn inode_key(&self) -> Option<(u64, u64)> {
+    fn inode_key(&self) -> Option<InodeKey> {
         self.file.inode_key()
     }
 

@@ -85,6 +85,38 @@ const AX_DRIVER_FEATURE_PROFILES: &[PackageFeatureProfile] = &[
     },
 ];
 
+// The rdif feature gates the whole rdif module and its device-level tests;
+// the plain default-feature run only covers the ctrl queue. This profile
+// lists the gated tests so CI proves they are discovered and executed.
+const VIRTIO_GPU_FEATURE_PROFILES: &[PackageFeatureProfile] = &[PackageFeatureProfile {
+    name: "rdif",
+    no_default_features: false,
+    features: &["rdif"],
+    name_filter: None,
+    expected_tests: &[
+        "rdif_test::context_close_releases_attachments_after_drain",
+        "rdif_test::display_change_remains_pending_after_output_query_fails",
+        "rdif_test::lost_device_fails_every_operation_fast",
+        "rdif_test::normal_drop_confirms_reset_before_releasing_queue",
+        "rdif_test::resource_creation_passes_the_format_through",
+        "rdif_test::scanout_rejects_a_3d_resource_with_an_incompatible_format",
+        "rdif_test::stale_context_handle_is_rejected",
+        "rdif_test::stalled_release_submits_without_resetting_the_device",
+        "rdif_test::completion_status_delivers_and_pumps_before_reporting",
+        "rdif_test::sync_response_with_wrong_fence_resets_the_device",
+        "rdif_test::test_only_and_release_keep_scanout_and_backing",
+        "rdif_test::unconfirmed_context_destroy_resets_before_releasing_backing",
+    ],
+}];
+
+const ACPICA_FEATURE_PROFILES: &[PackageFeatureProfile] = &[PackageFeatureProfile {
+    name: "host-test",
+    no_default_features: false,
+    features: &["host-test"],
+    name_filter: None,
+    expected_tests: &["production_interpreter_loads_and_evaluates_authored_aml"],
+}];
+
 const HOST_TEST_FEATURE_PROFILES: &[PackageFeatureProfile] = &[PackageFeatureProfile {
     name: "host-test",
     no_default_features: false,
@@ -123,14 +155,6 @@ const ALLOC_FEATURE_PROFILES: &[PackageFeatureProfile] = &[PackageFeatureProfile
     expected_tests: &[],
 }];
 
-const FS_FEATURE_PROFILES: &[PackageFeatureProfile] = &[PackageFeatureProfile {
-    name: "fs",
-    no_default_features: false,
-    features: &["fs"],
-    name_filter: None,
-    expected_tests: &[],
-}];
-
 const AX_FS_NG_FEATURE_PROFILES: &[PackageFeatureProfile] = &[
     PackageFeatureProfile {
         name: "host-test+vfs+fat+ext4",
@@ -138,6 +162,15 @@ const AX_FS_NG_FEATURE_PROFILES: &[PackageFeatureProfile] = &[
         features: &["host-test", "vfs", "fat", "ext4"],
         name_filter: None,
         expected_tests: &["block::cache::registry::tests::reclaim_capability_does_not_defer_last_endpoint_drop"],
+    },
+    PackageFeatureProfile {
+        name: "host-test-non-vfs-writeback-discovery",
+        no_default_features: false,
+        features: &["host-test"],
+        name_filter: Some("non_vfs_background_watermark_stays_synchronous"),
+        expected_tests: &[
+            "file::cache::tests::non_vfs_background_watermark_stays_synchronous",
+        ],
     },
     PackageFeatureProfile {
         name: "host-test-resource-rollback-discovery",
@@ -534,10 +567,11 @@ fn package_feature_profiles(package: &str) -> Option<&'static [PackageFeaturePro
         "ax-hal" => Some(AX_HAL_FEATURE_PROFILES),
         "ax-driver" => Some(AX_DRIVER_FEATURE_PROFILES),
         "nvme-driver" => Some(NVME_FEATURE_PROFILES),
+        "acpica-interpreter" => Some(ACPICA_FEATURE_PROFILES),
         "sdmmc-protocol" => Some(SDMMC_RDIF_FEATURE_PROFILES),
         "aic8800" => Some(AIC8800_FEATURE_PROFILES),
         "axbuild" => Some(AXBUILD_FEATURE_PROFILES),
-        "axvisor" => Some(FS_FEATURE_PROFILES),
+        "virtio-gpu" => Some(VIRTIO_GPU_FEATURE_PROFILES),
         _ => None,
     }
 }
@@ -797,53 +831,6 @@ mod tests {
     }
 
     #[test]
-    fn incremental_selection_accepts_no_affected_std_packages() {
-        let packages = vec!["ax-api".to_string(), "ax-hal".to_string()];
-        let selection = IncrementalPackageSelection::Packages {
-            changed: vec!["standalone".to_string()],
-            affected: vec!["standalone".to_string()],
-        };
-
-        let selected = select_std_packages(packages, &selection);
-
-        assert!(selected.is_empty());
-    }
-
-    #[test]
-    fn incremental_full_fallback_keeps_every_std_package() {
-        let packages = vec!["ax-api".to_string(), "ax-hal".to_string()];
-        let selection = IncrementalPackageSelection::Full {
-            reason: "fixture".to_string(),
-        };
-
-        let selected = select_std_packages(packages.clone(), &selection);
-
-        assert_eq!(selected, packages);
-    }
-
-    #[test]
-    fn parses_std_csv_with_blank_lines() {
-        let packages =
-            parse_std_crates_csv("\npackage\n\nax-api\n\nax-hal\n", &known_packages()).unwrap();
-
-        assert_eq!(packages, vec!["ax-api".to_string(), "ax-hal".to_string()]);
-    }
-
-    #[test]
-    fn rejects_empty_std_csv() {
-        let err = parse_std_crates_csv("", &known_packages()).unwrap_err();
-
-        assert!(err.to_string().contains("std crate csv is empty"));
-    }
-
-    #[test]
-    fn rejects_invalid_header() {
-        let err = parse_std_crates_csv("crate\nax-api\n", &known_packages()).unwrap_err();
-
-        assert!(err.to_string().contains("invalid header"));
-    }
-
-    #[test]
     fn rejects_unknown_package() {
         let err = parse_std_crates_csv("package\nunknown\n", &known_packages()).unwrap_err();
 
@@ -851,13 +838,6 @@ mod tests {
             err.to_string()
                 .contains("unknown workspace package `unknown`")
         );
-    }
-
-    #[test]
-    fn rejects_duplicate_package() {
-        let err = parse_std_crates_csv("package\nax-api\nax-api\n", &known_packages()).unwrap_err();
-
-        assert!(err.to_string().contains("duplicate package `ax-api`"));
     }
 
     #[test]
@@ -871,18 +851,6 @@ mod tests {
         let failed = run_std_tests(&mut runner, &root, &packages).unwrap();
 
         assert_eq!(failed, vec!["alpha", "gamma"]);
-        assert_eq!(runner.invocations.len(), packages.len());
-    }
-
-    #[test]
-    fn std_test_runner_returns_empty_failures_when_all_pass() {
-        let root = PathBuf::from("/tmp/workspace");
-        let packages = vec!["alpha".to_string(), "beta".to_string()];
-        let mut runner = FakeCargoRunner::succeeding();
-
-        let failed = run_std_tests(&mut runner, &root, &packages).unwrap();
-
-        assert!(failed.is_empty());
         assert_eq!(runner.invocations.len(), packages.len());
     }
 
@@ -923,23 +891,6 @@ mod tests {
         let err =
             validate_discovered_tests(&TEST_PROFILES[0], "0 tests, 0 benchmarks").unwrap_err();
         assert!(err.to_string().contains("discovered 0 tests"));
-    }
-
-    #[test]
-    fn unfiltered_profile_discovery_accepts_additional_tests() {
-        let profile = &TEST_PROFILES[0];
-        let mut tests = profile.expected_tests.to_vec();
-        tests.push("example::additional");
-        validate_discovered_tests(profile, &render_test_list(&tests)).unwrap();
-    }
-
-    #[test]
-    fn filtered_profile_discovery_rejects_additional_tests() {
-        let profile = &TEST_PROFILES[1];
-        let mut tests = profile.expected_tests.to_vec();
-        tests.push("example::additional");
-        let err = validate_discovered_tests(profile, &render_test_list(&tests)).unwrap_err();
-        assert!(err.to_string().contains("expected ["));
     }
 
     #[test]

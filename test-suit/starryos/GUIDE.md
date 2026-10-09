@@ -5,6 +5,36 @@
 
 测试设计统一遵循 [test-quality](../../.agents/skills/test-quality/SKILL.md)：优先复用或增强完整功能验证，错误输入的拒绝、状态保持和资源回收并入所属功能，不逐参数或 errno 拆测。本指南中的 case 选择、成功标记和 LTP 完成数量用于运行可信度，不因去重而削弱。
 
+## 一次性外部 QEMU 运行
+
+需要运行已经准备好的独立 rootfs、但仍复用 Starry 构建、成功判定和覆盖率导出链路时，
+可以给 `starry test qemu` 同时提供三个外部输入：
+
+```bash
+cargo xtask starry test qemu \
+  --build-config /absolute/path/build.toml \
+  --qemu-config /absolute/path/qemu.toml \
+  --rootfs /absolute/path/rootfs.img
+```
+
+三个参数必须成组出现，并与 `--arch`、`--target`、`--test-case` 和 `--list` 互斥。
+构建配置负责给出目标；QEMU 配置负责成功、失败和超时判定。外部 rootfs 总是以
+`snapshot=on` 接入，客户机写入不会落回原镜像。
+
+如需复现某个既有内核制品，可再传入位于 Cargo target 目录之外的绝对路径
+`--fixed-elf /absolute/path/starryos`。运行器仍先完成当前源码构建与 `.kallsyms`
+后处理，再比较构建产物和固定 ELF 的架构、入口以及装载与覆盖率 section；验证成功后
+只从固定 ELF 的临时副本启动，因此不会改写固定文件本体。
+
+调用方需要直接观察 QEMU Machine Protocol 时，可在自己的外部 QEMU 配置中声明
+`-qmp` 参数。运行器不连接或解释该端点；socket 生命周期、协议协商、事件解释和命令
+发送均由调用方负责。
+
+构建配置显式设置 `AXTEST_COVERAGE = "y"` 时，运行器启用 Starry 的软件包级覆盖率
+feature，等待客户机写入测试专用 `/proc/starry-test-coverage`，由宿主导出
+`coverage/starryos-<target>.profraw` 后再结束 QEMU。这个入口不参与
+`test-suit/starryos` 的用例发现或 CI case 路由。
+
 ## 发现规则
 
 StarryOS test-suit 不再使用 `normal`、`stress` 等一级测试组。QEMU 和 board
@@ -26,8 +56,8 @@ test-suit/starryos/<build_wrapper>/<case>/<runtime-config>.toml
   选择器；也可以写成 `qemu/system/<subcase>`。
 - `<subcase>` 优先使用 `system/` 下的子目录名；如果某个子测例安装的
   `usr/bin/starry-test-suit` binary / CMake target 名与目录名不同，也可以使用唯一的
-  binary / target 名，例如 `qemu/test-uid-gid-re-setters` 会映射到
-  `qemu/system/syscall-test-uid-gid-re-setters`。
+  binary / target 名，例如 `qemu/test-prlimit64` 会映射到
+  `qemu/system/syscall-test-prlimit64`。
 - `-l/--list` 列出根目录下发现的 Starry case；`qemu` 这类仅含 build config 的 wrapper 不会作为 root case 出现。
 
 旧的 Starry `--test-group` 和 `--stress` 入口已经移除。需要运行迁出的压力、K230、
@@ -73,7 +103,7 @@ test-suit/starryos/
       drm-test-drm-perbuf-dumb/
         CMakeLists.txt
         src/
-      evdev-test-evdev-event-primary/
+      evdev-test-evdev-minor/
         CMakeLists.txt
         src/
       usb-audio-iso/
@@ -88,7 +118,7 @@ test-suit/starryos/
       board-orangepi-5-plus.toml
     native-network-smoke/
       board-orangepi-5-plus.toml
-      iperf-smoke.sh
+      network-smoke.sh
 ```
 
 `qemu/system` 是统一的 SMP4 聚合 QEMU case。`qemu/` 根目录只放四架构 build
@@ -156,11 +186,12 @@ STARRY_SYSTEM_TEST_SUMMARY: total=1 passed=1 failed=0 elapsed_s=0.012
 后续 syscall 测试逐项迁移的断言映射、覆盖损失和验证状态记录在
 [`MIGRATION.md`](../../scripts/test/ltp-syscalls/MIGRATION.md) 与
 [`migration.csv`](../../scripts/test/ltp-syscalls/migration.csv)。该清单包含待审计项，
-不能把候选数量当成已经完成的迁移数量；每项迁移保留独立提交。已合入的 PR #2322
-处理了 13 个原程序（9 项部分替代、4 项无等效清理）。先前续迁批次另部分替代 7 个原程序；当前轮追加
-`bug-linkat-flags-symlink` 的 `linkat01` 部分替代并修复绝对目标路径的 `newdirfd` 语义，详细断言损失与失败记录见 [`NEXT.md`](../../scripts/test/ltp-syscalls/NEXT.md)。当前实际清单
-包含 85 个共同 LTP 用例，x86_64 另有 2 个旧入口用例；这是累计执行集合，两个 native
-隔离回归单独计数。IPv6 等先前失败项，以及本批 fcntl14/16 对应的原测试继续保留。
+不能把候选数量当成已经完成的迁移数量；每个原程序保留独立账本记录。已合入的 PR #2322
+处理了 13 个原程序（9 项部分替代、4 项无等效清理）。先前续迁批次及
+`bug-linkat-flags-symlink` 的 `linkat01` 部分替代见
+[`NEXT.md`](../../scripts/test/ltp-syscalls/NEXT.md)。2026-09-14 全量续迁从
+85 个共同 LTP 用例、2 个 x86_64 旧入口用例的基线开始；该数量是迁移前累计集合，
+不是本轮成功数量。两个 native 隔离回归单独计数，本轮结果见该文档第 5 节。
 
 `qemu/system/ltp-syscalls` 使用 rootfs 中固定的 Linux Test Project
 `20260529`（上游 commit `3a64d78f58bdceba93ed321e91215fb969a047ed`）。
@@ -203,8 +234,8 @@ STARRY_SYSTEM_PHASE_BEGIN: ltp-syscalls
 STARRY_SYSTEM_PHASE_END: ltp-syscalls
 ```
 
-`scripts/test/ltp-syscalls/probe-cases.txt` 保存从 PR #1775 所触及 C cases 对应到的
-官方 LTP families，包括
+`scripts/test/ltp-syscalls/probe-cases.txt` 保存历史批次及 bugfix/syscall 全量续迁审计过的
+官方 LTP 候选，包括
 process/namespace/pidfd/ptrace、futex/pipe/poll/epoll/socket、scheduler/affinity/timer/
 membarrier，以及 mmap/mprotect/memfd/perf。更新共同集时，先让候选集在四架构分别完成
 probe 并保存完整日志，再运行：
@@ -225,17 +256,25 @@ scripts/test/ltp-syscalls/generate-common.sh \
 这次接管的边界有意收缩：PR #1775 新增或修改过可执行 C 源码的 Starry cases 从发现
 流程中整项移除，由最终共同集中的官方 LTP 结果承担回归；原 C cases 中 LTP 没有表达的
 自定义断言不再保留，也不再宣称仍被覆盖。ArceOS C 测试仍由 ArceOS 自己的测试入口维护。
-性能基准 `apps/starry/wakeup-latency-bench` 作为独立 Starry app 保留，供后续调优使用。
+性能基准 `benchmarks/starry/wakeup-latency-bench` 作为独立 Starry app 保留，供后续调优使用。
 
 逐项 syscall 迁移以 `scripts/test/ltp-syscalls/migration.csv` 为账本。按当前工作约定，
-候选 LTP 出错时保留原测试，记录候选、失败架构、错误输出、证据路径及独立 issue 后暂缓，先处理
+候选 LTP 出错时保留原测试，记录候选、失败架构、错误输出和证据路径后暂缓，先处理
 无需修复且四架构通过的替换。暂缓不是通过，不删除失败候选，也不放宽 wrapper 的失败
-传播或完成数量检查。已完成替换仍须逐项记录未承接的断言。续迁批次遵循同一规则，测试失败时
+传播或完成数量检查。已完成替换仍须逐项记录未承接的断言。2026-09-14 续迁范围是当前
+`bugfix-*` 与 `syscall-*` 原程序：允许部分覆盖，不为覆盖缺口补写自定义测试；完全没有
+对应 LTP 的原程序保留。逐项按名称处理，失败后继续下一项，遍历完全部清单；本轮完成验证后提交拉取请求，不创建
+缺陷议题。续迁批次遵循同一规则，测试失败时
 不修改内核、上游逻辑、完成数量或超时来接入候选。停机同步对照本机 Linux v7.1 PREEMPT_RT 的命令锁、禁止抢占及阶段确认
 逻辑；wait 重启与信号通知确认修复的范围、源码依据和红绿证据分别记录在
 `MIGRATION.md` 第 7、8 节。
 
 定向运行累计 LTP 集合使用 `cargo xtask starry test qemu --arch <arch> -c qemu/system/ltp-syscalls`；
+只运行一个 LTP testcase 使用
+`cargo xtask starry test qemu --arch x86_64 -c qemu/system/ltp-syscalls/execve03`。
+单项名称须位于 `cases.txt` 或对应架构的 `cases-<arch>.txt`；无效名称在构建前报错。
+单项运行仅安装该 testcase 的 wrapper，不执行整组专用的两个 native 隔离回归；
+wrapper 原有的 LTP 版本、`TPASS` 完成数量及文件系统检查仍然生效。
 完整系统验证使用 `cargo xtask starry test qemu --arch <arch> -c qemu/system`。四个架构
 `x86_64`、`aarch64`、`riscv64`、`loongarch64` 在同一工作区串行执行，只有实际完成的
 测试结果才能计为通过。
@@ -276,8 +315,8 @@ cargo xtask starry test qemu --arch loongarch64 -c qemu/system/test-tty-termios-
   `max_ioqpairs=64,msix_qsize=65`，不回退到 `virtio-blk`。
 - `virtio-net` 提供基础网络。
 - `virtio-gpu`、`virtio-keyboard`、`virtio-tablet` 支持 DRM/evdev。
-- `qemu-xhci,id=xhci,msi=off,msix=off`、`usb-audio`、`usb-storage` 支持 USB 回归。
-- USB storage 第二盘使用 `${workspace}/tmp/axbuild/rootfs/rootfs-<arch>-busybox.img`。
+- `nec-usb-xhci,id=xhci,msi=off,msix=off`、`usb-audio`、`usb-storage` 支持 USB 回归。
+- USB storage 第二盘使用 `${workspace}/target/axbuild/rootfs/rootfs-<arch>-busybox.img`。
 
 `system/qemu-loongarch64.toml` 不带 xHCI、USB audio 或 USB storage。对应 build config
 也不启用 `ax-driver/xhci-pci`。USB 测试程序仍会被构建并安装，但在 loongarch64 guest
@@ -286,6 +325,22 @@ cargo xtask starry test qemu --arch loongarch64 -c qemu/system/test-tty-termios-
 ## QEMU 用例类型
 
 运行器会根据 case 目录内容选择一个 asset pipeline。一个 case 只能使用一种 pipeline。
+
+默认 Alpine 镜像在启动前准备 BusyBox init 与 OpenRC。分组 runner 由
+`starry-autorun` 服务执行，终端由 BusyBox init 重新拉起；测试命令结束不再等同于
+根 PID 1 退出。`qemu/pid1`、`qemu/pid1-exit`、`qemu/pid1-exit-thread` 和 `qemu/pid1-fault` 安装专用
+`/sbin/init`，验证根 PID 1 的信号、回收语义、两种退出入口与同步缺页；`qemu/openrc` 验证服务管理和终端重新拉起。
+
+`qemu/host-initramfs`、`qemu/host-initramfs-disk-fallback` 与 `qemu/host-initramfs-switch-root` 在 case 目录放置
+`host-initramfs.toml`，其中 `source` 指向工作区内的归档目录；可选的
+`init_source` 指向 AArch64 `/init` 的 C 源码，同目录须有 `entry-aarch64.S`。
+axbuild 在运行前用 clang/lld 编译 `/init`、构建 `newc` 归档，再交给 QEMU。
+运行配置不要再写固定 `initramfs` 路径。内存根用例不接磁盘，磁盘回退用例
+显式配置主 rootfs drive；两者分别检查 `/init` 优先和无 `/init` 时的 `root=`。
+
+`python3 scripts/test/starry_openrc_boot.py --arch <arch> --output <目录>` 另外在私有镜像副本上
+通过 `cargo xtask starry qemu` 连续启动两次，检查服务注册持久化、正常关机及重启的 QMP
+事件。它不修改 test-suit 的 discard 策略；单纯匹配服务停止日志不能替代电源终态证明。
 
 | Pipeline | 触发条件 | 行为 |
 | --- | --- | --- |
@@ -341,7 +396,7 @@ qemu-user 执行 staging root 内的工具，否则使用宿主原生 `<gnu_tool
 args = [
     "-nographic", "-cpu", "rv64",
     "-device", "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
-    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-alpine.img",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/target/axbuild/rootfs/rootfs-riscv64-alpine.img",
     "-device", "virtio-net-pci,netdev=net0",
     "-netdev", "user,id=net0",
 ]
@@ -430,7 +485,7 @@ configure 入口，自动 `add_subdirectory()` 各个 subcase；每个 subcase �
 调试单个 system subcase 时，不需要新增 CLI 参数，直接复用 `-c/--test-case`：
 
 ```bash
-cargo xtask starry test qemu --arch x86_64 -c qemu/syscall-test-uid-gid-re-setters
+cargo xtask starry test qemu --arch x86_64 -c qemu/syscall-test-prlimit64
 cargo xtask starry test qemu --arch x86_64 -c qemu/test-futex-race
 ```
 
@@ -464,8 +519,8 @@ STARRY_GROUPED_TEST_PASSED: step=1/2 epoch=... status=0 command=/usr/bin/test-a
 `STARRY_SYSTEM_TEST_BEGIN/PASSED/FAILED`，但仍只在全部 binary 通过后打印既有的
 `STARRY_GROUPED_TESTS_PASSED`，失败时仍打印 `STARRY_GROUPED_TEST_FAILED`。
 共享 runner 默认限制每个 binary 最多运行 120 秒；同步写入密集型的
-`test-ext4-inode-unique` 和完成 1400 个磁盘文件清理的 `test-pagecache-cap` 通过显式名称表
-取得 240 秒预算。慢用例例外必须保留在共享 runner 中并由静态契约测试覆盖，不能放宽所有
+`test-ext4-inode-unique` 通过显式名称表取得 240 秒预算。
+慢用例例外必须保留在共享 runner 中并通过运行器功能验证，不能放宽所有
 binary 的默认预算。TOML `timeout` 约束整个 QEMU case，不替代上述单 binary 超时。
 单 binary 超时后的 PID namespace 清理另有 30 秒硬上限；清理失败必须打印
 `STARRY_SYSTEM_TEST_CLEANUP_TIMEOUT` 并立即中止 suite，不能继续运行下一个 binary，也不能
@@ -520,7 +575,7 @@ os/StarryOS/configs/board/<board>.toml
 
 ```toml
 session_files = [
-  "iperf-bench.sh",
+  "network-bench.sh",
   "tools/network/probe.sh",
 ]
 ```
@@ -586,70 +641,58 @@ App 的 `board-<name>.toml` 默认复用
 ```bash
 cargo xtask starry test board --board orangepi-5-plus
 cargo xtask starry test board -c native-hardware-smoke --board orangepi-5-plus
-cargo xtask starry app board -t iperf3 -b OrangePi-5-Plus
+cargo xtask starry app board -t network-throughput -b OrangePi-5-Plus --board-config board-orangepi-5-plus.toml
+cargo xtask starry app board -t benchmark/iperf3 -b OrangePi-5-Plus
 ```
 
 `native-hardware-smoke` 在一次启动中依次验证启动、PCIe、USB2、PWM 和 NPU。
-`native-network-smoke` 执行一条短 TCP 双向命令，随后在 `eth1` 上验证 rtnetlink
-地址增删，适合作为 CI 连通性检查。完整吞吐测试位于 `apps/starry/iperf3`，直接通过
-上面的 `cargo xtask starry app board` 命令启动板测；ostool server 持续提供 iperf3
+`native-network-smoke` 在专用 TCP 3000 端口执行短时双向 HTTP 流式传输，随后在
+`eth1` 上验证 rtnetlink 地址增删，适合作为 CI 连通性检查。AKA Wi-Fi 的
+`wifi-network-smoke` 在取得 DHCP 地址后执行同样的双向传输。AKA 板端只有
+`wget` 时，测试会从本次 session 下载包含 `curl` 及其 musl 依赖的归档，再运行
+`upload-source` 和双向传输；无需预装 iperf 或 curl。
+
+nightly 性能用例在 `benchmarks/starry/iperf3` 提供完整 TCP 吞吐测试，直接通过
+上面的 `-t benchmark/iperf3` 命令启动板测；ostool server 持续提供 iperf3
 服务，board 配置步骤内的 `shell_cmd` 通过活动 session 的 `${boardServerIp}` 和
 `${sessionFile:iperf-bench.sh}` 获取实际地址；app 的 `init.sh` 会按现有 xtask 流程追加
 到该步骤中，下载并启动测试脚本，不依赖固定网卡、固定 IP、固定网段或额外的板测
 启动脚本。
 
-真板卡 CI 的 AKA WiFi 与 OrangePi 网络冒烟统一使用 iperf2，共享 TCP 5001
-服务端口；iperf2 服务进程接受多个独立客户端。`board-common/iperf2` 提供公共脚本
-和打包规则，各 case 的 `c/prebuild.sh` 在 Alpine 暂存环境安装 `iperf`，CMake 将
-客户端、musl 加载器及匹配的 C++ 运行库打包为 `share/iperf2.tar.gz`。板卡通过
-`${sessionFile:share/iperf2.tar.gz}` 下载到 `/tmp`，不要求预装客户端或修改持久根文件系统。
+`board-common/network-test` 的 `upload-source.c` 以 128 KiB 固定块生成零数据，
+按单调时钟运行指定时长，不落盘；CMake 将其编译并把脚本安装到每次运行的 session
+upload root。AKA 板测的 CMake 同时从 staging root 打包 curl 的目标 ELF 依赖。
+板端从 `${sessionFile:bin/...}` 和 `${sessionFile:share/curl-bundle.tar.gz}` 下载资产，使用 `${boardServerIp}:3000`
+访问 ostool-server 的网络测试服务。管理 API 仍使用 2999；该测试是 HTTP 协议，
+不兼容 iperf2/iperf3。
 
-`iperf2-smoke` 使用 `--full-duplex` 同时收发，按 iperf2 的普通线程 ID 和带 `*`
-的接收线程 ID 分别检查进展。AKA 运行 22 秒，其中前 2 秒预热；OrangePi 运行
-4 秒，其中前 1 秒预热。任一方向在预热后连续 3 秒无进展、缺少接收报告、最终
-报告提前结束或命令非零退出均失败。最终汇总不能覆盖中间停滞。完整 iperf3
-benchmark 应用仍可手工运行，不属于这两个 CI 冒烟入口。
+每次 smoke 先用 `POST /v1/tests` 获取独立的测试 ID，然后并行运行
+`PUT /v1/tests/{id}/upload` 和 `GET /v1/tests/{id}/download?duration_secs=N`。
+脚本每秒查询 `GET /v1/tests/{id}`，按上传和下载的字节数分别检查进展，预热后
+任一方向连续三次查询没有进展，或预热后未观察到该方向进展即失败。
+OrangePi 运行 4 秒、预热 1 秒；AKA Wi-Fi
+运行 22 秒、预热 2 秒。只有两个 curl 命令均成功、两方向状态均为 `completed`、
+字节数大于零且服务端耗时覆盖预期时长才打印通过标记。网络或服务端错误会失败；
+结果与测试 ID 同时输出，便于按服务端记录排查。专用端口默认最多允许 64 个
+活动测试；容量满时创建请求返回 429，smoke 会失败而不是误报通过。
 
-在 runner 服务器安装并启用共享 iperf2 服务：
+完整吞吐矩阵位于 `apps/starry/network-throughput`，通过上面的
+`cargo xtask starry app board` 手工启动。它覆盖单流上传、单流下载、单流双向、
+2/4/8 流上传和 4 流下载，每场景三轮并取中位数。上传使用同一
+`upload-source`，下载由服务端流式生成。板端用 `curl` 与服务端的状态字节计数
+计算 Mbps；这是 HTTP 流式吞吐指标，不能和旧 iperf3 报告直接比较。
+
+可在 runner 上检查服务：
 
 ```bash
-sudo apt-get install -y iperf
-sudo install -m 644 .github/ci/iperf2.service /etc/systemd/system/iperf2.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now iperf2.service
+curl -fsS http://10.3.10.194:3000/healthz
+curl -fsS -X POST http://10.3.10.194:3000/v1/tests
 ```
 
-模板使用 systemd 动态用户，服务器防火墙需要允许板卡访问 TCP 5001。服务端和
-板端必须都是 iperf2；iperf3 不兼容该协议。无需为每块板分配独立的 iperf3 实例。
-
-完整 benchmark 固定执行 T01--T07：单流 TX、单流 RX、单流双向、2/4/8 流 TX 和
-4 流 RX。每个场景使用 `-t 10 -O 2 -l 128K` 运行 3 次，每个连接结束后固定冷却
-15 秒，避免上一轮 TCP teardown 干扰下一轮；脚本直接打印原始输出、中位数和最终
-汇总表：
-
-```text
-T01  Single-stream DUT TX
-Command: iperf3 -c <session-host> -t 10 -O 2 -P 1 -l 128K
-
-Run 1/3
-<native iperf3 output>
-Result  DUT TX: ... Mbps
-
-Run 2/3
-<native iperf3 output>
-Result  DUT TX: ... Mbps
-
-Run 3/3
-<native iperf3 output>
-Result  DUT TX: ... Mbps
-
-Median DUT TX: ... Mbps
-STARRY_IPERF3_BENCH_PASSED
-```
-
-每轮 iperf3 原始文本和机器可读汇总保存在板端 `/tmp/starry-iperf3-bench/`。
-benchmark 只要求所有场景完成并产生有效速率，不设置与机器绑定的吞吐门槛；端口和
-测试档位固定，避免不同运行使用不同参数。
+测试要求 `ostool-server` 0.8.0 或更新版本，并启用网络测试服务。该端口在 TOML 中
+可配置，默认 3000。若服务器更改端口，
+需同时更新板卡脚本中的 URL。无需重启或更改独立的 iperf2 服务；迁移后的
+TGOSKits 测试不再调用它。
 
 ROCK 4D 使用板卡服务名称 `Rock-4D`、仓库内的 RK3576 DTB 和 1,500,000 baud
 串口。维护的单核启动回归命令为：
@@ -668,7 +711,7 @@ cargo xtask starry board \
   -b Rock-4D
 ```
 
-两条路径都必须进入 `root@starry:/root #` 并打印独立的
+两条路径都必须进入 `root@starry:~#` 并打印独立的
 `STARRY_ROCK4D_BOOT_OK` 成功行。RK3576 的固件、PSCI、CPU 拓扑和 CRU/PMU
 检查点见 `.claude/skills/arch-platform-porting/references/boot-debugging.md`。
 
@@ -686,7 +729,7 @@ discovery 或 CI 启用。后续网络可用时移除 `.disabled` 后缀；其
 cargo xtask starry test qemu --arch riscv64
 cargo xtask starry test qemu --target riscv64gc-unknown-none-elf
 cargo xtask starry test qemu --arch x86_64 -c qemu/system
-cargo xtask starry test qemu --arch x86_64 -c qemu/syscall-test-uid-gid-re-setters
+cargo xtask starry test qemu --arch x86_64 -c qemu/syscall-test-prlimit64
 
 # 列出发现的用例
 cargo xtask starry test qemu -l
@@ -711,3 +754,5 @@ cargo xtask starry app qemu -t k230-qemu/qemu-k230/kpu-smoke --arch riscv64
 - `fail_regex` 保持精确，避免匹配正常输出如 `failed: 0`。
 - 不要在同一个工作区并行运行多个 `cargo xtask starry test qemu`，rootfs 和生成配置可能互相影响。
 - heavy app 不应放回 `test-suit/starryos`；迁出到 `apps/starry` 后加入 `apps/.ignore`，需要时用显式 `-t` 运行。
+
+`qemu/host-initramfs-switch-root` 的早期 `/init` 直接挂载 NVMe Ext4、移动 `/dev`、执行 `pivot_root(".", ".")` 和 `umount2(MNT_DETACH)`，读取磁盘根版本文件后再 exec 磁盘 `/sbin/init`；各步骤失败打印 errno 并令测试失败。

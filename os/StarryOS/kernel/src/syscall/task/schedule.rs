@@ -1,7 +1,7 @@
 use alloc::{sync::Arc, vec, vec::Vec};
 
 use ax_runtime::hal::{self, time::TimeValue};
-use ax_std::os::arceos::{task as scheduler, task::sync::WaitQueue};
+use ax_std::os::arceos::task as scheduler;
 use bytemuck::{Pod, Zeroable};
 #[cfg(any(target_arch = "aarch64", target_arch = "loongarch64"))]
 use linux_raw_sys::general::__kernel_timespec;
@@ -96,18 +96,31 @@ fn sleep_until(
             };
         }
     };
-    let interrupted = core::cell::Cell::new(false);
-    let timed_out = WaitQueue::new().wait_until_deadline(deadline, || {
-        let pending = current.take_interrupt();
-        interrupted.set(pending);
-        pending
-    });
-    if interrupted.get() {
-        Err(crate::StarryError::Interrupted)
-    } else if timed_out {
-        Ok(())
-    } else {
-        unreachable!("a scheduler sleep must end by timeout or interruption")
+    loop {
+        let now = scheduler::time::MonotonicInstant::from_nanos(hal::time::monotonic_time_nanos())
+            .expect("platform monotonic clock exceeded the signed ktime domain");
+        if current.take_interrupt() {
+            return Err(StarryError::Interrupted);
+        }
+        if now.reached(deadline) {
+            return Ok(());
+        }
+        // Interruption publishes its bit before the scheduler wake. The park
+        // handshake consumes an earlier wake or prevents the later commit
+        // from blocking, so this task-local sleep needs no external wait queue.
+        let mut park = match scheduler::thread::current::begin_current_park()
+            .expect("user sleep must satisfy scheduler invariants")
+        {
+            scheduler::thread::current::CurrentParkStart::Notified => continue,
+            scheduler::thread::current::CurrentParkStart::Prepared(park) => park,
+        };
+        if let Err(error) = park.arm_deadline(deadline) {
+            park.cancel()
+                .expect("failed user sleep must cancel its prepared park");
+            panic!("user sleep deadline must satisfy scheduler invariants: {error}");
+        }
+        park.commit()
+            .expect("user sleep must satisfy scheduler invariants");
     }
 }
 
@@ -195,24 +208,23 @@ pub fn sys_clock_nanosleep(
 pub fn sys_sched_getaffinity(
     current: &crate::task::UserTaskRef,
     pid: i32,
-    cpusetsize: usize,
+    cpusetsize: u32,
     user_mask: *mut u8,
 ) -> crate::StarryResult<isize> {
     let cpu_count = hal::cpu_num();
-    let kernel_mask_bytes = cpu_count
-        .div_ceil(usize::BITS as usize)
-        .saturating_mul(core::mem::size_of::<usize>());
-    if cpusetsize
-        .checked_mul(8)
-        .is_none_or(|bits| bits < cpu_count)
-        || !cpusetsize.is_multiple_of(core::mem::size_of::<usize>())
+    let abi_cpu_count = u32::try_from(cpu_count).map_err(|_| crate::StarryError::BadState)?;
+    let cpusetsize_bits = cpusetsize.wrapping_mul(u8::BITS);
+    let cpusetsize = cpusetsize as usize;
+    if cpusetsize_bits < abi_cpu_count || !cpusetsize.is_multiple_of(core::mem::size_of::<usize>())
     {
         return Err(crate::StarryError::InvalidInput);
     }
 
-    let affinity = scheduler::thread::ThreadHandle::lookup(scheduler_thread_id(current, pid)?)
+    let task = scheduler_task(current, pid)?;
+    let affinity = scheduler::thread::ThreadHandle::lookup(task.id())
         .and_then(|thread| thread.affinity())
         .map_err(map_task_error)?;
+    let kernel_mask_bytes = sched_affinity_mask_bytes(cpu_count);
     let mut mask_bytes = vec![0_u8; kernel_mask_bytes.min(cpusetsize)];
     for cpu in 0..cpu_count {
         let cpu_id = u32::try_from(cpu).map_err(|_| crate::StarryError::InvalidInput)?;
@@ -230,8 +242,15 @@ pub fn check_sched_permission(
     current: &crate::task::UserTaskRef,
     pid: i32,
 ) -> crate::StarryResult<()> {
-    let caller = current.as_thread().cred();
     let task = scheduler_task(current, pid)?;
+    check_sched_task_permission(current, &task)
+}
+
+fn check_sched_task_permission(
+    current: &crate::task::UserTaskRef,
+    task: &crate::task::UserTaskRef,
+) -> crate::StarryResult<()> {
+    let caller = current.as_thread().cred();
     if task.id() == current.id() {
         return Ok(());
     }
@@ -249,12 +268,11 @@ pub fn check_sched_permission(
 pub fn sys_sched_setaffinity(
     current: &crate::task::UserTaskRef,
     pid: i32,
-    cpusetsize: usize,
+    cpusetsize: u32,
     user_mask: *const u8,
 ) -> crate::StarryResult<isize> {
-    check_sched_permission(current, pid)?;
     let cpu_count = hal::cpu_num();
-    let size = cpusetsize.min(cpu_count.div_ceil(8));
+    let size = (cpusetsize as usize).min(sched_affinity_mask_bytes(cpu_count));
     let user_mask = vm_load(current, user_mask, size)?;
     let mut affinity = scheduler::sched::CpuSet::empty(cpu_count);
     let mut any_cpu = false;
@@ -267,20 +285,20 @@ pub fn sys_sched_setaffinity(
         }
     }
 
+    let task = scheduler_task(current, pid)?;
+    check_sched_task_permission(current, &task)?;
     if !any_cpu {
         return Err(crate::StarryError::InvalidInput);
     }
-    let target_tid = scheduler_tid(current, pid)?;
-    if target_tid == current.as_thread().tid() {
-        scheduler::thread::current::set_current_thread_affinity(affinity)
-            .map_err(map_task_error)?;
-    } else {
-        scheduler::thread::ThreadHandle::lookup(scheduler_thread_id(current, pid)?)
-            .and_then(|thread| thread.set_affinity_and_wait(affinity))
-            .map_err(map_task_error)?;
-    }
+    scheduler::thread::ThreadHandle::lookup(task.id())
+        .and_then(|thread| thread.set_affinity_and_wait(affinity))
+        .map_err(map_task_error)?;
 
     Ok(0)
+}
+
+fn sched_affinity_mask_bytes(cpu_count: usize) -> usize {
+    cpu_count.div_ceil(usize::BITS as usize) * core::mem::size_of::<usize>()
 }
 
 pub fn sys_sched_getscheduler(
@@ -495,10 +513,6 @@ fn scheduler_thread_id(
     pid: i32,
 ) -> crate::StarryResult<scheduler::thread::ThreadId> {
     Ok(scheduler_task(current, pid)?.id())
-}
-
-fn scheduler_tid(current: &crate::task::UserTaskRef, pid: i32) -> crate::StarryResult<TidNumber> {
-    Ok(scheduler_task(current, pid)?.as_thread().tid_number())
 }
 
 fn scheduler_task(

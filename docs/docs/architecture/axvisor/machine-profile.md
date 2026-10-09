@@ -82,6 +82,7 @@ AArch64/RISC-V 在 `prepare_dtb_guest()` 开始时调用 `resolve_machine_resour
 
 - host FDT 字节不存在时直接保留 fallback；整个 FDT 无法解析时返回 `InvalidData`。
 - `host_selected_serial()` 只在 `/chosen/stdout-path` 确实选择 UART 时生成 `HostSerialSnapshot`。没有选择时返回 `None`；路径、`reg`、interrupt、clock、型号或传输已经出现但畸形/不支持时返回错误。
+- 所有客户机的默认 `console0` 都跟随宿主选定的 UART 型号、地址、中断及固件身份，保留物理控制台的宿主所有权。宿主未选定时继续使用 machine profile 固定资源；已经选定但描述无效时拒绝启动。显式串口 `address` 优先于宿主地址，并取消继承的固定中断及宿主节点身份；型号不同时使用配置的 model。
 - `host_gic_profile()`、`host_plic_profile()` 没有发现相应控制器时保留 fallback；发现后必须通过几何和 firmware identity 校验。
 - AArch64 fallback 含 timer，因此 host FDT 路径要求得到有效 `arm,armv8-timer`；节点缺失或 PPI specifier 畸形是错误，不退回 QEMU 默认 PPI。
 
@@ -95,6 +96,7 @@ x86（启用 `host-fs` 时）和 LoongArch 从 host ACPI SPCR 取得控制台。
 [[devices.virtual]]
 id = "console0"
 model = "pl011-mmio"
+address = 0x09000000
 clock_hz = 48000000
 backend = { type = "host-console" }
 
@@ -104,7 +106,7 @@ model = "uart16550-mmio"
 backend = { type = "null" }
 ```
 
-若用户 model/transport 与当前 machine/host 串口兼容，`console0` 保留固定 MMIO/PIO、wired IRQ 和 FDT/ACPI identity，只替换 model options；不兼容时丢弃这些 fixed bindings 和 identity，成为从自动池分配的普通虚拟串口。第二个串口始终自动分配。每台 VM 最多一个 `host-console` backend owner，重复 owner 在图构建前报配置错误。
+若用户 model/transport 与当前 machine/host 串口兼容且未配置 `address`，`console0` 保留固定 MMIO/PIO、wired IRQ 和 FDT/ACPI identity；型号不兼容时丢弃这些 fixed bindings 和 identity，从自动池分配。显式 `address` 固定串口基址，无论型号是否兼容都取消继承的固定 IRQ 和宿主节点 identity；其他串口只有在未配置 `address` 时才自动分配地址。每台 VM 最多一个 `host-console` backend owner，重复 owner 在图构建前报配置错误。
 
 ## 3. 四架构平台参考
 
@@ -141,7 +143,7 @@ machine replacement snapshot 进入 config 前必须形成能实现的客户机�
 
 `GuestRegionPlanner` 处理的是最终 stage-2 可见性，不是设备访问分派。`AddressSpacePolicy::Virtualized` 从空映射开始，只加入显式 passthrough；`Passthrough` 从整个可用 GPA 恒等窗口开始，再逐个打孔。这些步骤的顺序就是 `GuestRegionPlanner` 的收集顺序：先声明的区间先占用地址空间，后续与之冲突的固定资源会让 prepare 失败，而不是被自动挪动。
 
-1. 计算 guest address-space 上限。GPA 能力来自 VM 的所有目标物理 CPU：`minimum_recorded_target_cpu_capability()` 对 `virtualization/axvm/src/percpu.rs:18-21` 发布的 `CPU_MAX_GPT_LEVELS` / `CPU_GPA_BITS` 取最小值；缺少任一目标 CPU snapshot 直接报 unsupported。x86/LoongArch 3/4 级换算为 39/48 位，RISC-V 3/4 级为 41/50 位，AArch64 由 stage-2 levels 得到 39/48 位。最终 size 是架构 `VM_ASPACE_SIZE` 与 `1 << gpa_bits` 的较小值。
+1. 计算 guest address-space 上限。GPA 能力来自 VM 的所有目标物理 CPU：`minimum_recorded_target_cpu_capability()` 对 `virtualization/axvm/src/percpu.rs` 发布的 `CPU_MAX_GPT_LEVELS` / `CPU_GPA_BITS` 取最小值；缺少任一目标 CPU snapshot 直接报 unsupported。x86/LoongArch 3/4 级换算为 39/48 位，RISC-V 3/4 级为 41/50 位，AArch64 由 stage-2 levels 得到 39/48 位。最终 size 是架构 `VM_ASPACE_SIZE` 与 `1 << gpa_bits` 的较小值。
 2. 收集 guest RAM，标为 `Memory` owned region。
 3. 收集 `boot_description.occupied_ranges()`，包括 DTB、ACPI、MP table 等已注册启动描述，标为 `BootDescription`。
 4. 收集用户/host parser 写入的 configured `Reserved` 范围。
@@ -180,7 +182,7 @@ flowchart TB
 
 共同 FDT composer 的顺序是：重建 memory nodes 和 `/chosen`，替换 machine interrupt controller，写入通用 resolved 配置设备节点，替换 architectural timer，再安装 `console0` 与额外串口。
 
-AArch64 的 `Aarch64FirmwarePlan` 从同一 `ResolvedDeviceGraph` 固化 GIC、所有串口、普通 FDT contribution 和 timer。host GIC 节点 path/phandle、GICD/GICC/GICR/ITS 窗口和 host-selected serial identity 尽量保持；composer 删除物理实现节点后以虚拟实现重建。兼容的 `console0` 沿用原 `stdout-path`、node path/phandle、interrupt parent/specifier 和必要 clock provider identity；PL011 会生成虚拟 fixed-clock，避免把 host clock 控制硬件暴露给客户机。不兼容的 `console0` 使用新地址并建立新的 serial node、alias 和 `/chosen/stdout-path`。
+AArch64 的 `Aarch64FirmwarePlan` 从同一 `ResolvedDeviceGraph` 固化 GIC、所有串口、普通 FDT contribution 和 timer。对于 `Passthrough` 客户机，host GIC 节点 path/phandle、GICD/GICC/GICR/ITS 窗口和 host-selected serial identity 尽量保持；composer 删除物理实现节点后以虚拟实现重建。`Virtualized` 客户机不沿用固件选定的物理 UART 身份，而使用架构或 machine profile 的默认 serial profile。兼容的 `console0` 沿用原 `stdout-path`、node path/phandle、interrupt parent/specifier 和必要 clock provider identity；PL011 会生成虚拟 fixed-clock，避免把 host clock 控制硬件暴露给客户机。不兼容的 `console0` 使用新地址并建立新的 serial node、alias 和 `/chosen/stdout-path`。
 
 RISC-V 在运行时从 graph 解析 `console0`、额外串口和普通 FDT contribution，再结合 config 中仍匹配 binding path 的 serial identity 与 PLIC profile patch FDT。PLIC host replacement 保留 node identity 和窗口；没有独立 machine timer replacement DTO。
 
@@ -194,7 +196,7 @@ MADT 发布 vCPU APIC IDs、local APIC 和 IOAPIC；FADT/DSDT 发布 PM timer、
 
 `GuestPlatform::discover()` 先调用 `resolved_fw_cfg()` 和 `resolved_serial()` 从 resolved graph 取得 `fw-cfg` 与 `console0`；graph 缺少 `fw-cfg` 会立即返回 `NotFound`，当前 discover 路径不会使用 `defaults.fw_cfg`。随后 host ACPI probe 才补充可复用的平台拓扑。这里要区分两种 ACPI 消费：创建 VM 前的 SPCR serial replacement 解析失败会返回错误；`GuestPlatformBuilder::apply_host_acpi()` 对 PCI、中断和固件设备的拓扑 probe 则是 best-effort。
 
-`apply_host_acpi()` 保留 collector 返回 `Err` 时记录 warning 的防御分支。当前 `host_acpi_resources()` 主要把 ACPI 字段不存在解释为资源缺失：PCI 和 interrupt 缺失由 `build()` 的 defaults 补齐；firmware devices 在 collector 内以 `QemuVirtDefaults` 为基线，再按探测结果覆盖。RTC 资源查询失败由 `.ok()?` 转成“没有 RTC snapshot”，不会触发该 warning。最终 IRQ routes 按补齐后的拓扑生成（`virtualization/axvm/src/arch/loongarch64/boot/probe.rs:70-98`）。
+`apply_host_acpi()` 保留 collector 返回 `Err` 时记录 warning 的防御分支。当前 `host_acpi_resources()` 主要把 ACPI 字段不存在解释为资源缺失：PCI 和 interrupt 缺失由 `build()` 的 defaults 补齐；firmware devices 在 collector 内以 `QemuVirtDefaults` 为基线，再按探测结果覆盖。RTC 资源查询失败由 `.ok()?` 转成“没有 RTC snapshot”，不会触发该 warning。最终 IRQ routes 按补齐后的拓扑生成（`virtualization/axvm/src/arch/loongarch64/boot/probe.rs`）。
 
 UEFI FDT 在 `0x0010_0000` 发布 memory、CPU、CPUIC/EIOINTC/PCH-PIC/PCH-MSI、PCI、RTC、flash、GED、fw_cfg、serial 和普通配置设备；fw_cfg ACPI composer 生成 FACS、DSDT、FADT、MADT、SRAT、SPCR、MCFG、RSDT、RSDP 及普通配置设备 AML。
 
@@ -227,7 +229,7 @@ Machine 层的失败大多发生在 VM prepare 阶段，错误信息通常能直
 | firmware plan missing device/slot、selected interface unsupported 或 transport mismatch | FDT/ACPI composer | composer 是否在读取同一 resolved graph；model 是否声明平台选中的 FDT/ACPI contribution；`console0` binding 是否仍与 host identity 匹配；LoongArch 是否误用了 PIO |
 | 地址存在但客户机访问 stage-2 fault | address layout | 该区间是否属于 disabled、host-owned、x86 local APIC、replacement hole，或超过所有目标 CPU 的最小 GPA 能力 |
 
-现有覆盖包括 machine fallback 常量、host serial/GIC/PLIC/timer 解析与畸形输入、设备图 fixed conflict 与 pool exhaustion、host-owned 显式选择、x86 local APIC hole、目标 CPU 最小能力和 FDT/ACPI composer 的表指针/checksum。`virtualization/axvm/src/configured/append.rs:231` 是 `console_override_and_extra_serial_share_deterministic_planning` 的位置。该测试只覆盖不兼容 model 的重新分配；兼容 model 保留 fixed resources 与 firmware identity 尚无直接测试。
+现有覆盖包括 machine fallback 常量、host serial/GIC/PLIC/timer 解析与畸形输入、设备图 fixed conflict 与 pool exhaustion、host-owned 显式选择、x86 local APIC hole、目标 CPU 最小能力和 FDT/ACPI composer 的表指针/checksum。`virtualization/axvm/src/configured/append.rs` 是 `console_override_and_extra_serial_share_deterministic_planning` 的位置。该测试只覆盖不兼容 model 的重新分配；兼容 model 保留 fixed resources 与 firmware identity 尚无直接测试。
 
 最小验证命令：
 

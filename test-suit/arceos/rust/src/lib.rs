@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "virtio-block-lifecycle", feature(used_with_arg))]
+
 #[cfg(feature = "cpu-capacity")]
 mod cpu_capacity;
 
@@ -6,6 +8,9 @@ use ax_std as _;
 
 #[cfg(feature = "serial-rx")]
 pub mod serial_rx;
+
+#[cfg(feature = "virtio-block-lifecycle")]
+mod virtio_block_lifecycle;
 
 pub type TestResult = Result<(), &'static str>;
 
@@ -44,6 +49,8 @@ pub mod fs;
 pub mod futex;
 #[cfg(all(feature = "eventfd-epoll", feature = "ax-std"))]
 pub mod io_mpx;
+#[cfg(all(feature = "iommu-dma", feature = "ax-std"))]
+pub mod iommu_dma;
 #[cfg(all(
     feature = "ax-std",
     any(feature = "lockdep-baseline", feature = "lockdep-detect",)
@@ -54,8 +61,13 @@ pub mod lockdep;
     any(feature = "mem-stage1-transition", feature = "memtest")
 ))]
 pub mod mem;
-#[cfg(all(feature = "net-loopback", feature = "ax-std"))]
+#[cfg(all(
+    any(feature = "net-loopback", feature = "net-unix-path"),
+    feature = "ax-std"
+))]
 pub mod net;
+#[cfg(all(feature = "nvme-qemu", feature = "ax-std", target_arch = "x86_64"))]
+pub mod nvme;
 #[cfg(all(
     feature = "ax-std",
     any(
@@ -120,7 +132,15 @@ test_runner!(
     run_exception_page_fault,
     exception::page_fault::run
 );
+test_runner!(
+    "virtio-block-lifecycle",
+    run_virtio_block_lifecycle,
+    virtio_block_lifecycle::run
+);
 test_runner!("fs-basic", run_fs_basic, fs::basic::run);
+#[cfg(target_arch = "x86_64")]
+test_runner!("nvme-qemu", run_nvme_qemu, nvme::run);
+test_runner!("iommu-dma", run_iommu_dma, iommu_dma::run);
 test_runner!("futex-errno-order", run_futex_errno_order, futex::run);
 test_runner!(
     "lockdep-baseline",
@@ -135,6 +155,7 @@ test_runner!(
     mem::stage1_transition::run
 );
 test_runner!("net-loopback", run_net_loopback, net::loopback::run);
+test_runner!("net-unix-path", run_net_unix_path, net::unix_path::run);
 test_runner!("sched-cfs", run_sched_cfs, task::priority::run_cfs);
 test_runner!("sched-rr", run_sched_rr, task::priority::run_rr);
 test_runner!("task-affinity", run_task_affinity, task::affinity::run);
@@ -207,6 +228,12 @@ test_runner!("task-yield", run_task_yield, task::yield_now::run);
 test_runner!("serial-rx", run_serial_rx, serial_rx::run);
 
 const SELECTED_TESTS: &[TestCase] = &[
+    #[cfg(feature = "virtio-block-lifecycle")]
+    TestCase::new(
+        "virtio-block-lifecycle",
+        "confirmed reset and DMA ownership",
+        run_virtio_block_lifecycle,
+    ),
     #[cfg(feature = "cpu-capacity")]
     TestCase::new(
         "cpu-capacity",
@@ -249,6 +276,18 @@ const SELECTED_TESTS: &[TestCase] = &[
     ),
     #[cfg(feature = "fs-basic")]
     TestCase::new("fs-basic", "bounded filesystem operations", run_fs_basic),
+    #[cfg(all(feature = "nvme-qemu", target_arch = "x86_64"))]
+    TestCase::new(
+        "nvme-qemu",
+        "QEMU NVMe 4 KiB LBA I/O with cold-cache readback",
+        run_nvme_qemu,
+    ),
+    #[cfg(feature = "iommu-dma")]
+    TestCase::new(
+        "iommu-dma",
+        "SMMUv3 PCI DMA translation and isolation",
+        run_iommu_dma,
+    ),
     #[cfg(feature = "futex-errno-order")]
     TestCase::new(
         "futex-errno-order",
@@ -280,6 +319,12 @@ const SELECTED_TESTS: &[TestCase] = &[
         "net-loopback",
         "finite network address smoke",
         run_net_loopback,
+    ),
+    #[cfg(feature = "net-unix-path")]
+    TestCase::new(
+        "net-unix-path",
+        "sleepable Unix pathname namespace",
+        run_net_unix_path,
     ),
     #[cfg(feature = "sched-cfs")]
     TestCase::new("sched-cfs", "CFS scheduling priority smoke", run_sched_cfs),

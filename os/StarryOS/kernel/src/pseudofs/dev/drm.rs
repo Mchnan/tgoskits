@@ -1,9 +1,9 @@
 //! DRM ioctl decoding helpers and userspace struct definitions.
 //!
 //! See Linux's `include/uapi/drm/drm.h` for the canonical definitions —
-//! everything here is layout-compatible with that header.  This file
-//! intentionally covers only the subset `card0.rs` implements today; the
-//! full DRM ioctl set has ~100 commands, and we add them incrementally.
+//! everything here is layout-compatible with that header. This module holds
+//! core DRM ABI shared by the device nodes; VirtIO GPU private ABI lives in
+//! `card0/virtgpu_uapi.rs`.
 
 use core::ffi::c_int;
 
@@ -26,7 +26,7 @@ const fn ioc(dir: u32, ty: u8, nr: u8, size: u16) -> u32 {
     (dir << 30) | ((size as u32) << 16) | ((ty as u32) << 8) | (nr as u32)
 }
 #[inline]
-const fn iowr<T>(ty: u8, nr: u8) -> u32 {
+pub(super) const fn iowr<T>(ty: u8, nr: u8) -> u32 {
     ioc(
         IOC_READ | IOC_WRITE,
         ty,
@@ -83,6 +83,14 @@ pub const DRM_IOCTL_VERSION: u32 = iowr::<DrmVersion>(DRM_TYPE, 0x00);
 pub const DRM_IOCTL_GET_UNIQUE: u32 = iowr::<DrmUnique>(DRM_TYPE, 0x01);
 pub const DRM_IOCTL_SET_VERSION: u32 = iowr::<DrmSetVersion>(DRM_TYPE, 0x07);
 pub const DRM_IOCTL_GET_CAP: u32 = iowr::<DrmGetCap>(DRM_TYPE, 0x0c);
+/// GEM_CLOSE — release a GEM handle (pure input, WRITE direction).
+/// Layout: `struct drm_gem_close { u32 handle; u32 pad; }` (8 bytes).
+pub const DRM_IOCTL_GEM_CLOSE: u32 = ioc(
+    IOC_WRITE,
+    DRM_TYPE,
+    0x09,
+    core::mem::size_of::<DrmGemClose>() as u16,
+);
 pub const DRM_IOCTL_SET_CLIENT_CAP: u32 = ioc(
     IOC_WRITE,
     DRM_TYPE,
@@ -239,13 +247,14 @@ pub const DRM_IOCTL_MODE_ATOMIC: u32 = iowr::<DrmModeAtomic>(DRM_TYPE, 0xBC);
 pub const DRM_IOCTL_MODE_CREATEPROPBLOB: u32 = iowr::<DrmModeCreateBlob>(DRM_TYPE, 0xBD);
 pub const DRM_IOCTL_MODE_DESTROYPROPBLOB: u32 = iowr::<DrmModeDestroyBlob>(DRM_TYPE, 0xBE);
 pub const DRM_IOCTL_MODE_GETPROPBLOB: u32 = iowr::<DrmModeGetBlob>(DRM_TYPE, 0xAC);
-// WAIT_VBLANK is a union of request/reply, size = 24 bytes on 64-bit.
 pub const DRM_IOCTL_WAIT_VBLANK: u32 = ioc(
     IOC_READ | IOC_WRITE,
     DRM_TYPE,
     0x3A,
     core::mem::size_of::<DrmWaitVblank>() as u16,
 );
+pub const DRM_IOCTL_CRTC_GET_SEQUENCE: u32 = iowr::<DrmModeCrtcGetSequence>(DRM_TYPE, 0x3b);
+pub const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: u32 = iowr::<DrmModeCrtcQueueSequence>(DRM_TYPE, 0x3c);
 
 /// 32 bytes — Linux's `DRM_DISPLAY_MODE_LEN`.
 pub const DRM_MODE_NAME_LEN: usize = 32;
@@ -339,10 +348,17 @@ pub struct DrmModeGetConnector {
 
 /// Linux's `DRM_MODE_CONNECTED`.
 pub const DRM_MODE_CONNECTED: u32 = 1;
-/// `DRM_MODE_CONNECTOR_VIRTUAL` — we advertise a single virtual connector
-/// since we're not on real hardware.
+pub const DRM_MODE_DISCONNECTED: u32 = 2;
+pub const DRM_MODE_CONNECTOR_UNKNOWN: u32 = 0;
+pub const DRM_MODE_CONNECTOR_VGA: u32 = 1;
+pub const DRM_MODE_CONNECTOR_DISPLAYPORT: u32 = 10;
+pub const DRM_MODE_CONNECTOR_HDMIA: u32 = 11;
+pub const DRM_MODE_CONNECTOR_EDP: u32 = 14;
 pub const DRM_MODE_CONNECTOR_VIRTUAL: u32 = 15;
-/// Encoder type VIRTUAL.
+pub const DRM_MODE_ENCODER_NONE: u32 = 0;
+pub const DRM_MODE_ENCODER_DAC: u32 = 1;
+pub const DRM_MODE_ENCODER_TMDS: u32 = 2;
+pub const DRM_MODE_ENCODER_LVDS: u32 = 3;
 pub const DRM_MODE_ENCODER_VIRTUAL: u32 = 5;
 
 #[repr(C)]
@@ -387,12 +403,32 @@ pub struct DrmModeDestroyDumb {
     pub handle: u32,
 }
 
+/// `struct drm_gem_close` — GEM_CLOSE ioctl payload. Unlike
+/// `DrmModeDestroyDumb`, this carries an explicit 8-byte layout
+/// (`handle` + `pad`) so the packed ioctl number decodes with size 8,
+/// matching `DRM_IOCTL_GEM_CLOSE = 0x40086409` as sent by Mesa/libdrm.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+pub struct DrmGemClose {
+    pub handle: u32,
+    pub pad: u32,
+}
+
+/// Linux DRM fourcc formats supported by the portable GPU interface.
+pub const DRM_FORMAT_RGB565: u32 =
+    (b'R' as u32) | ((b'G' as u32) << 8) | ((b'1' as u32) << 16) | ((b'6' as u32) << 24);
+pub const DRM_FORMAT_RGB888: u32 =
+    (b'R' as u32) | ((b'G' as u32) << 8) | ((b'2' as u32) << 16) | ((b'4' as u32) << 24);
+pub const DRM_FORMAT_BGR888: u32 =
+    (b'B' as u32) | ((b'G' as u32) << 8) | ((b'2' as u32) << 16) | ((b'4' as u32) << 24);
 /// XRGB8888 — four bytes per pixel, little-endian, X/R/G/B in low-to-high.
 pub const DRM_FORMAT_XRGB8888: u32 =
     (b'X' as u32) | ((b'R' as u32) << 8) | ((b'2' as u32) << 16) | ((b'4' as u32) << 24);
 /// ARGB8888 — same layout but with meaningful alpha.
 pub const DRM_FORMAT_ARGB8888: u32 =
     (b'A' as u32) | ((b'R' as u32) << 8) | ((b'2' as u32) << 16) | ((b'4' as u32) << 24);
+pub const DRM_FORMAT_XBGR8888: u32 =
+    (b'X' as u32) | ((b'B' as u32) << 8) | ((b'2' as u32) << 16) | ((b'4' as u32) << 24);
 
 // ======== M4b: planes, properties, page flip, vblank ========
 
@@ -419,12 +455,12 @@ pub struct DrmModeGetPlane {
     pub format_type_ptr: u64,
 }
 
-/// `DRM_MODE_OBJECT_*` — type tags for `OBJ_GETPROPERTIES` and atomic
-/// commits.  Values match Linux's uapi exactly; weston/modetest pattern-
-/// match on them.
+/// Linux `drm_mode.h` object type tags used by object queries and
+/// OBJECT property metadata.
 pub const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
 pub const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 pub const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
+pub const DRM_MODE_OBJECT_FB: u32 = 0xfbfb_fbfb;
 
 pub const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
 
@@ -449,6 +485,7 @@ pub const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
 pub const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 pub const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
 pub const DRM_MODE_PROP_OBJECT: u32 = 1 << 6;
+pub const DRM_MODE_PROP_SIGNED_RANGE: u32 = 1 << 7;
 pub const DRM_MODE_PROP_ATOMIC: u32 = 0x8000_0000;
 
 /// `DRM_PROP_NAME_LEN` from Linux uapi.
@@ -509,13 +546,68 @@ pub struct DrmWaitVblank {
 /// `_DRM_VBLANK_ABSOLUTE = 0`, `_DRM_VBLANK_RELATIVE = 1`. The low bits
 /// of `type` are a CRTC index (unused here — we have one CRTC).
 pub const DRM_VBLANK_RELATIVE: u32 = 0x1;
+/// `_DRM_VBLANK_EVENT` — deliver a `DRM_EVENT_VBLANK` on the fd instead
+/// of blocking inside the ioctl.
+pub const DRM_VBLANK_EVENT: u32 = 0x400_0000;
+/// `_DRM_VBLANK_NEXTONMISS` — if the target already passed, jump to the
+/// next edge instead of firing immediately.
+pub const DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
+/// `_DRM_VBLANK_SECONDARY` — select the second CRTC (none on this card).
+pub const DRM_VBLANK_SECONDARY: u32 = 0x2000_0000;
+/// `_DRM_VBLANK_SIGNAL` — signal-based delivery, rejected as EINVAL by
+/// modern Linux.
+pub const DRM_VBLANK_SIGNAL: u32 = 0x4000_0000;
+/// `_DRM_VBLANK_HIGH_CRTC_MASK` — bits 1..6 carry a CRTC index beyond
+/// the secondary bit.
+pub const DRM_VBLANK_HIGH_CRTC_MASK: u32 = 0x3e;
+/// `_DRM_VBLANK_TYPES_MASK` — the absolute/relative selector bits.
+pub const DRM_VBLANK_TYPES_MASK: u32 = DRM_VBLANK_RELATIVE;
+/// `_DRM_VBLANK_FLAGS_MASK` — every flag bit of `type`.
+pub const DRM_VBLANK_FLAGS_MASK: u32 =
+    DRM_VBLANK_EVENT | DRM_VBLANK_SIGNAL | DRM_VBLANK_SECONDARY | DRM_VBLANK_NEXTONMISS;
+
+// ---- CRTC vblank sequence clock (Linux 4.19+ `drm_crtc_get_sequence`) ----
+
+/// `DRM_IOCTL_CRTC_GET_SEQUENCE` payload: query the current vblank
+/// sequence and the timestamp of its edge.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmModeCrtcGetSequence {
+    pub crtc_id: u32,
+    /// Return: 1 while the CRTC is actively scanning out.
+    pub active: u32,
+    /// Return: most recent vblank sequence.
+    pub sequence: u64,
+    /// Return: time of the sequence's first pixel out, in
+    /// `CLOCK_MONOTONIC` nanoseconds.
+    pub sequence_ns: i64,
+}
+
+/// `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` payload: deliver a
+/// `DRM_EVENT_CRTC_SEQUENCE` when the counter reaches `sequence`.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmModeCrtcQueueSequence {
+    pub crtc_id: u32,
+    pub flags: u32,
+    /// Input: target sequence. Output: target (or the actual counter
+    /// when the target had already passed).
+    pub sequence: u64,
+    pub user_data: u64,
+}
+
+/// `DRM_CRTC_SEQUENCE_RELATIVE` — `sequence` counts from the current
+/// counter value.
+pub const DRM_CRTC_SEQUENCE_RELATIVE: u32 = 0x0000_0001;
+/// `DRM_CRTC_SEQUENCE_NEXT_ON_MISS` — use the next edge if the target
+/// was missed.
+pub const DRM_CRTC_SEQUENCE_NEXT_ON_MISS: u32 = 0x0000_0002;
 
 // ---- event delivery ----
 //
-// Page-flip completion events are delivered by reading the DRM fd.  Each
-// event begins with a `drm_event` header (type + total length); the
-// concrete payload type tells userspace what struct to expect.  We only
-// ever emit `drm_event_vblank`.
+// Display events are delivered by reading the DRM fd. Each event begins
+// with a `drm_event` header (type + total length); the event type selects
+// either a vblank/page-flip payload or a CRTC sequence payload.
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
@@ -535,7 +627,19 @@ pub struct DrmEventVblank {
     pub crtc_id: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmEventCrtcSequence {
+    pub base: DrmEvent,
+    pub user_data: u64,
+    /// `CLOCK_MONOTONIC` nanoseconds of the delivery edge.
+    pub tv_ns: i64,
+    pub sequence: u64,
+}
+
+pub const DRM_EVENT_VBLANK: u32 = 0x01;
 pub const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
+pub const DRM_EVENT_CRTC_SEQUENCE: u32 = 0x03;
 
 // ======== M4c: atomic KMS + property blobs ========
 

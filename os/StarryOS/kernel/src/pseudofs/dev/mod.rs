@@ -1,20 +1,17 @@
 //! Special devices
 
 mod axivc;
-mod card0;
+pub(crate) mod card0;
 #[cfg(feature = "rknpu")]
 pub(crate) mod card1;
-// The real contiguous coherent dma-heap is shared by every accelerator that
-// exchanges buffers (JPU / NPU / RGA).
-#[cfg(any(feature = "jpeg", feature = "rknpu", feature = "rga"))]
+// The coherent dma-heap is shared by GPUs and other DMA devices.
 mod dmaheap;
 mod drm;
-#[cfg(feature = "input")]
+mod vblank;
 pub mod event;
 mod fb;
 #[cfg(feature = "sg2002")]
 pub mod ion;
-#[cfg(any(feature = "input", feature = "k230-kpu"))]
 mod irq_service;
 mod kmsg;
 #[cfg(feature = "k230-kpu")]
@@ -26,13 +23,14 @@ pub(crate) mod r#loop;
 mod memtrack;
 #[cfg(feature = "jpeg")]
 mod mpp_service;
+mod net;
 #[cfg(feature = "sg2002")]
 mod pinmux;
-#[cfg(any(feature = "sg2002", feature = "rk3588-pwm"))]
 pub(super) mod pwm;
 #[cfg(feature = "rga")]
 pub(crate) mod rga;
 mod rtc;
+mod sync_file;
 #[cfg(feature = "sg2002")]
 pub mod tpu;
 pub mod tty;
@@ -45,8 +43,16 @@ mod cvi_usb_camera;
 
 #[cfg(feature = "sg2002-cvi-usb-camera")]
 mod cvi_vdec;
+#[cfg(feature = "uvc")]
+mod uvc_camera;
+#[cfg(feature = "uvc")]
+pub(crate) mod video;
+#[cfg(feature = "uvc")]
+mod video_allocator;
+#[cfg(feature = "uvc")]
+mod video_dir;
 
-use alloc::{format, sync::Arc};
+use alloc::{format, string::ToString, sync::Arc};
 use core::{
     any::Any,
     sync::atomic::{AtomicU64, Ordering},
@@ -108,8 +114,10 @@ pub(super) fn request_shared_disabled(
     ax_runtime::hal::irq::request_irq(irq, request).map(IrqRegistration::new)
 }
 
-pub(crate) fn new_devfs() -> Filesystem {
-    SimpleFs::new_with("devfs".into(), 0x01021994, builder)
+pub(crate) fn new_devfs(root_mount_device: u64) -> Filesystem {
+    SimpleFs::new_with("devfs".into(), 0x01021994, move |fs| {
+        builder(fs, root_mount_device)
+    })
 }
 
 pub(crate) fn new_devptsfs(mount: tty::DevPtsMount) -> Filesystem {
@@ -161,6 +169,27 @@ impl DeviceOps for Null {
 /// read/write return `EIO` rather than silently succeeding, so the node never
 /// masquerades as a working disk for `dd`/`blkid`/`fsck`.
 struct RootBlk;
+
+/// Mountable physical block device. Raw device I/O is not implemented here.
+pub(crate) struct PhysicalBlock(pub ax_fs_ng::root::BlockDeviceNode);
+
+impl DeviceOps for PhysicalBlock {
+    fn len(&self) -> VfsResult<u64> {
+        Ok(self.0.region.num_blocks() * self.0.handle.device_info().logical_block_size as u64)
+    }
+
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+        Err(VfsError::Io)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(VfsError::Io)
+    }
+
+    fn as_any(&self) -> &dyn Any { self }
+
+    fn flags(&self) -> NodeFlags { NodeFlags::NON_CACHEABLE }
+}
 
 impl DeviceOps for RootBlk {
     fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
@@ -422,7 +451,7 @@ impl DeviceOps for CpuDmaLatency {
     }
 }
 
-fn builder(fs: Arc<SimpleFs>) -> DirMaker {
+fn builder(fs: Arc<SimpleFs>, root_mount_device: u64) -> DirMaker {
     let mut root = DirMapping::new();
     let pts_instance = initial_pts_instance(tty::DevPtsOptions::root());
 
@@ -482,17 +511,27 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     // Root block device node. Its rdev must equal the root filesystem's st_dev
     // so that tools resolving the root device by scanning /dev (e.g. busybox
     // `rdev`, which stats "/" then looks for a block node with a matching
-    // st_rdev) can find it. The root mount is the first mount, so its
-    // `DEVICE_COUNTER` id is 1 (== `DeviceId::new(0, 1).0`).
+    // `st_rdev`) can find it. Disk roots use their Linux device number; a
+    // memory root keeps the synthetic mount device assigned by the VFS.
+    let block_nodes = ax_fs_ng::root::block_device_nodes()
+        .unwrap_or_else(|error| panic!("failed to discover block device nodes: {error:?}"));
+    let root_name = ax_fs_ng::root::root_block_identity().name;
+    if !block_nodes.iter().any(|node| node.path.strip_prefix("/dev/") == Some(root_name)) {
     root.add(
         ax_fs_ng::root::root_block_identity().name,
         Device::new(
             fs.clone(),
             NodeType::BlockDevice,
-            DeviceId::new(0, 1),
+            DeviceId(root_mount_device),
             Arc::new(RootBlk),
         ),
     );
+    }
+    for node in block_nodes {
+        let name = node.path.strip_prefix("/dev/").expect("device path").to_string();
+        let device = node.device;
+        root.add(name, Device::new(fs.clone(), NodeType::BlockDevice, device, Arc::new(PhysicalBlock(node))));
+    }
     if ax_display::has_display() {
         root.add(
             "fb0",
@@ -655,11 +694,9 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     }
 
     // /dev/dma_heap — the real contiguous, DMA-coherent allocator that the
-    // accelerators share buffers from (zero-copy across JPU / NPU / RGA). Every
-    // heap name maps to the same allocator. Available under any accelerator
-    // feature, not just `jpeg`.
-    #[cfg(any(feature = "jpeg", feature = "rknpu", feature = "rga"))]
-    {
+    // accelerators and GPUs share buffers from. Every heap name maps to the
+    // same allocator. GPU PRIME import also accepts these direct-domain pages.
+    if ax_gpu::has_gpu() || cfg!(any(feature = "jpeg", feature = "rknpu", feature = "rga")) {
         let mut dma_heap_dir = DirMapping::new();
         for name in dmaheap::HEAP_NAMES {
             dma_heap_dir.add(
@@ -688,6 +725,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         "mqueue",
         SimpleDir::new_maker(fs.clone(), Arc::new(DirMapping::new())),
     );
+    root.add(
+        "net",
+        SimpleDir::new_maker(fs.clone(), Arc::new(net::net_dir(fs.clone()))),
+    );
     {
         let mut bus_dir = DirMapping::new();
         bus_dir.add(
@@ -697,29 +738,28 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         root.add("bus", SimpleDir::new_maker(fs.clone(), Arc::new(bus_dir)));
     }
 
-    // /dev/dri/card0 — simpledrm-class DRM character device. Advertised
-    // unconditionally so libdrm/libudev see the DRM node even before
-    // there's a display device behind it.
-    let dri_card0 = card0::Card0::new();
     let mut dri_dir = DirMapping::new();
-    dri_dir.add(
-        "card0",
-        Device::new(
-            fs.clone(),
-            NodeType::CharacterDevice,
-            DeviceId::new(226, 0),
-            dri_card0.clone(),
-        ),
-    );
-    dri_dir.add(
-        "renderD128",
-        Device::new(
-            fs.clone(),
-            NodeType::CharacterDevice,
-            DeviceId::new(226, 128),
-            dri_card0,
-        ),
-    );
+    if ax_gpu::has_gpu() {
+        let dri_card0 = card0::Card0::new();
+        dri_dir.add(
+            "card0",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(226, 0),
+                dri_card0.clone(),
+            ),
+        );
+        dri_dir.add(
+            "renderD128",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(226, 128),
+                dri_card0,
+            ),
+        );
+    }
 
     #[cfg(feature = "rga")]
     root.add(
@@ -764,7 +804,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     }
 
     // Input devices
-    #[cfg(feature = "input")]
     root.add(
         "input",
         SimpleDir::new_maker(fs.clone(), Arc::new(event::input_devices(fs.clone()))),
@@ -826,7 +865,15 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             );
         }
     }
-    SimpleDir::new_maker(fs, Arc::new(root))
+    #[cfg(feature = "uvc")]
+    {
+        SimpleDir::new_maker(fs.clone(), Arc::new(video_dir::UvcDevRoot::new(root, fs)))
+    }
+
+    #[cfg(not(feature = "uvc"))]
+    {
+        SimpleDir::new_maker(fs, Arc::new(root))
+    }
 }
 
 fn descriptor_symlink(fs: Arc<SimpleFs>, target: &'static str) -> Arc<SimpleFile> {

@@ -7,7 +7,7 @@ use core::{
 };
 
 use ax_driver::rknpu::{
-    self, GemCachePolicy, RknpuAction, RknpuMemCreate, RknpuMemDestroy, RknpuMemMap, RknpuMemSync,
+    self, GemCachePolicy, GemOwner, RknpuAction, RknpuMemCreate, RknpuMemDestroy, RknpuMemMap, RknpuMemSync,
     RknpuSubmit, RknpuTask, RKNPU_CORE0_MASK, RKNPU_CORE1_MASK, RKNPU_CORE2_MASK,
 };
 use ax_memory_addr::{PhysAddr, PhysAddrRange};
@@ -20,8 +20,8 @@ use super::drm::{DrmUnique, DrmVersion};
 use crate::{
     StarryError, StarryResult,
     file::{
-        add_file_like, current_fd_table, release_locks_on_close, File as KernelFile, FileLike,
-        IoDst, IoSrc, Kstat,
+        File as KernelFile, FileLike, IoDst, IoSrc, Kstat, add_file_like, current_fd_table,
+        dma_buf_seek, release_locks_on_close,
         dmabuf::{ContiguousDmaBuf, resolve_contiguous_dmabuf},
     },
     mm::{vm_load, vm_write_slice},
@@ -231,6 +231,7 @@ pub(crate) fn open_card1_file(
 
 struct Card1File {
     base: KernelFile,
+    owner: GemOwner,
     /// Local handles are translated to global driver handles. This prevents a
     /// handle obtained from another card1 open from reaching the NPU GEM pool.
     handles: Mutex<BTreeMap<u32, u32>>,
@@ -251,6 +252,7 @@ impl Card1File {
     fn new(base: KernelFile) -> Self {
         Self {
             base,
+            owner: GemOwner::default(),
             handles: Mutex::new(BTreeMap::new()),
             next_handle: Mutex::new(1),
             operation: Mutex::new(()),
@@ -290,16 +292,6 @@ impl Card1File {
     fn exported_gem_buffer(&self, handle: u32) -> StarryResult<ExportedGemBuffer> {
         let global_handle = self.global_handle(handle)?;
         exported_gem_buffer(global_handle)
-    }
-
-    fn find_dma_range(&self, address: u64, length: u64) -> bool {
-        let handles: Vec<u32> = self.handles.lock().values().copied().collect();
-        handles.into_iter().any(|global_handle| {
-            let Ok(info) = rknpu::buffer_info(global_handle) else {
-                return false;
-            };
-            range_contains(info.dma_addr, info.size, address, length)
-        })
     }
 
     fn find_cpu_range(&self, address: u64, offset: u64, length: u64) -> bool {
@@ -382,7 +374,6 @@ impl Card1File {
 
     fn load_tasks(
         &self,
-        current: &UserTaskRef,
         args: &RknpuSubmit,
         core_mask: u32,
     ) -> VfsResult<(usize, Vec<RknpuTask>)> {
@@ -399,8 +390,16 @@ impl Card1File {
             return Err(VfsError::BadAddress);
         }
 
-        let bytes: Vec<u8> = vm_load(current, task_addr as *const u8, byte_len)
-            .map_err(|_| VfsError::BadAddress)?;
+        if !self.find_cpu_range(args.task_obj_addr, byte_offset as u64, byte_len as u64) {
+            return Err(VfsError::BadAddress);
+        }
+        // SAFETY: task_addr is within a GEM owned by this open description;
+        // the ioctl operation mutex prevents its destruction for this call.
+        // Snapshot bytewise without creating a reference to userspace-shared
+        // storage. Descriptor fields are decoded and validated from the copy.
+        let bytes: Vec<u8> = (0..byte_len)
+            .map(|offset| unsafe { core::ptr::read_volatile((task_addr as *const u8).add(offset)) })
+            .collect();
         let mut tasks = Vec::with_capacity(end - first);
         for bytes in bytes.chunks_exact(task_size) {
             // `RknpuTask` is `repr(C, packed)` and contains integer fields only.
@@ -418,10 +417,21 @@ impl Card1File {
         tasks: &[RknpuTask],
         task_bytes: u64,
     ) -> VfsResult<()> {
+        // The per-open operation mutex pins this handle set throughout submit.
+        // Resolve its immutable DMA extents once; every command still receives
+        // the same checked containment test against buffers owned by this file.
+        let handles: Vec<u32> = self.handles.lock().values().copied().collect();
+        let buffers: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| rknpu::buffer_info(handle).ok())
+            .collect();
+        let contains = |address, length| {
+            buffers.iter().any(|info| range_contains(info.dma_addr, info.size, address, length))
+        };
         if args.task_base_addr != 0
             && !task_base_addr_is_valid(
                 args.task_base_addr,
-                self.find_dma_range(args.task_base_addr, task_bytes),
+                contains(args.task_base_addr, task_bytes),
             )
         {
             return Err(VfsError::InvalidData);
@@ -432,7 +442,7 @@ impl Card1File {
                 .ok_or(VfsError::InvalidData)?;
             if command_bytes == 0
                 || task.regcmd_addr > u32::MAX as u64
-                || !self.find_dma_range(task.regcmd_addr, command_bytes)
+                || !contains(task.regcmd_addr, command_bytes)
             {
                 return Err(VfsError::InvalidData);
             }
@@ -441,11 +451,14 @@ impl Card1File {
     }
 
     fn handle_submit(&self, current: &UserTaskRef, args: &mut RknpuSubmit) -> VfsResult<()> {
-        if !rknpu::submit_available().map_err(map_rknpu_err)? {
-            return Err(VfsError::OperationNotSupported);
+        // Raw vendor command streams carry arbitrary DMA addresses. Match the
+        // existing RGA raw-address boundary: authorize the current caller on
+        // every ioctl, including descriptors inherited before dropping caps.
+        if !current.as_thread().cred().has_cap_sys_rawio() {
+            return Err(VfsError::OperationNotPermitted);
         }
         let core_mask = rknpu::normalize_core_mask(args.core_mask).map_err(map_rknpu_err)?;
-        let (first, mut tasks) = self.load_tasks(current, args, core_mask)?;
+        let (first, mut tasks) = self.load_tasks(args, core_mask)?;
         let task_bytes = (tasks.len() as u64)
             .checked_mul(mem::size_of::<RknpuTask>() as u64)
             .ok_or(VfsError::BadAddress)?;
@@ -478,20 +491,28 @@ impl Card1File {
                     .ok_or(VfsError::InvalidData)?;
             }
         }
-        rknpu::submit(&mut driver_args, &mut tasks).map_err(map_rknpu_err)?;
+        // SAFETY: CAP_SYS_RAWIO above authorizes physical-memory access. The
+        // per-open operation mutex pins all owned GEM handles across validation,
+        // submission and synchronous completion/recovery; tasks is a snapshot.
+        unsafe { rknpu::submit_rawio(&mut driver_args, &mut tasks) }.map_err(map_rknpu_err)?;
         args.task_counter = driver_args.task_counter;
         args.hw_elapse_time = driver_args.hw_elapse_time;
 
         let task_addr = (args.task_obj_addr as usize)
             .checked_add(first.checked_mul(mem::size_of::<RknpuTask>()).ok_or(VfsError::BadAddress)?)
             .ok_or(VfsError::BadAddress)?;
-        // SAFETY: `tasks` is an initialized, contiguous vector of packed ABI
-        // records, and `task_bytes` is exactly its byte length.
-        let task_bytes = unsafe {
-            core::slice::from_raw_parts(tasks.as_ptr().cast::<u8>(), task_bytes as usize)
-        };
-        vm_write_slice(current, task_addr as *mut u8, task_bytes)
-            .map_err(|_| VfsError::BadAddress)?;
+        // Only interrupt feedback changes. Do not overwrite shared command
+        // descriptors with the earlier snapshot after hardware completion.
+        for (index, task) in tasks.iter().enumerate() {
+            let offset = index * mem::size_of::<RknpuTask>()
+                + core::mem::offset_of!(RknpuTask, int_status);
+            for (byte, value) in task.int_status.to_ne_bytes().into_iter().enumerate() {
+                // SAFETY: load_tasks validated this complete owned GEM span,
+                // and the same operation mutex is still held. Volatile byte
+                // stores do not require aligned/shared Rust references.
+                unsafe { core::ptr::write_volatile((task_addr as *mut u8).add(offset + byte), value) };
+            }
+        }
         Ok(())
     }
 }
@@ -514,6 +535,10 @@ fn task_base_addr_is_valid(address: u64, dma_range_valid: bool) -> bool {
 }
 
 impl FileLike for Card1File {
+    fn validate_write_access(&self) -> StarryResult {
+        self.base.validate_write_access()
+    }
+
     fn read(&self, dst: &mut IoDst) -> StarryResult<usize> {
         self.base.read(dst)
     }
@@ -648,7 +673,7 @@ impl Card1File {
                     bytemuck::bytes_of_mut(&mut mem_create_args),
                     arg,
                 )?;
-                rknpu::mem_create(&mut mem_create_args).map_err(map_rknpu_err)?;
+                rknpu::mem_create(&self.owner, &mut mem_create_args).map_err(map_rknpu_err)?;
                 let global_handle = mem_create_args.handle;
                 let local_handle = match self.add_handle(global_handle) {
                     Ok(handle) => handle,
@@ -970,6 +995,14 @@ impl ExportedGemBuffer {
 }
 
 impl FileLike for ExportedGemBuffer {
+    fn seek(&self, pos: ax_io::SeekFrom) -> StarryResult<u64> {
+        dma_buf_seek(self.range.size() as u64, pos)
+    }
+
+    fn validate_write_access(&self) -> StarryResult {
+        Err(StarryError::InvalidInput)
+    }
+
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:[rknpu-gem]".into()
     }
@@ -1032,6 +1065,7 @@ fn map_rknpu_err(err: rknpu::Error) -> VfsError {
         rknpu::Error::Busy => VfsError::AlreadyExists,
         rknpu::Error::TimedOut => VfsError::TimedOut,
         rknpu::Error::Quarantined => VfsError::Io,
+        rknpu::Error::NoMemory => VfsError::NoMemory,
         rknpu::Error::InvalidData => VfsError::InvalidData,
         rknpu::Error::NotSupported => VfsError::OperationNotSupported,
     }
@@ -1239,6 +1273,16 @@ mod tests {
         assert!(
             matches!(exported.device_mmap(0, 0).unwrap(), DeviceMmap::PhysicalCached(actual, Some(_)) if actual == range)
         );
+    }
+
+    #[test]
+    fn exported_buffer_supports_dma_buf_size_probe() {
+        let range = PhysAddrRange::from_start_size(0x1234_5000.into(), 0x4000);
+        let exported = ExportedGemBuffer::new(range, GemCachePolicy::Cacheable, Arc::new(()));
+
+        assert_eq!(exported.seek(ax_io::SeekFrom::Start(0)).unwrap(), 0);
+        assert_eq!(exported.seek(ax_io::SeekFrom::End(0)).unwrap(), 0x4000);
+        assert!(exported.seek(ax_io::SeekFrom::Current(0)).is_err());
     }
 
     #[test]

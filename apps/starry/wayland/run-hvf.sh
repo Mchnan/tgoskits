@@ -6,8 +6,8 @@ WORKSPACE="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 ARCH="aarch64"
 TARGET="aarch64-unknown-none-softfloat"
 
-ROOTFS_BASE="$WORKSPACE/tmp/axbuild/rootfs/rootfs-${ARCH}-alpine.img"
-ROOTFS_APP="$WORKSPACE/tmp/axbuild/rootfs/rootfs-${ARCH}-wayland.img"
+ROOTFS_BASE="$WORKSPACE/target/axbuild/rootfs/rootfs-${ARCH}-alpine.img"
+ROOTFS_APP="$WORKSPACE/target/axbuild/rootfs/rootfs-${ARCH}-wayland.img"
 KERNEL="$WORKSPACE/target/${TARGET}/release/starryos.bin"
 BUILD_CONFIG="$SCRIPT_DIR/build-${TARGET}.toml"
 PROVISION_MARKER=".wayland-provisioned"
@@ -258,7 +258,18 @@ if [ ! -s "$apk_list" ]; then
     echo "PROVISION_NO_PREFETCHED_APKS"
     exit 1
 fi
-xargs apk add --allow-untrusted --no-network < "$apk_list"
+# Authenticate all indexes and payloads before any install script can run.
+# apk add then enforces the authenticated index checksums for each package.
+if ! apk verify --no-network /usr/local/wayland-apks/*/*/APKINDEX.tar.gz \
+    /usr/local/wayland-apks/*/*/*.apk; then
+    echo "PROVISION_FAILED"
+    exit 1
+fi
+if ! xargs apk add --no-network \
+    --repositories-file /usr/local/wayland-apks/repositories < "$apk_list"; then
+    echo "PROVISION_FAILED"
+    exit 1
+fi
 echo "PROVISION_PACKAGES_DONE"
 touch /.wayland-provisioned
 echo "PROVISION_DONE"
@@ -273,7 +284,7 @@ if ! marker_exists || [ "$REPROVISION" = true ]; then
 
     # Headless boot: send the provision command once the shell is ready.
     # AArch64 TCG boot is slow — wait 25s before sending.
-    provision_log="$WORKSPACE/tmp/axbuild/rootfs/provision-${ARCH}-wayland.log"
+    provision_log="$WORKSPACE/target/axbuild/rootfs/provision-${ARCH}-wayland.log"
     echo "    (booting headless, aarch64 TCG takes ~20s to reach shell...)"
     set +e
     run_provision_qemu "$provision_log"

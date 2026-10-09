@@ -93,10 +93,13 @@ const AF_INET: u8 = 2;
 
 const ARPHRD_ETHER: u16 = 1;
 const ARPHRD_LOOPBACK: u16 = 772;
+const ARPHRD_NONE: u16 = 0xfffe;
 
 const IFF_UP: u32 = 1;
 const IFF_BROADCAST: u32 = 2;
 const IFF_LOOPBACK: u32 = 8;
+const IFF_POINTOPOINT: u32 = 16;
+const IFF_NOARP: u32 = 128;
 const IFF_RUNNING: u32 = 64;
 const IFF_MULTICAST: u32 = 4096;
 const IFF_LOWER_UP: u32 = 65536;
@@ -210,8 +213,8 @@ struct LinkInfo {
     qlen: u32,
     qdisc: &'static str,
     operstate: u8,
-    address: [u8; 6],
-    broadcast: [u8; 6],
+    /// `dev_addr` and `broadcast`, reported only when `addr_len` is nonzero.
+    link_addresses: Option<([u8; 6], [u8; 6])>,
 }
 
 struct AddrInfo {
@@ -642,6 +645,10 @@ impl NetlinkSocket {
 }
 
 impl FileLike for NetlinkSocket {
+    fn validate_write_access(&self) -> StarryResult {
+        Ok(())
+    }
+
     fn ioctl(
         &self,
         current: &crate::task::UserTaskRef,
@@ -773,26 +780,29 @@ fn link_infos() -> Vec<LinkInfo> {
                 name: info.name,
                 ty: match info.kind {
                     InterfaceKind::Loopback => ARPHRD_LOOPBACK,
-                    InterfaceKind::Ethernet => ARPHRD_ETHER,
+                    InterfaceKind::Ethernet | InterfaceKind::Tap => ARPHRD_ETHER,
+                    InterfaceKind::Tun => ARPHRD_NONE,
                 },
                 flags,
                 mtu: info.mtu as u32,
                 qlen: 1000,
                 qdisc: match info.kind {
                     InterfaceKind::Loopback => "noqueue",
-                    InterfaceKind::Ethernet => "mq",
+                    InterfaceKind::Ethernet | InterfaceKind::Tun | InterfaceKind::Tap => "mq",
                 },
                 operstate: if info.flags.contains(InterfaceFlags::RUNNING) {
                     IF_OPER_UP
                 } else {
                     IF_OPER_UNKNOWN
                 },
-                address,
-                broadcast: if info.kind == InterfaceKind::Ethernet {
-                    [0xff; 6]
-                } else {
-                    [0; 6]
-                },
+                link_addresses: (info.kind != InterfaceKind::Tun).then(|| {
+                    let broadcast = if matches!(info.kind, InterfaceKind::Ethernet | InterfaceKind::Tap) {
+                        [0xff; 6]
+                    } else {
+                        [0; 6]
+                    };
+                    (address, broadcast)
+                }),
             }
         })
         .collect()
@@ -804,7 +814,7 @@ fn addr_infos() -> Vec<AddrInfo> {
         .filter_map(|info| {
             let ipv4 = info.ipv4?;
             let local = ipv4.address.address().octets();
-            let broadcast = (info.kind == InterfaceKind::Ethernet).then(|| {
+            let broadcast = matches!(info.kind, InterfaceKind::Ethernet | InterfaceKind::Tap).then(|| {
                 let ip = u32::from_be_bytes(local);
                 let mask = if ipv4.address.prefix_len() == 0 {
                     0
@@ -819,7 +829,9 @@ fn addr_infos() -> Vec<AddrInfo> {
                 prefix_len: ipv4.address.prefix_len(),
                 scope: match info.kind {
                     InterfaceKind::Loopback => RT_SCOPE_HOST,
-                    InterfaceKind::Ethernet => RT_SCOPE_UNIVERSE,
+                    InterfaceKind::Ethernet | InterfaceKind::Tun | InterfaceKind::Tap => {
+                        RT_SCOPE_UNIVERSE
+                    }
                 },
                 local,
                 broadcast,
@@ -838,6 +850,12 @@ fn linux_link_flags(info: &InterfaceInfo) -> u32 {
     }
     if info.flags.contains(InterfaceFlags::LOOPBACK) {
         flags |= IFF_LOOPBACK;
+    }
+    if info.flags.contains(InterfaceFlags::POINTOPOINT) {
+        flags |= IFF_POINTOPOINT;
+    }
+    if info.flags.contains(InterfaceFlags::NOARP) {
+        flags |= IFF_NOARP;
     }
     if info.flags.contains(InterfaceFlags::RUNNING) {
         flags |= IFF_RUNNING | IFF_LOWER_UP;
@@ -862,15 +880,16 @@ fn push_link_message(out: &mut Vec<u8>, seq: u32, pid: u32, link: &LinkInfo) {
         },
     );
     push_attr_string(&mut body, IFLA_IFNAME, &link.name);
-    push_attr(&mut body, IFLA_ADDRESS, &link.address);
-    push_attr(&mut body, IFLA_BROADCAST, &link.broadcast);
+    if let Some((address, broadcast)) = &link.link_addresses {
+        push_attr(&mut body, IFLA_ADDRESS, address);
+        push_attr(&mut body, IFLA_BROADCAST, broadcast);
+    }
     push_attr(&mut body, IFLA_MTU, &link.mtu.to_ne_bytes());
     push_attr(&mut body, IFLA_QDISC, link.qdisc.as_bytes());
     push_attr(&mut body, IFLA_TXQLEN, &link.qlen.to_ne_bytes());
     push_attr(&mut body, IFLA_OPERSTATE, &[link.operstate]);
 
-    push_nl_header(out, RTM_NEWLINK, NLM_F_MULTI, seq, pid, body.len());
-    out.extend_from_slice(&body);
+    push_nl_message(out, RTM_NEWLINK, NLM_F_MULTI, seq, pid, &body);
 }
 
 fn push_addr_message(out: &mut Vec<u8>, seq: u32, pid: u32, addr: &AddrInfo) {
@@ -892,8 +911,7 @@ fn push_addr_message(out: &mut Vec<u8>, seq: u32, pid: u32, addr: &AddrInfo) {
         push_attr(&mut body, IFA_BROADCAST, &broadcast);
     }
 
-    push_nl_header(out, RTM_NEWADDR, NLM_F_MULTI, seq, pid, body.len());
-    out.extend_from_slice(&body);
+    push_nl_message(out, RTM_NEWADDR, NLM_F_MULTI, seq, pid, &body);
 }
 
 fn push_default_route_message(out: &mut Vec<u8>, seq: u32, pid: u32, route: &ax_net::RouteInfo) {
@@ -927,8 +945,7 @@ fn push_default_route_message(out: &mut Vec<u8>, seq: u32, pid: u32, route: &ax_
     push_attr(&mut body, RTA_PRIORITY, &route.metric.to_ne_bytes());
     push_attr(&mut body, RTA_PREFSRC, &source.octets());
 
-    push_nl_header(out, RTM_NEWROUTE, NLM_F_MULTI, seq, pid, body.len());
-    out.extend_from_slice(&body);
+    push_nl_message(out, RTM_NEWROUTE, NLM_F_MULTI, seq, pid, &body);
 }
 
 fn push_ctrl_family(out: &mut Vec<u8>, seq: u32, pid: u32, multi: bool) {
@@ -956,8 +973,7 @@ fn push_ctrl_family(out: &mut Vec<u8>, seq: u32, pid: u32, multi: bool) {
     );
 
     let flags = if multi { NLM_F_MULTI } else { 0 };
-    push_nl_header(out, GENL_ID_CTRL, flags, seq, pid, payload.len());
-    out.extend_from_slice(&payload);
+    push_nl_message(out, GENL_ID_CTRL, flags, seq, pid, &payload);
 }
 
 /// Emit a `NLMSG_ERROR` whose payload echoes the entire original
@@ -970,10 +986,10 @@ fn push_ctrl_family(out: &mut Vec<u8>, seq: u32, pid: u32, multi: bool) {
 fn push_nlmsg_error(out: &mut Vec<u8>, request_bytes: &[u8], pid: u32, error: i32) {
     let header = unsafe { request_bytes.as_ptr().cast::<NlMsgHdr>().read_unaligned() };
     let req_len = (header.len as usize).min(request_bytes.len());
-    let payload_len = size_of::<i32>() + req_len;
-    push_nl_header(out, NLMSG_ERROR, 0, header.seq, pid, payload_len);
-    out.extend_from_slice(&error.to_ne_bytes());
-    out.extend_from_slice(&request_bytes[..req_len]);
+    let mut payload = Vec::with_capacity(size_of::<i32>() + req_len);
+    payload.extend_from_slice(&error.to_ne_bytes());
+    payload.extend_from_slice(&request_bytes[..req_len]);
+    push_nl_message(out, NLMSG_ERROR, 0, header.seq, pid, &payload);
 }
 
 fn push_nlmsg_error_from_ax(out: &mut Vec<u8>, request_bytes: &[u8], pid: u32, err: StarryError) {
@@ -1193,8 +1209,23 @@ fn parse_genl_family_name(mut buf: &[u8]) -> Option<alloc::string::String> {
 }
 
 fn push_done_message(out: &mut Vec<u8>, seq: u32, pid: u32) {
-    push_nl_header(out, NLMSG_DONE, NLM_F_MULTI, seq, pid, size_of::<i32>());
-    out.extend_from_slice(&0i32.to_ne_bytes());
+    push_nl_message(out, NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_ne_bytes());
+}
+
+/// Append one netlink message followed by the padding that ends it.
+///
+/// `nlmsg_len` carries the unpadded size, but the datagram itself has to reach
+/// the next `NLMSG_ALIGNTO` boundary. Readers advance with `NLMSG_NEXT`, which
+/// subtracts the *aligned* length from a byte count that `NLMSG_OK` validates
+/// against the *unaligned* one; a message that ends mid-word therefore drives
+/// that count below zero, and every reader holding it in an unsigned variable
+/// then walks past the end of its receive buffer. Linux reserves the same
+/// padding in `__nlmsg_put()` (include/linux/netlink.h), where `skb_put` takes
+/// `NLMSG_ALIGN(size)` while the header stores the unaligned `size`.
+fn push_nl_message(out: &mut Vec<u8>, ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) {
+    push_nl_header(out, ty, flags, seq, pid, payload.len());
+    out.extend_from_slice(payload);
+    pad_to_align4(out);
 }
 
 fn push_nl_header(out: &mut Vec<u8>, ty: u16, flags: u16, seq: u32, pid: u32, payload_len: usize) {

@@ -13,21 +13,16 @@ pub(crate) mod boot;
 mod capabilities;
 pub(crate) mod irq;
 mod npt;
+mod pci_config;
 mod resource_pools;
 mod vm;
 pub(crate) use vm::LoongArchVmPlan;
 
 pub(crate) struct LoongArch64Arch;
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum LoongArchDeferredRunWork {
-    ExternalInterrupt { vector: usize },
-}
-
 impl ArchOps for LoongArch64Arch {
     type VCpu = AxvmLoongArchVcpu;
     type PerCpu = AxvmLoongArchPerCpu;
-    type DeferredRunWork = LoongArchDeferredRunWork;
     type NestedPageTable = npt::NestedPageTable<crate::HostPagingHandler>;
 
     fn has_hardware_support() -> bool {
@@ -39,13 +34,27 @@ impl ArchOps for LoongArch64Arch {
         vcpu: &crate::vcpu::AxVCpu<Self::VCpu>,
         interrupt: crate::runtime::QueuedVcpuInterrupt,
     ) {
-        let crate::runtime::QueuedVcpuInterrupt::Physical {
-            vector,
-            physical_irq,
-        } = interrupt
-        else {
-            unreachable!("virtual interrupts are consumed by the common injection path")
+        let (vector, physical_irq) = match interrupt {
+            crate::runtime::QueuedVcpuInterrupt::Physical {
+                vector,
+                physical_irq,
+            } => (vector, Some(physical_irq)),
+            crate::runtime::QueuedVcpuInterrupt::External { vector } => (vector, None),
+            crate::runtime::QueuedVcpuInterrupt::Virtual(_) => {
+                unreachable!("virtual interrupts are consumed by the common injection path")
+            }
         };
+        if physical_irq.is_none() {
+            if let Err(err) = vcpu.get_arch_vcpu().inject_eiointc_interrupt(vector) {
+                warn!(
+                    "Failed to inject queued LoongArch EIOINTC vector={vector:#x} into \
+                     VM[{vm_id}] VCpu[{}]: {err:?}",
+                    vcpu.id()
+                );
+            }
+            return;
+        }
+        let physical_irq = physical_irq.expect("physical interrupt identity was checked above");
         let Some(vm) = crate::get_vm_by_id(vm_id) else {
             warn!("VM[{vm_id}] disappeared before physical interrupt injection");
             return;
@@ -86,7 +95,7 @@ impl ArchOps for LoongArch64Arch {
         vm: &crate::AxVMRef,
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
         exit: <Self::VCpu as VmArchVcpuOps>::Exit,
-    ) -> AxVmResult<BoundVcpuExit<Self::DeferredRunWork>> {
+    ) -> AxVmResult<VcpuExitAction> {
         let exit = match exit {
             LoongArchVmExit::Machine(exit) => {
                 loongarch_result(vcpu.get_arch_vcpu().0.process_exit(exit))
@@ -131,17 +140,9 @@ impl ArchOps for LoongArch64Arch {
             LoongArchVmExit::NestedPageFault { addr, access_flags } => {
                 handle_loongarch_nested_page_fault(vm, vcpu, addr, access_flags)
             }
-            LoongArchVmExit::ExternalInterrupt { vector } => {
-                debug!("VM[{}] run VCpu[{}] get irq {vector}", vm.id(), vcpu.id());
-                Ok(BoundVcpuExit::Defer(
-                    LoongArchDeferredRunWork::ExternalInterrupt {
-                        vector: vector as usize,
-                    },
-                ))
-            }
             LoongArchVmExit::Idle => {
                 trace!("VM[{}] run VCpu[{}] Idle", vm.id(), vcpu.id());
-                Ok(BoundVcpuExit::Complete(VcpuRunAction {
+                Ok(VcpuExitAction::Complete(VcpuRunAction {
                     waits_for_event: true,
                     stop_reason: None,
                     resets_vm: false,
@@ -150,14 +151,14 @@ impl ArchOps for LoongArch64Arch {
             }
             LoongArchVmExit::Halt => {
                 debug!("VM[{}] run VCpu[{}] Halt", vm.id(), vcpu.id());
-                Ok(BoundVcpuExit::Complete(VcpuRunAction {
+                Ok(VcpuExitAction::Complete(VcpuRunAction {
                     waits_for_event: true,
                     stop_reason: None,
                     resets_vm: false,
                     exits_vcpu: false,
                 }))
             }
-            LoongArchVmExit::Nothing => Ok(BoundVcpuExit::Complete(VcpuRunAction {
+            LoongArchVmExit::Nothing => Ok(VcpuExitAction::Complete(VcpuRunAction {
                 waits_for_event: false,
                 stop_reason: None,
                 resets_vm: false,
@@ -166,30 +167,12 @@ impl ArchOps for LoongArch64Arch {
         }
     }
 
-    fn finish_deferred_run_work(
-        _vm: &crate::AxVMRef,
-        _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
-        work: Self::DeferredRunWork,
-    ) -> AxVmResult<VcpuRunAction> {
-        match work {
-            LoongArchDeferredRunWork::ExternalInterrupt { vector } => {
-                crate::host::arceos::dispatch_host_irq(vector);
-            }
-        }
-        Ok(VcpuRunAction {
-            waits_for_event: false,
-            stop_reason: None,
-            resets_vm: false,
-            exits_vcpu: false,
-        })
-    }
-
     fn wait_for_vcpu_event(
         vm: &crate::AxVMRef,
         vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
         runtime: &crate::vm::VmRuntimeHandle,
     ) {
-        let wait_snapshot = runtime.vcpu_event_wait_snapshot();
+        let wait_snapshot = runtime.vcpu_event_wait_snapshot(vcpu.run_state());
         crate::vm::wait_for_vcpu_event_if_idle_with(
             runtime,
             &wait_snapshot,
@@ -208,7 +191,7 @@ fn handle_loongarch_nested_page_fault(
     vcpu: &crate::vm::AxVCpuRef<AxvmLoongArchVcpu>,
     addr: LoongArchGuestPhysAddr,
     access_flags: LoongArchAccessFlags,
-) -> AxVmResult<BoundVcpuExit<LoongArchDeferredRunWork>> {
+) -> AxVmResult<VcpuExitAction> {
     let ax_addr = loong_guest_phys_addr_to_ax(addr);
     if let Some(decoded) = vcpu.get_arch_vcpu().decode_mmio_fault(addr, access_flags) {
         let handled = match decoded {
@@ -241,13 +224,13 @@ fn handle_loongarch_nested_page_fault(
             _ => false,
         };
         if handled {
-            return Ok(BoundVcpuExit::Continue);
+            return Ok(VcpuExitAction::Continue);
         }
     }
 
     let ax_flags = loong_access_flags_to_ax(access_flags);
     if vm.handle_nested_page_fault(ax_addr, ax_flags) {
-        Ok(BoundVcpuExit::Continue)
+        Ok(VcpuExitAction::Continue)
     } else {
         warn!(
             "VM[{}] VCpu[{}] unhandled nested page fault at {:#x}, access={:?}",
@@ -256,7 +239,7 @@ fn handle_loongarch_nested_page_fault(
             ax_addr.as_usize(),
             ax_flags
         );
-        Ok(BoundVcpuExit::Complete(VcpuRunAction {
+        Ok(VcpuExitAction::Complete(VcpuRunAction {
             waits_for_event: false,
             stop_reason: None,
             resets_vm: false,
@@ -330,6 +313,11 @@ impl LoongArchHostOps for AxvmLoongArchHostOps {
 pub(crate) struct AxvmLoongArchVcpu(LoongArchVcpu<AxvmLoongArchHostOps>);
 
 impl AxvmLoongArchVcpu {
+    fn inject_eiointc_interrupt(&mut self, vector: usize) -> AxVmResult {
+        loongarch_result(self.0.inject_eiointc_interrupt(vector))
+            .map_err(|error| AxVmError::interrupt("inject LoongArch EIOINTC interrupt", error))
+    }
+
     fn inject_external_interrupt(&mut self, vector: usize, physical_irq: usize) -> AxVmResult {
         loongarch_result(self.0.inject_external_interrupt(vector, physical_irq))
             .map_err(|error| AxVmError::interrupt("inject LoongArch external interrupt", error))

@@ -116,6 +116,7 @@ const EXITING_GUEST_MODE_BIT: usize = 1;
 pub(crate) struct VcpuRunState {
     mode: AtomicUsize,
     exit_requested: AtomicBool,
+    unblock_requested: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,10 +129,11 @@ pub(crate) enum HardIrqExitClaim {
 }
 
 impl VcpuRunState {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             mode: AtomicUsize::new(OUTSIDE_GUEST_MODE),
             exit_requested: AtomicBool::new(false),
+            unblock_requested: AtomicBool::new(false),
         }
     }
 
@@ -162,6 +164,16 @@ impl VcpuRunState {
             run_state: self,
             guest_mode,
         }
+    }
+
+    /// Publishes KVM_REQ_UNBLOCK-like work before waking this vCPU's thread.
+    /// This is a wake request, not a second source of interrupt pending state.
+    pub(crate) fn request_unblock(&self) {
+        self.unblock_requested.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_unblock_request(&self) -> bool {
+        self.unblock_requested.swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn publish_exit_request(&self) {
@@ -305,6 +317,7 @@ pub struct AxVCpu<A: VmArchVcpuOps> {
     inner_const: AxVCpuInnerConst,
     inner_mut: Mutex<AxVCpuInnerMut>,
     run_state: Arc<VcpuRunState>,
+    entry_loop_active: AtomicBool,
     arch_vcpu: UnsafeCell<A>,
 }
 
@@ -328,6 +341,7 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
                 state: VmVcpuState::Created,
             }),
             run_state: Arc::new(VcpuRunState::new()),
+            entry_loop_active: AtomicBool::new(false),
             arch_vcpu: UnsafeCell::new(
                 A::new(vm_id, vcpu_id, arch_config)
                     .map_err(|error| map_vcpu_backend_error("create vCPU", error))?,
@@ -564,6 +578,7 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
         F: FnOnce() -> AxVmResult<T>,
     {
         self.with_current_cpu_set(|| {
+            let _entry_loop = EntryLoopGuard::new(&self.entry_loop_active);
             self.get_arch_vcpu()
                 .bind()
                 .map_err(|error| map_vcpu_backend_error("load vCPU on host CPU", error))?;
@@ -581,6 +596,13 @@ impl<A: VmArchVcpuOps> AxVCpu<A> {
                 Ok(())
             })
         })
+    }
+
+    /// Whether the current backend scope belongs to the guest-entry loop,
+    /// rather than a control-plane setup/manipulation operation.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn entry_loop_is_active(&self) -> bool {
+        self.entry_loop_active.load(Ordering::Acquire)
     }
 
     /// Sets the guest entry point.
@@ -673,6 +695,24 @@ fn with_backend_cleanup<T>(
 
 #[ax_percpu::def_percpu]
 static CURRENT_VCPU: usize = 0;
+
+struct EntryLoopGuard<'a>(&'a AtomicBool);
+
+impl<'a> EntryLoopGuard<'a> {
+    fn new(active: &'a AtomicBool) -> Self {
+        assert!(
+            !active.swap(true, Ordering::AcqRel),
+            "nested vCPU entry loop"
+        );
+        Self(active)
+    }
+}
+
+impl Drop for EntryLoopGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// Gets the current AxVM vCPU on this physical CPU.
 pub(crate) fn get_current_vcpu<'pin, A: VmArchVcpuOps>(

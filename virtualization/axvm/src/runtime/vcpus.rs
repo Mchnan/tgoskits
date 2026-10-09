@@ -143,6 +143,20 @@ pub(crate) fn queue_physical_interrupt(
     Ok(())
 }
 
+#[cfg(target_arch = "loongarch64")]
+pub(crate) fn queue_external_interrupt(vm_id: usize, vcpu_id: usize, vector: usize) -> AxVmResult {
+    let vm = crate::get_vm_by_id(vm_id)
+        .ok_or_else(|| ax_err_type!(NotFound, format!("VM[{vm_id}] not found")))?;
+    if !matches!(vm.status(), VmStatus::Running | VmStatus::Paused) {
+        return Err(ax_err_type!(
+            BadState,
+            format!("VM[{vm_id}] is not accepting interrupts")
+        ));
+    }
+    vm.runtime_handle()?
+        .dispatch_external_vcpu_interrupt(vcpu_id, vector)
+}
+
 /// Wake a vCPU after its architecture backend has published canonical state,
 /// and send a guest-exit doorbell only while a remote CPU owns the guest.
 pub(crate) fn kick_vcpu_from_published_state(vm_id: usize, vcpu_id: usize) -> AxVmResult {
@@ -447,6 +461,10 @@ fn vcpu_task_cpu_mask(vm_id: usize, vcpu_id: usize, requested_mask: usize) -> us
     fallback_mask
 }
 
+fn yield_after_vcpu_exit(policy: crate::host::task::SchedulePolicy) -> bool {
+    matches!(policy, crate::host::task::SchedulePolicy::Fifo { .. })
+}
+
 /// The main routine for VCpu task.
 /// This function is the entry point for the VCpu tasks, which are spawned for each VCpu of a VM.
 ///
@@ -594,7 +612,12 @@ fn vcpu_run() {
                 VcpuRunAction {
                     waits_for_event: true,
                     ..
-                } => CurrentArch::wait_for_vcpu_event(&vm, &vcpu, &runtime),
+                } => run_waits_for_event(
+                    vcpu_id,
+                    &runtime,
+                    || poll_vm_devices(&vm),
+                    || CurrentArch::wait_for_vcpu_event(&vm, &vcpu, &runtime),
+                ),
                 VcpuRunAction { .. } => {}
             }
         }
@@ -663,11 +686,12 @@ fn vcpu_run() {
             break;
         }
 
-        // AxVM may run on ArceOS's cooperative FIFO scheduler. Yield after
-        // every completed VM exit so host services such as the management
-        // console and virtual serial input can make progress alongside a
-        // continuously runnable guest.
-        crate::host::task::yield_now();
+        // FIFO tasks must cooperate with same-priority peers. Fair/RR/DL
+        // already have scheduler-enforced service budgets: yielding on each
+        // device exit forfeits a Fair request and penalizes IRQ-heavy guests.
+        if yield_after_vcpu_exit(curr.base_policy()) {
+            crate::host::task::yield_now();
+        }
     }
 
     info!("VM[{}] VCpu[{}] exiting...", vm_id, vcpu_id);
@@ -677,6 +701,32 @@ fn poll_primary_vcpu_devices_with(runtime: &VmRuntimeHandle, poll_devices: impl 
     let consumed_request = runtime.take_device_poll_request();
     poll_devices();
     consumed_request
+}
+
+/// Handles a `waits_for_event` vCPU exit.
+///
+/// vCPU0 owns VM-wide device polling. A virtio-blk MMIO queue notify is handled
+/// inside the guest run slice and only leaves device-local pending work (the
+/// device's own `queue_pending` flag); it does not publish a VM-wide
+/// `device_poll_requested`. That work is drained by the DMA device poll, so the
+/// poll at the top of the run loop can have run before the notify and never see
+/// it. Parking here without polling again would leave the deferred queue
+/// unprocessed, the file worker without a request, and no completion wake to
+/// arrive. The primary vCPU therefore advances pollable and DMA devices
+/// unconditionally before the architecture wait, independently of whether a
+/// runtime poll request was published. Secondary vCPUs never poll here, keeping
+/// vCPU0 the single VM-wide poll owner rather than spreading producer-side
+/// polling across vCPUs.
+fn run_waits_for_event(
+    vcpu_id: usize,
+    runtime: &VmRuntimeHandle,
+    poll_devices: impl FnOnce(),
+    wait_for_event: impl FnOnce(),
+) {
+    if vcpu_id == 0 {
+        let _ = poll_primary_vcpu_devices_with(runtime, poll_devices);
+    }
+    wait_for_event();
 }
 
 pub(super) fn poll_vm_devices(vm: &VMRef) {
@@ -732,7 +782,8 @@ mod tests {
         });
 
         request_published.wait();
-        let wait_snapshot = runtime.vcpu_event_wait_snapshot();
+        let wait_snapshot =
+            runtime.vcpu_event_wait_snapshot(Arc::new(crate::vcpu::VcpuRunState::new()));
         let wait_count = std::cell::Cell::new(0);
         crate::vm::wait_for_vcpu_event_if_idle(
             &runtime,
@@ -758,9 +809,55 @@ mod tests {
     }
 
     #[test]
+    fn primary_vcpu_polls_devices_before_the_architecture_wait_without_a_runtime_request() {
+        let runtime = VmRuntimeHandle::new();
+        // A virtio-blk queue notify inside the run slice only leaves
+        // device-local pending work; it publishes no runtime poll request, so
+        // the wait path must poll unconditionally.
+        assert!(
+            !runtime.device_poll_requested(),
+            "the regression window starts with no VM-wide poll request"
+        );
+        let order = std::cell::RefCell::new(Vec::new());
+
+        run_waits_for_event(
+            0,
+            &runtime,
+            || order.borrow_mut().push("poll"),
+            || order.borrow_mut().push("wait"),
+        );
+
+        assert_eq!(
+            *order.borrow(),
+            ["poll", "wait"],
+            "the primary vCPU must advance device-local work before it waits"
+        );
+    }
+
+    #[test]
+    fn secondary_vcpu_waits_without_running_vm_wide_device_poll() {
+        let runtime = VmRuntimeHandle::new();
+        let order = std::cell::RefCell::new(Vec::new());
+
+        run_waits_for_event(
+            1,
+            &runtime,
+            || order.borrow_mut().push("secondary-poll"),
+            || order.borrow_mut().push("wait"),
+        );
+
+        assert_eq!(
+            *order.borrow(),
+            ["wait"],
+            "a secondary vCPU must not run VM-wide device polling"
+        );
+    }
+
+    #[test]
     fn interrupt_queued_before_wait_snapshot_prevents_sleep() {
         let runtime = VmRuntimeHandle::new();
-        let wait_snapshot = runtime.vcpu_event_wait_snapshot();
+        let wait_snapshot =
+            runtime.vcpu_event_wait_snapshot(Arc::new(crate::vcpu::VcpuRunState::new()));
         let wait_count = std::cell::Cell::new(0);
 
         crate::vm::wait_for_vcpu_event_if_idle(
@@ -777,7 +874,8 @@ mod tests {
     #[test]
     fn request_published_at_wait_boundary_prevents_sleep_and_is_consumed_once() {
         let runtime = Arc::new(VmRuntimeHandle::new());
-        let wait_snapshot = runtime.vcpu_event_wait_snapshot();
+        let wait_snapshot =
+            runtime.vcpu_event_wait_snapshot(Arc::new(crate::vcpu::VcpuRunState::new()));
         let wait_boundary_reached = Arc::new(std::sync::Barrier::new(2));
         let request_published = Arc::new(std::sync::Barrier::new(2));
         let notifier_runtime = runtime.clone();

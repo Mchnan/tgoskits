@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.5](https://github.com/rcore-os/tgoskits/compare/ax-std-v0.7.4...ax-std-v0.7.5) - 2026-09-22
+
+### Other
+
+- updated the following local packages: ax-runtime, ax-hal, ax-posix-api
+
+## [0.7.4](https://github.com/rcore-os/tgoskits/compare/ax-std-v0.7.3...ax-std-v0.7.4) - 2026-09-21
+
+### Fixed
+
+- *(axvisor)* validate guest kernels and complete shell editing ([#2462](https://github.com/rcore-os/tgoskits/pull/2462))
+
+## [0.7.3](https://github.com/rcore-os/tgoskits/compare/ax-std-v0.7.2...ax-std-v0.7.3) - 2026-09-18
+
+### Other
+
+- updated the following local packages: ax-driver, ax-runtime, ax-posix-api, ax-hal
+
 ## [0.7.2](https://github.com/rcore-os/tgoskits/compare/ax-std-v0.7.1...ax-std-v0.7.2) - 2026-09-13
 
 ### Other

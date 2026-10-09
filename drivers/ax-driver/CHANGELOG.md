@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1](https://github.com/rcore-os/tgoskits/compare/ax-driver-v0.18.0...ax-driver-v0.18.1) - 2026-09-22
+
+### Added
+
+- *(virtio-gpu)* integrate virgl DRM on current dev ([#2483](https://github.com/rcore-os/tgoskits/pull/2483))
+
+## [0.18.0](https://github.com/rcore-os/tgoskits/compare/ax-driver-v0.17.0...ax-driver-v0.18.0) - 2026-09-21
+
+### Added
+
+- *(pwm)* unify BSP-backed drivers and Starry integration ([#2437](https://github.com/rcore-os/tgoskits/pull/2437))
+
+## [0.17.0](https://github.com/rcore-os/tgoskits/compare/ax-driver-v0.16.0...ax-driver-v0.17.0) - 2026-09-18
+
+### Fixed
+
+- *(ci)* restore RK3588 NPU inference and require complete workload success ([#2441](https://github.com/rcore-os/tgoskits/pull/2441))
+- *(rknpu)* enforce per-owner and per-device GEM allocation quotas ([#2424](https://github.com/rcore-os/tgoskits/pull/2424))
+- *(ci)* fix debugfs test execution and virtio input startup ([#2396](https://github.com/rcore-os/tgoskits/pull/2396))
+- *(ax-driver)* keep PCI INTx unmasked for virtio input probe ([#2353](https://github.com/rcore-os/tgoskits/pull/2353))
+
+### Other
+
+- *(repo)* remove nonfunctional and redundant test assertions ([#2440](https://github.com/rcore-os/tgoskits/pull/2440))
+
 ## [0.16.0](https://github.com/rcore-os/tgoskits/compare/ax-driver-v0.15.0...ax-driver-v0.16.0) - 2026-09-13
 
 ### Fixed

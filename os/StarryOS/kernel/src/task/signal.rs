@@ -231,23 +231,36 @@ pub fn wait_existing_ptrace_stop_current(thr: &Thread, uctx: &mut UserContext) {
 
 fn wait_ptrace_resume(thr: &Thread, tid: TidNumber, uctx: &mut UserContext) {
     let task = current_user_task();
-    let stale_interrupts = thr.interrupt_snapshot();
-    thr.acknowledge_interrupt(stale_interrupts);
-    let wait_result = block_on_user(
-        &task,
-        super::process_wait::wait_on_pollset(thr.proc_data.ptrace_stop_event(), || {
-            thr.proc_data
-                .ptrace_stop_signo_for(tid)
-                .is_none()
-                .then_some(())
-        }),
-    );
+    loop {
+        // TASK_TRACED is released by the tracer or fatal state, not by an
+        // ordinary signal's scheduler notification. Acknowledge first, then
+        // recheck persistent exit state so a fatal wake cannot be lost here.
+        let stale_interrupts = thr.interrupt_snapshot();
+        thr.acknowledge_interrupt(stale_interrupts);
+        if thr.pending_exit()
+            || thr.has_exit_request()
+            || thr.proc_data.signal.group_exit_status().is_some()
+            || thr.signal().pending().has(Signo::SIGKILL)
+        {
+            thr.proc_data.clear_ptrace_stop();
+            return;
+        }
 
-    if matches!(wait_result, UserWaitOutcome::Interrupted) {
-        thr.proc_data.clear_ptrace_stop();
-    } else if matches!(wait_result, UserWaitOutcome::Ready(()))
-        && let Some(resume_uctx) = thr.proc_data.take_ptrace_stop_user_context_for(tid)
-    {
+        let wait_result = block_on_user(
+            &task,
+            super::process_wait::wait_on_pollset(thr.proc_data.ptrace_stop_event(), || {
+                thr.proc_data
+                    .ptrace_stop_signo_for(tid)
+                    .is_none()
+                    .then_some(())
+            }),
+        );
+        if matches!(wait_result, UserWaitOutcome::Ready(())) {
+            break;
+        }
+    }
+
+    if let Some(resume_uctx) = thr.proc_data.take_ptrace_stop_user_context_for(tid) {
         *uctx = resume_uctx;
         thr.proc_data.restore_current_fp_for_ptrace(tid, uctx);
     }
@@ -451,23 +464,37 @@ pub(crate) fn check_signals_with_outcome(
 }
 
 pub(super) fn queue_rttime_limit_signal_from_scheduler_tick(thr: &Thread, _observed_ns: u64) {
-    let limit = thr.proc_data.rlimit(RLIMIT_RTTIME);
+    if thr.proc_data.rlimit_current(RLIMIT_RTTIME) == u64::MAX {
+        return;
+    }
+    // Serialize the threshold decision and shared soft-limit advance with
+    // prlimit writers and watchdogs running for other threads in this group.
+    let update = thr.proc_data.rlimit_update(RLIMIT_RTTIME);
+    let limit = update.snapshot();
     let (soft_limit_us, hard_limit_us) = (limit.current, limit.max);
     if soft_limit_us == u64::MAX {
         return;
     }
-    let action = thr.rttime().lock().check_limit_at(
-        thr.cpu_time(),
-        thr.scheduler_runtime_ns(),
-        soft_limit_us,
-        hard_limit_us,
-    );
+    let Some((ticks, period)) = thr.cpu_time().realtime_ticks() else {
+        return;
+    };
+    let action = super::check_realtime_tick_limit(ticks, period, soft_limit_us, hard_limit_us);
     let signo = match action {
         RttimeLimitAction::None => return,
-        RttimeLimitAction::Soft => Signo::SIGXCPU,
-        RttimeLimitAction::Hard => Signo::SIGKILL,
+        RttimeLimitAction::Soft => {
+            update.replace(super::Rlimit::new(
+                soft_limit_us.wrapping_add(1_000_000),
+                hard_limit_us,
+            ));
+            Signo::SIGXCPU
+        }
+        RttimeLimitAction::Hard => {
+            drop(update);
+            Signo::SIGKILL
+        }
     };
-    queue_thread_signal(thr, SignalInfo::new_kernel(signo));
+    // Resource-limit locks must not cover signal publication or task wakeup.
+    let _ = send_signal_to_process_data(&thr.proc_data, Some(SignalInfo::new_kernel(signo)));
 }
 
 /// Notify a process's parent of a job-control state change by sending it
@@ -883,6 +910,11 @@ pub fn raise_signal_fatal(sig: SignalInfo, uctx: &UserContext) -> crate::StarryR
                 ));
         if force_default {
             *act = starry_signal::SignalAction::default();
+        }
+        if matches!(act.disposition, SignalDisposition::Default) {
+            // A synchronous fault must not loop forever in global init. The
+            // action lock also orders this transition with signal publication.
+            thread.proc_data.signal.allow_init_fault_exit();
         }
     }
     let mut mask = thread.signal().blocked();

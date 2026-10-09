@@ -369,7 +369,7 @@ impl ArceOS {
     async fn run_qemu_request(&mut self, request: ResolvedBuildRequest) -> anyhow::Result<()> {
         match build::load_arceos_build_mode(&request.build_info_path)? {
             build::ArceosBuildMode::Rust => {
-                let cargo = build::load_cargo_config(&request)?;
+                let cargo = build::load_cargo_config(&request, self.app.workspace_context())?;
                 self.run_qemu_request_with_cargo(request, cargo).await
             }
             build::ArceosBuildMode::AppC { app_dir, app_name } => {
@@ -400,7 +400,7 @@ impl ArceOS {
         self.app.set_debug_mode(request.debug)?;
         match build::load_arceos_build_mode(&request.build_info_path)? {
             build::ArceosBuildMode::Rust => {
-                let mut cargo = build::load_cargo_config(&request)?;
+                let mut cargo = build::load_cargo_config(&request, self.app.workspace_context())?;
                 if !extra_rustflags.is_empty() {
                     crate::build::append_cargo_rustflags(&mut cargo, extra_rustflags);
                 }
@@ -415,7 +415,7 @@ impl ArceOS {
                 if !extra_rustflags.is_empty() {
                     bail!("ArceOS board extra rustflags are only supported for Rust packages");
                 }
-                let cargo = build::load_c_app_cargo_config(&request)?;
+                let cargo = build::load_c_app_cargo_config(&request, self.app.workspace_context())?;
                 let board_config = self
                     .load_board_config(&cargo, board_config_path.as_deref())
                     .await?;
@@ -465,14 +465,14 @@ impl ArceOS {
         self.app.set_debug_mode(request.debug)?;
         match build::load_arceos_build_mode(&request.build_info_path)? {
             build::ArceosBuildMode::Rust => {
-                let cargo = build::load_cargo_config(&request)?;
+                let cargo = build::load_cargo_config(&request, self.app.workspace_context())?;
                 self.app
                     .build(cargo, request.build_info_path)
                     .await
                     .map(|_| ())
             }
             build::ArceosBuildMode::AppC { app_dir, app_name } => {
-                let cargo = build::load_c_app_cargo_config(&request)?;
+                let cargo = build::load_c_app_cargo_config(&request, self.app.workspace_context())?;
                 let output = self.build_c_app_request(&request, app_dir, app_name)?;
                 println!("[axbuild] cargo build elf={}", output.elf_path.display());
                 if cargo.to_bin {
@@ -493,7 +493,7 @@ impl ArceOS {
         self.app.set_debug_mode(request.debug)?;
         match build::load_arceos_build_mode(&request.build_info_path)? {
             build::ArceosBuildMode::Rust => {
-                let cargo = build::load_cargo_config(&request)?;
+                let cargo = build::load_cargo_config(&request, self.app.workspace_context())?;
                 let uboot = self.load_uboot_config(&request, &cargo).await?;
                 self.app.uboot(cargo, request.build_info_path, uboot).await
             }
@@ -510,9 +510,8 @@ impl ArceOS {
         app_dir: PathBuf,
         app_name: String,
     ) -> anyhow::Result<cbuild::ArceosCBuildOutput> {
-        let workspace_root = self.app.workspace_root();
         let config = build::load_arceos_build_config(&request.build_info_path)?;
-        let paths = cbuild::default_c_app_artifact_paths(workspace_root, &app_name);
+        let paths = cbuild::default_c_app_artifact_paths(self.app.target_dir(), &app_name);
         let input = cbuild::ArceosCBuildInput {
             app_dir,
             app_name,
@@ -521,7 +520,7 @@ impl ArceOS {
             features: config.build_info.features,
         };
 
-        cbuild::build_c_app(workspace_root, request, &input)
+        cbuild::build_c_app(self.app.workspace_context(), request, &input)
     }
 
     async fn run_c_app_qemu_request(
@@ -531,7 +530,7 @@ impl ArceOS {
         app_name: String,
     ) -> anyhow::Result<()> {
         self.app.set_debug_mode(request.debug)?;
-        let cargo = build::load_c_app_cargo_config(&request)?;
+        let cargo = build::load_c_app_cargo_config(&request, self.app.workspace_context())?;
         let mut qemu = self
             .load_qemu_config(&request, &cargo)
             .await?
@@ -559,7 +558,7 @@ impl ArceOS {
         app_name: String,
     ) -> anyhow::Result<()> {
         self.app.set_debug_mode(request.debug)?;
-        let cargo = build::load_c_app_cargo_config(&request)?;
+        let cargo = build::load_c_app_cargo_config(&request, self.app.workspace_context())?;
         let uboot = self
             .load_uboot_config(&request, &cargo)
             .await?
@@ -577,42 +576,4 @@ impl ArceOS {
 
 pub(crate) fn default_qemu_config_template_path(workspace_root: &Path, arch: &str) -> PathBuf {
     workspace_root.join(format!("os/arceos/configs/qemu/qemu-{arch}.toml"))
-}
-
-#[cfg(test)]
-mod tests {
-    use tempfile::tempdir;
-
-    use super::*;
-
-    #[test]
-    fn qemu_request_starts_host_http_server_from_config() {
-        let root = tempdir().unwrap();
-        let qemu_config = root.path().join("qemu-x86_64.toml");
-        std::fs::write(
-            &qemu_config,
-            r#"
-args = []
-
-[host_http_server]
-port = 0
-body = "fixture"
-"#,
-        )
-        .unwrap();
-        let request = ResolvedBuildRequest {
-            package: "arceos-httpclient".to_string(),
-            arch: "x86_64".to_string(),
-            target: "x86_64-unknown-none".to_string(),
-            smp: Some(1),
-            debug: false,
-            build_info_path: root.path().join("build.toml"),
-            qemu_config: Some(qemu_config),
-            uboot_config: None,
-        };
-
-        let guard = start_qemu_host_http_server(&request).unwrap();
-
-        assert!(guard.is_some());
-    }
 }

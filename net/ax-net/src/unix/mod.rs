@@ -22,10 +22,11 @@ pub mod namespace;
 pub(crate) mod stream;
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use ax_io::{IoBuf, Read, Write};
 use ax_lazyinit::LazyLock;
-use ax_sync::SpinLock;
+use ax_sync::{Mutex, SpinLock};
 use axpoll::{ExclusiveRegistrationSink, IoEvents, Pollable, SharedRegistrationSink};
 use axpoll_set::PollSet;
 use enum_dispatch::enum_dispatch;
@@ -200,18 +201,43 @@ fn with_slot_or_insert<R>(
 pub struct UnixSocket {
     /// Concrete stream or datagram transport.
     transport: Transport,
-    /// Public local Unix address.
-    local_addr: SpinLock<UnixSocketAddr>,
-    /// Public remote Unix address.
-    remote_addr: SpinLock<UnixSocketAddr>,
+    /// Serializes bind, including filesystem namespace creation which may sleep.
+    local_addr: Mutex<UnixSocketAddr>,
+    /// Serializes connect, including filesystem path resolution which may sleep.
+    remote_addr: Mutex<Option<UnixSocketAddr>>,
+    /// Whether this socket owns the namespace binding in `local_addr`.
+    ///
+    /// Accepted sockets inherit the listener's local address but not ownership
+    /// of its namespace entry, while duplicated descriptors share this whole
+    /// socket object and therefore release the entry only on the final close.
+    owns_bind: AtomicBool,
 }
 impl UnixSocket {
     /// Create a new Unix socket with the given transport.
     pub fn new(transport: impl Into<Transport>) -> Self {
         Self {
             transport: transport.into(),
-            local_addr: SpinLock::new(UnixSocketAddr::Unnamed),
-            remote_addr: SpinLock::new(UnixSocketAddr::Unnamed),
+            local_addr: Mutex::new(UnixSocketAddr::Unnamed),
+            remote_addr: Mutex::new(None),
+            owns_bind: AtomicBool::new(false),
+        }
+    }
+
+    /// Create one endpoint of an already-connected anonymous socket pair.
+    pub fn new_connected(transport: impl Into<Transport>) -> Self {
+        Self {
+            transport: transport.into(),
+            local_addr: Mutex::new(UnixSocketAddr::Unnamed),
+            remote_addr: Mutex::new(Some(UnixSocketAddr::Unnamed)),
+            owns_bind: AtomicBool::new(false),
+        }
+    }
+
+    fn write_connected_peer_address(&self, from: Option<&mut SocketAddrEx>) {
+        if let Some(from) = from
+            && let Some(peer) = self.remote_addr.lock().clone()
+        {
+            *from = SocketAddrEx::Unix(peer);
         }
     }
 }
@@ -231,6 +257,7 @@ impl SocketOps for UnixSocket {
         if matches!(&*guard, UnixSocketAddr::Unnamed) {
             with_slot_or_insert(&local_addr, |slot| self.transport.bind(slot, &local_addr))?;
             *guard = local_addr;
+            self.owns_bind.store(true, Ordering::Release);
         } else {
             return Err(NetError::InvalidInput);
         }
@@ -242,13 +269,13 @@ impl SocketOps for UnixSocket {
         let local_addr = self.local_addr.lock().clone();
         let accept_poll = {
             let mut guard = self.remote_addr.lock();
-            if !matches!(&*guard, UnixSocketAddr::Unnamed) {
+            if guard.is_some() {
                 return Err(NetError::InvalidInput);
             }
             let accept_poll = with_slot(&remote_addr, |slot| {
                 self.transport.connect(slot, &local_addr)
             })?;
-            *guard = remote_addr;
+            *guard = Some(remote_addr);
             accept_poll
         };
         self.transport.finish_connect(accept_poll);
@@ -267,8 +294,9 @@ impl SocketOps for UnixSocket {
         let (transport, peer_addr) = self.transport.try_accept()?;
         Ok(Self {
             transport,
-            local_addr: SpinLock::new(self.local_addr.lock().clone()),
-            remote_addr: SpinLock::new(peer_addr),
+            local_addr: Mutex::new(self.local_addr.lock().clone()),
+            remote_addr: Mutex::new(Some(peer_addr)),
+            owns_bind: AtomicBool::new(false),
         }
         .into())
     }
@@ -278,6 +306,16 @@ impl SocketOps for UnixSocket {
     }
 
     fn try_recv(&self, dst: impl Write, options: &mut RecvOptions<'_>) -> NetResult<usize> {
+        // Linux reports the connected peer in recvfrom/recvmsg for Unix
+        // stream sockets.  StreamTransport only moves bytes and ancillary
+        // data, so populate the address at the facade where the connection's
+        // logical peer identity is tracked.  Datagram-like transports keep
+        // filling this from each packet's sender below.
+        if matches!(&self.transport, Transport::Stream(_)) {
+            let received = self.transport.try_recv(dst, options)?;
+            self.write_connected_peer_address(options.from.as_deref_mut());
+            return Ok(received);
+        }
         self.transport.try_recv(dst, options)
     }
 
@@ -286,11 +324,30 @@ impl SocketOps for UnixSocket {
     }
 
     fn peer_addr(&self) -> NetResult<SocketAddrEx> {
-        Ok(SocketAddrEx::Unix(self.remote_addr.lock().clone()))
+        self.remote_addr
+            .lock()
+            .clone()
+            .map(SocketAddrEx::Unix)
+            .ok_or(NetError::NotConnected)
     }
 
     fn shutdown(&self, how: Shutdown) -> NetResult {
         self.transport.shutdown(how)
+    }
+}
+
+impl Drop for UnixSocket {
+    fn drop(&mut self) {
+        if !self.owns_bind.load(Ordering::Acquire) {
+            return;
+        }
+        let UnixSocketAddr::Abstract(name) = self.local_addr.get_mut() else {
+            // Pathname socket nodes persist after close and are removed only by
+            // an explicit filesystem unlink, matching Linux.
+            return;
+        };
+        let removed = ABSTRACT_BINDS.lock().remove(name);
+        drop(removed);
     }
 }
 

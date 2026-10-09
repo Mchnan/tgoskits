@@ -1,6 +1,4 @@
-// Shared contiguous dma-buf primitive + resolver used by every accelerator that
-// exchanges buffers (JPU / NPU / RGA).
-#[cfg(any(feature = "jpeg", feature = "rknpu", feature = "rga"))]
+// Shared contiguous dma-buf primitive for GPUs and other DMA devices.
 pub mod dmabuf;
 pub mod epoll;
 #[cfg(test)]
@@ -40,7 +38,7 @@ use core::{
 use ax_fs_ng::vfs::{FileBackend, FileFlags, OpenOptions, current_fs_context};
 use ax_io::prelude::*;
 use ax_std::os::arceos::task::thread::ThreadState;
-use axfs_ng_vfs::DeviceId;
+use axfs_ng_vfs::{DeviceId, FilesystemId, Location};
 use axpoll::Pollable;
 use downcast_rs::{DowncastSync, impl_downcast};
 use flatten_objects::FlattenObjects;
@@ -55,7 +53,7 @@ pub(crate) use self::pipe::qperf_metrics_snapshot as pipe_qperf_metrics_snapshot
 pub use self::{
     fs::{
         Directory, File, ResolveAtResult, metadata_to_kstat, resolve_at, resolve_at_checked,
-        resolve_fd, with_fs,
+        resolve_at_with_boundary_checked, resolve_fd, with_fs,
     },
     io_uring::IoUring,
     net::Socket,
@@ -70,6 +68,25 @@ use crate::{
     sync::RwLock,
     task::{AX_FILE_LIMIT, PidIdentityId, current_user_task, tasks},
 };
+
+/// Mount-independent identity for inode-scoped state.
+///
+/// File descriptions pin the backing inode and filesystem. Mount-local device
+/// numbers remain metadata only and must not split locks or FIFO channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InodeKey {
+    filesystem: FilesystemId,
+    inode: u64,
+}
+
+impl InodeKey {
+    fn for_location(location: &Location) -> Self {
+        Self {
+            filesystem: location.mountpoint().filesystem_id(),
+            inode: location.entry().inode(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Kstat {
@@ -152,6 +169,9 @@ impl From<Kstat> for statx {
         statx.stx_ino = value.ino as _;
         statx.stx_size = value.size as _;
         statx.stx_blocks = value.blocks as _;
+        let dev = DeviceId(value.dev);
+        statx.stx_dev_major = dev.major();
+        statx.stx_dev_minor = dev.minor();
         statx.stx_rdev_major = value.rdev.major();
         statx.stx_rdev_minor = value.rdev.minor();
 
@@ -166,9 +186,6 @@ impl From<Kstat> for statx {
         statx.stx_ctime = time_to_statx(&value.ctime);
         statx.stx_mtime = time_to_statx(&value.mtime);
 
-        statx.stx_dev_major = (value.dev >> 32) as _;
-        statx.stx_dev_minor = value.dev as _;
-
         statx
     }
 }
@@ -181,8 +198,28 @@ pub trait ReadBuf: Read + IoBuf {}
 impl<T: Read + IoBuf> ReadBuf for T {}
 pub type IoSrc<'a> = dyn ReadBuf + 'a;
 
+/// Apply Linux dma-buf size-probe seek semantics.
+///
+/// A dma-buf has no file cursor. It accepts only `SEEK_SET(0)` and
+/// `SEEK_END(0)` so userspace can query the exported buffer size.
+pub(crate) fn dma_buf_seek(size: u64, pos: ax_io::SeekFrom) -> StarryResult<u64> {
+    match pos {
+        ax_io::SeekFrom::Start(0) => Ok(0),
+        ax_io::SeekFrom::End(0) => Ok(size),
+        _ => Err(StarryError::InvalidInput),
+    }
+}
+
 #[allow(dead_code)]
 pub trait FileLike: Pollable + DowncastSync {
+    /// Seek a special file using its own offset rules.
+    ///
+    /// Files without a seek operation return ESPIPE. Implementations own any
+    /// cursor state and must reject offsets or origins their file type forbids.
+    fn seek(&self, _pos: ax_io::SeekFrom) -> StarryResult<u64> {
+        Err(StarryError::from(crate::Errno::ESPIPE))
+    }
+
     /// Whether this file supports epoll interest registration.
     ///
     /// A file may provide synchronous poll readiness without supporting epoll
@@ -191,6 +228,14 @@ pub trait FileLike: Pollable + DowncastSync {
     fn supports_epoll(&self) -> bool {
         true
     }
+
+    /// Validate write access before importing a user buffer.
+    ///
+    /// Every file type must declare this capability explicitly so a newly
+    /// added implementation cannot silently import user memory before
+    /// reporting an object-level write error. This hook must not perform
+    /// operation-specific checks such as memfd seals.
+    fn validate_write_access(&self) -> StarryResult;
 
     /// Validate a scalar write length before importing the user buffer.
     ///
@@ -271,14 +316,11 @@ pub trait FileLike: Pollable + DowncastSync {
         Err(StarryError::NotATty)
     }
 
-    /// (device, inode) identity used as the key for advisory file locks
-    /// (fcntl POSIX/OFD locks and flock(2)).
+    /// Mount-independent inode identity for advisory file locks and cleanup.
     ///
-    /// Returns `None` for fd kinds that have no inode and are therefore
-    /// not lockable (pipes, sockets, epoll, eventfd, ...). Regular files
-    /// and directories override this — Linux allows both kinds to carry
-    /// advisory locks.
-    fn inode_key(&self) -> Option<(u64, u64)> {
+    /// Filesystem-backed descriptions, including named FIFOs, override this.
+    /// `None` means this description does not expose an advisory-lock identity.
+    fn inode_key(&self) -> Option<InodeKey> {
         None
     }
 
@@ -644,6 +686,60 @@ pub fn current_fd_table() -> Arc<RwLock<FileTable>> {
 #[cfg(all(test, axtest))]
 static FD_TABLE_LOOKUP_READ_LOCKS: AtomicUsize = AtomicUsize::new(0);
 
+/// An unpublished fd slot reserved before an operation can block.
+pub(crate) struct FileDescriptorReservation {
+    table: Arc<RwLock<FileTable>>,
+    fd: Option<usize>,
+}
+
+impl FileDescriptorReservation {
+    /// Reserves a slot in the originating fd table without exposing a file.
+    pub(crate) fn new() -> StarryResult<Self> {
+        let limit = current_user_task()
+            .as_thread()
+            .proc_data
+            .rlimit_current(RLIMIT_NOFILE);
+        let table = current_fd_table();
+        let fd = {
+            let mut slots = table.write();
+            let fd = slots.reserve().ok_or(StarryError::TooManyOpenFiles)?;
+            // The bitmap chooses the lowest free number. Keep FIFO's fd-number
+            // limit without allocating a separate reservation under the raw lock.
+            if fd as u64 >= limit {
+                slots.release_reserved(fd);
+                return Err(StarryError::TooManyOpenFiles);
+            }
+            fd
+        };
+        Ok(Self {
+            table,
+            fd: Some(fd),
+        })
+    }
+
+    pub(crate) const fn fd(&self) -> c_int {
+        self.fd.expect("installed fd reservation queried") as c_int
+    }
+
+    pub(crate) fn install(mut self, descriptor: FileDescriptor) {
+        let fd = self.fd.take().expect("fd reservation installed twice");
+        let install = self.table.write().install_reserved(fd, descriptor);
+        if let Err(descriptor) = install {
+            // Destruction may wake waiters; keep it outside the table lock.
+            drop(descriptor);
+            panic!("prepared file descriptor lost its reservation before install");
+        }
+    }
+}
+
+impl Drop for FileDescriptorReservation {
+    fn drop(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            self.table.write().release_reserved(fd);
+        }
+    }
+}
+
 /// A file descriptor number prepared by a fallible syscall transaction.
 ///
 /// Dropping it before [`PreparedFileDescriptor::install`] rolls the descriptor
@@ -833,7 +929,13 @@ fn fd_tables_contain_file(file: &Arc<dyn FileLike>) -> bool {
 
 fn notify_close_write(fd: &FileDescriptor) {
     let access = fd.inner.open_flags() & O_ACCMODE;
-    if (access == O_WRONLY || access == O_RDWR) && fd.inner.is::<File>() {
+    let filesystem_backed = fd.inner.is::<File>()
+        || fd
+            .inner
+            .downcast_ref::<Pipe>()
+            .and_then(Pipe::named_file)
+            .is_some();
+    if (access == O_WRONLY || access == O_RDWR) && filesystem_backed {
         let path = fd.inner.path();
         inotify::notify_close_write_path(path.as_ref());
     }

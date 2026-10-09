@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5](https://github.com/rcore-os/tgoskits/compare/axvm-v0.8.4...axvm-v0.8.5) - 2026-09-22
+
+### Other
+
+- updated the following local packages: ax-cpu, cpu-local, ax-std
+
+## [0.8.4](https://github.com/rcore-os/tgoskits/compare/axvm-v0.8.3...axvm-v0.8.4) - 2026-09-21
+
+### Added
+
+- *(arceos)* add task switch overhead benchmark and validate inter-VM virtio-net ([#2428](https://github.com/rcore-os/tgoskits/pull/2428))
+
+### Fixed
+
+- *(axvisor)* validate guest kernels and complete shell editing ([#2462](https://github.com/rcore-os/tgoskits/pull/2462))
+- *(axvm)* unify targeted vCPU unblock and kick handling ([#1934](https://github.com/rcore-os/tgoskits/pull/1934))
+
+## [0.8.3](https://github.com/rcore-os/tgoskits/compare/axvm-v0.8.2...axvm-v0.8.3) - 2026-09-18
+
+### Added
+
+- *(axvm)* support LoongArch PCI direct boot ([#2405](https://github.com/rcore-os/tgoskits/pull/2405))
+- *(axvm)* support x86 virtio-blk file backends ([#2390](https://github.com/rcore-os/tgoskits/pull/2390))
+
+### Fixed
+
+- *(axvm)* preserve host interrupt ownership across guest execution ([#2438](https://github.com/rcore-os/tgoskits/pull/2438))
+- *(axvm)* reduce redundant vCPU scheduling and add board perf CI ([#2362](https://github.com/rcore-os/tgoskits/pull/2362))
+- *(axvm)* parse VM interrupts before passthrough address resolution ([#2400](https://github.com/rcore-os/tgoskits/pull/2400))
+
+### Other
+
+- *(repo)* remove nonfunctional and redundant test assertions ([#2440](https://github.com/rcore-os/tgoskits/pull/2440))
+
 ## [0.8.2](https://github.com/rcore-os/tgoskits/compare/axvm-v0.8.1...axvm-v0.8.2) - 2026-09-13
 
 ### Other

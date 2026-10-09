@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.9.0...axbuild-v0.9.1) - 2026-09-22
+
+### Added
+
+- *(axbuild)* add opt-in bounded parallel clippy checks ([#2482](https://github.com/rcore-os/tgoskits/pull/2482))
+
+### Other
+
+- Revert "fix(starry-kernel): close container userland gaps found by the Debian rootfs case" ([#2480](https://github.com/rcore-os/tgoskits/pull/2480))
+- Merge pull request #2466 from rcore-os/debin/container-guest-env-fixes
+
+## [0.9.0](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.8.1...axbuild-v0.9.0) - 2026-09-21
+
+### Fixed
+
+- *(ci)* stabilize qemu and app test semantics ([#2461](https://github.com/rcore-os/tgoskits/pull/2461))
+
+### Other
+
+- *(axbuild)* move generated artifacts into Cargo target ([#2460](https://github.com/rcore-os/tgoskits/pull/2460))
+
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.8.0...axbuild-v0.8.1) - 2026-09-18
+
+### Added
+
+- *(vfs)* implement mutation credentials for directory operations an… ([#2287](https://github.com/rcore-os/tgoskits/pull/2287))
+- *(sysbench)* unify reproducible QEMU and board benchmarks ([#2395](https://github.com/rcore-os/tgoskits/pull/2395))
+- *(axvm)* support x86 virtio-blk file backends ([#2390](https://github.com/rcore-os/tgoskits/pull/2390))
+
+### Fixed
+
+- *(ax-net)* allow sleeping in Unix pathname socket operations ([#2443](https://github.com/rcore-os/tgoskits/pull/2443))
+- *(ax-fs-ng)* bound page-cache writeback ([#2427](https://github.com/rcore-os/tgoskits/pull/2427))
+- *(axvm)* reduce redundant vCPU scheduling and add board perf CI ([#2362](https://github.com/rcore-os/tgoskits/pull/2362))
+- *(axbuild)* retry image downloads on fresh connections ([#2410](https://github.com/rcore-os/tgoskits/pull/2410))
+- *(ci)* fix debugfs test execution and virtio input startup ([#2396](https://github.com/rcore-os/tgoskits/pull/2396))
+- *(starry)* align syscall and Unix socket semantics with Linux ([#2270](https://github.com/rcore-os/tgoskits/pull/2270))
+
+### Other
+
+- *(repo)* remove nonfunctional and redundant test assertions ([#2440](https://github.com/rcore-os/tgoskits/pull/2440))
+- *(starry)* simplify feature selection ([#2436](https://github.com/rcore-os/tgoskits/pull/2436))
+- *(sched)* reduce scheduler and futex hot-path overhead ([#2399](https://github.com/rcore-os/tgoskits/pull/2399))
+
 ## [0.8.0](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.7.1...axbuild-v0.8.0) - 2026-09-13
 
 ### Added

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.5](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.13.4...ax-runtime-v0.13.5) - 2026-09-22
+
+### Fixed
+
+- *(axvisor)* preserve guest console output under backpressure ([#2473](https://github.com/rcore-os/tgoskits/pull/2473))
+
+### Other
+
+- *(ax-runtime)* retain tagged TLB entries across lazy switches ([#2464](https://github.com/rcore-os/tgoskits/pull/2464))
+
+## [0.13.4](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.13.3...ax-runtime-v0.13.4) - 2026-09-21
+
+### Other
+
+- updated the following local packages: ax-driver, ax-hal
+
+## [0.13.3](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.13.2...ax-runtime-v0.13.3) - 2026-09-18
+
+### Added
+
+- *(vfs)* implement mutation credentials for directory operations an… ([#2287](https://github.com/rcore-os/tgoskits/pull/2287))
+- *(ax-task)* integrate capacity-aware Fair placement ([#2389](https://github.com/rcore-os/tgoskits/pull/2389))
+
+### Fixed
+
+- *(starry-kernel)* enforce executable inode write exclusion ([#2375](https://github.com/rcore-os/tgoskits/pull/2375))
+
+### Other
+
+- *(scheduler)* streamline wakeup paths and RT accounting ([#2435](https://github.com/rcore-os/tgoskits/pull/2435))
+- *(sched)* reduce scheduler and futex hot-path overhead ([#2399](https://github.com/rcore-os/tgoskits/pull/2399))
+
 ## [0.13.2](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.13.1...ax-runtime-v0.13.2) - 2026-09-13
 
 ### Other

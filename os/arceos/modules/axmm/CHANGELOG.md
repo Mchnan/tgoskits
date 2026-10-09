@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4](https://github.com/rcore-os/tgoskits/compare/ax-mm-v0.8.3...ax-mm-v0.8.4) - 2026-09-22
+
+### Other
+
+- updated the following local packages: ax-cpu, ax-hal
+
+## [0.8.3](https://github.com/rcore-os/tgoskits/compare/ax-mm-v0.8.2...ax-mm-v0.8.3) - 2026-09-21
+
+### Other
+
+- updated the following local packages: ax-hal
+
+## [0.8.2](https://github.com/rcore-os/tgoskits/compare/ax-mm-v0.8.1...ax-mm-v0.8.2) - 2026-09-18
+
+### Other
+
+- updated the following local packages: ax-cpu, ax-hal
+
 ## [0.8.1](https://github.com/rcore-os/tgoskits/compare/ax-mm-v0.8.0...ax-mm-v0.8.1) - 2026-09-13
 
 ### Other

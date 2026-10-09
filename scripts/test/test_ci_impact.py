@@ -206,6 +206,56 @@ class CiImpactTests(unittest.TestCase):
         )
         self.assertEqual(impact.targets, ())
 
+    def test_benchmark_suite_path_routes_to_axvisor_instead_of_ignored_app(self) -> None:
+        path = Path(
+            "benchmarks/axvisor/board-orangepi-5-plus/vcpu-perf/"
+            "performance/board-orangepi-5-plus-vcpu-perf.toml"
+        )
+
+        impact = ci_impact.analyze_changed_paths(
+            self.workspace_root,
+            [path],
+            self.metadata_by_arch,
+        )
+
+        self.assertFalse(impact.full)
+        self.assertEqual(impact.ignored_apps, ())
+        self.assertTrue(impact.exclusive)
+        self.assertEqual(impact.test_suite_paths, (path.as_posix(),))
+        self.assertEqual(impact.targets, ())
+
+    def test_benchmark_starry_path_routes_to_nightly_app_instead_of_ignored_app(
+        self,
+    ) -> None:
+        path = Path(
+            "benchmarks/starry/block-rw-bench/board-orangepi-5-plus.toml"
+        )
+
+        impact = ci_impact.analyze_changed_paths(
+            self.workspace_root,
+            [path],
+            self.metadata_by_arch,
+        )
+
+        self.assertFalse(impact.full)
+        self.assertEqual(impact.ignored_apps, ())
+        self.assertTrue(impact.exclusive)
+        self.assertEqual(impact.test_suite_paths, (path.as_posix(),))
+        self.assertEqual(impact.targets, ())
+
+    def test_apps_starry_functional_path_stays_ignored(self) -> None:
+        path = Path("apps/starry/qemu/compile-sim-bench/qemu-x86_64.toml")
+
+        impact = ci_impact.analyze_changed_paths(
+            self.workspace_root,
+            [path],
+            self.metadata_by_arch,
+        )
+
+        self.assertFalse(impact.full)
+        self.assertEqual(impact.ignored_apps, (path.as_posix(),))
+        self.assertEqual(impact.test_suite_paths, ())
+
     def test_ci_owned_virtio_blk_app_triggers_axvisor_aarch64(self) -> None:
         impact = ci_impact.analyze_changed_paths(
             self.workspace_root,
@@ -402,29 +452,6 @@ class CiImpactTests(unittest.TestCase):
         self.assertTrue(impact.full)
         self.assertEqual(impact.ignored_markdown, ("README.md",))
         load_metadata.assert_not_called()
-
-    def test_summary_reports_selected_and_skipped_checks(self) -> None:
-        impact = ci_impact.CiImpact(
-            full=False,
-            reason="fixture",
-            changed_paths=("components/shared/src/lib.rs",),
-            ignored_markdown=("components/shared/README.md",),
-            changed_packages=("shared",),
-            affected_packages=("shared", "starryos"),
-            targets=("starry:aarch64",),
-        )
-
-        summary = ci_impact.render_summary(
-            impact,
-            ["run-clippy", "test-starry-aarch64-qemu"],
-            ["test-starry-x86-64-qemu"],
-        )
-
-        self.assertIn("components/shared/src/lib.rs", summary)
-        self.assertIn("components/shared/README.md", summary)
-        self.assertIn("starry:aarch64", summary)
-        self.assertIn("Selected checks (2)", summary)
-        self.assertIn("Skipped checks (1)", summary)
 
     def test_unknown_and_global_paths_fall_back_to_full(self) -> None:
         for changed_path in (

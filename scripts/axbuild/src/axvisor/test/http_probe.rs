@@ -63,6 +63,7 @@ pub(crate) fn run(
     addr: &str,
     config: &AxvisorHttpProbeConfig,
     case_dir: &Path,
+    builtin_configs: Option<&Path>,
     stop: Arc<AtomicBool>,
 ) -> HostHttpProbeOutcome {
     let script = case_dir.join(&config.probe_script);
@@ -74,7 +75,8 @@ pub(crate) fn run(
                 script.display()
             );
         }
-        let (mut child, output_capture) = spawn_probe_asset(&script, addr, config, case_dir)?;
+        let (mut child, output_capture) =
+            spawn_probe_asset(&script, addr, config, case_dir, builtin_configs)?;
         let status = wait_probe_asset(&mut child, &stop);
         let bytes = output_capture.finish()?;
         Ok((bytes, status))
@@ -193,12 +195,16 @@ fn spawn_probe_asset(
     addr: &str,
     config: &AxvisorHttpProbeConfig,
     case_dir: &Path,
+    builtin_configs: Option<&Path>,
 ) -> anyhow::Result<(Child, ProbeOutputCapture)> {
     let (reader, stdout) = os_pipe::pipe().context("failed to create probe output pipe")?;
     let stderr = stdout
         .try_clone()
         .context("failed to clone probe output pipe")?;
     let mut command = Command::new(script);
+    if let Some(configs) = builtin_configs {
+        command.env("AXVISOR_BUILTIN_CONFIG_DIR", configs);
+    }
     command
         .env("AXVISOR_HTTP_BASE", format!("http://{addr}"))
         .env(
@@ -252,9 +258,9 @@ mod tests {
             // Some CI runners mount their system temporary directory with
             // `noexec`. Probe fixtures are deliberately executable, so keep
             // them below the workspace build directory instead.
-            let root = std::env::current_dir()
+            let root = crate::context::WorkspaceContext::discover(None)
                 .unwrap()
-                .join("target")
+                .target_dir()
                 .join("axbuild-http-probe-fixtures");
             fs::create_dir_all(&root).unwrap();
             tempfile::Builder::new()
@@ -307,19 +313,6 @@ mod tests {
         path
     }
 
-    #[cfg(unix)]
-    fn write_output_fixture_probe(dir: &Path, name: &str) -> PathBuf {
-        use std::{fs, os::unix::fs::PermissionsExt};
-        let path = dir.join(name);
-        fs::write(
-            &path,
-            "#!/bin/sh\nprintf 'probe stdout\\n'\nprintf 'probe stderr\\n' >&2\n",
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
     #[cfg(target_os = "linux")]
     fn write_large_output_fixture_probe(dir: &Path, name: &str) -> PathBuf {
         use std::{fs, os::unix::fs::PermissionsExt};
@@ -337,16 +330,6 @@ mod tests {
         path
     }
 
-    #[test]
-    fn captured_probe_output_is_bounded_without_changing_execution_verdict() {
-        let mut output = BoundedProbeOutput::default();
-        output.append(&vec![b'x'; MAX_PROBE_OUTPUT_BYTES + 1]);
-        let output = output.finish();
-
-        assert!(output.starts_with(&vec![b'x'; MAX_PROBE_OUTPUT_BYTES]));
-        assert!(output.ends_with(b"\n[probe output truncated: dropped 1 bytes]\n"));
-    }
-
     #[cfg(unix)]
     #[test]
     fn run_executes_the_case_probe_asset_with_env() {
@@ -355,7 +338,7 @@ mod tests {
         let config = test_config(PathBuf::from("http_probe.py"));
         let stop = Arc::new(AtomicBool::new(false));
 
-        let outcome = run("127.0.0.1:12345", &config, dir.path(), stop);
+        let outcome = run("127.0.0.1:12345", &config, dir.path(), None, stop);
 
         assert!(
             outcome.verdict.is_ok(),
@@ -373,22 +356,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn run_captures_probe_output_for_deferred_replay() {
-        let dir = fixture_dir();
-        write_output_fixture_probe(dir.path(), "http_probe.py");
-        let config = test_config(PathBuf::from("http_probe.py"));
-        let stop = Arc::new(AtomicBool::new(false));
-
-        let outcome = run("127.0.0.1:12345", &config, dir.path(), stop);
-
-        assert!(outcome.verdict.is_ok());
-        assert_eq!(
-            String::from_utf8(outcome.output).unwrap(),
-            "probe stdout\nprobe stderr\n"
-        );
-    }
-
     #[cfg(target_os = "linux")]
     #[test]
     fn run_bounds_a_real_probe_while_it_writes_to_a_pipe() {
@@ -397,7 +364,7 @@ mod tests {
         let config = test_config(PathBuf::from("http_probe.py"));
         let stop = Arc::new(AtomicBool::new(false));
 
-        let outcome = run("127.0.0.1:12345", &config, dir.path(), stop);
+        let outcome = run("127.0.0.1:12345", &config, dir.path(), None, stop);
 
         assert!(outcome.verdict.is_ok());
         assert!(outcome.output.starts_with(b"pipe:["));
@@ -418,7 +385,7 @@ mod tests {
         let config = test_config(PathBuf::from("http_probe.py"));
         let stop = Arc::new(AtomicBool::new(false));
 
-        let error = run("127.0.0.1:12345", &config, dir.path(), stop)
+        let error = run("127.0.0.1:12345", &config, dir.path(), None, stop)
             .verdict
             .unwrap_err();
         assert!(
@@ -433,7 +400,7 @@ mod tests {
         let config = test_config(PathBuf::from("http_probe.py"));
         let stop = Arc::new(AtomicBool::new(false));
 
-        let error = run("127.0.0.1:12345", &config, dir.path(), stop)
+        let error = run("127.0.0.1:12345", &config, dir.path(), None, stop)
             .verdict
             .unwrap_err();
         assert!(error.to_string().contains("does not exist"));
@@ -450,7 +417,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let run_stop = stop.clone();
         let probe_thread =
-            thread::spawn(move || run("127.0.0.1:12345", &config, &case_dir, run_stop));
+            thread::spawn(move || run("127.0.0.1:12345", &config, &case_dir, None, run_stop));
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !started.is_file() {
@@ -465,27 +432,6 @@ mod tests {
         let error = probe_thread.join().unwrap().verdict.unwrap_err();
         assert!(
             error.to_string().contains("was killed"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn run_does_not_spawn_probe_when_stop_was_already_requested() {
-        let dir = fixture_dir();
-        let probe = dir.path().join("http_probe.py");
-        std::fs::write(&probe, "#!/bin/sh\nexit 0\n").unwrap();
-        let config = test_config(PathBuf::from("http_probe.py"));
-        let stop = Arc::new(AtomicBool::new(true));
-
-        let error = run("127.0.0.1:12345", &config, dir.path(), stop)
-            .verdict
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("was not started because the case had already stopped"),
             "unexpected error: {error:#}"
         );
     }

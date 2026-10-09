@@ -1,6 +1,6 @@
 [package]
 name = "starry-kernel"
-version = "0.10.2"
+version = "0.12.1"
 edition.workspace = true
 description = "A Linux-compatible OS kernel built on ArceOS unikernel"
 authors = [
@@ -26,8 +26,6 @@ default = ["dynamic_debug"]
 dev-log = []
 ext4 = ["ax-fs-ng/ext4"]
 fat = ["ax-fs-ng/fat"]
-input = ["dep:ax-input", "ax-runtime/input"]
-ipi = ["ax-runtime/ipi"]
 memtrack = ["axbacktrace/alloc", "ax-alloc/tracking"]
 qperf-metrics = ["ax-runtime/qperf-metrics"]
 # Exposes a debugfs-only synchronization hook used by the real userspace QEMU
@@ -36,16 +34,10 @@ uaccess-lock-regression = []
 rknpu = ["ax-driver/rknpu"]
 jpeg = ["ax-driver/jpeg"]
 rga = ["ax-driver/rga", "dep:rockchip-rga"]
-rk3588-pwm = [
-    "ax-driver/rk3588-pwm",
-    "dep:rdif-pwm",
-]
 k230-kpu = ["ax-hal/riscv-thead-mae", "dep:k230-kpu"]
-vsock = ["ax-runtime/vsock"]
-dynamic_debug = ["ipi"]
+dynamic_debug = []
 sg2002 = [
     "ax-driver/usb",
-    "dep:rdif-pwm",
     "dep:sg2002-tpu",
     "dep:some-serial",
     "dep:sg200x-bsp",
@@ -56,26 +48,29 @@ sg2002-cvi-usb-camera = [
     "dep:cvi-vdec-uapi",
     "dep:sg200x-jpu",
 ]
-smp = ["ax-std/smp"]
+uvc = ["dep:ax-media", "dep:media-uvc"]
 stack-guard-page = ["ax-runtime/stack-guard-page"]
 stack-protector = ["ax-runtime/stack-protector"]
-axtest = ["ax-runtime/fault-injection"]
+axtest = ["ax-runtime/fault-injection", "dep:axtest"]
+axtest-coverage = ["dep:axtest", "axtest/coverage"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(feature, values("ax-std"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(axtest_coverage)', 'cfg(feature, values("ax-std"))'] }
 
 [dependencies]
+axtest = { workspace = true, optional = true }
 ax-alloc = { workspace = true }
 ax-display.workspace = true
+ax-gpu.workspace = true
 ax-fs-ng = { workspace = true, features = ["vfs"] }
-ax-cpu = { workspace = true, features = ["fp-simd"] }
+ax-cpu = { workspace = true, features = ["fp-simd", "exception-table"] }
 ax-hal = { workspace = true, features = ["fp-simd", "uspace"] }
-ax-input = { workspace = true, optional = true }
+ax-input.workspace = true
 ax-lazyinit.workspace = true
 ax-log.workspace = true
 ax-mm = { workspace = true, features = ["copy"] }
 ax-net = { workspace = true }
-ax-driver = { workspace = true, features = ["usb"] }
+ax-driver = { workspace = true, features = ["usb", "pwm"] }
 axklib.workspace = true
 axplat-dyn.workspace = true
 ax-runtime = { workspace = true, features = [
@@ -85,12 +80,16 @@ ax-runtime = { workspace = true, features = [
     "ext4fs",
     "net",
     "vmap-task-stack",
+    "input",
+    "ipi",
+    "vsock",
 ] }
 ax-std = { workspace = true, default-features = false, features = [
     "alloc",
     "fd",
     "task-ext",
     "tracepoint-hooks",
+    "smp",
 ] }
 rockchip-rga = { workspace = true, optional = true }
 sg2002-tpu = { workspace = true, optional = true }
@@ -98,13 +97,18 @@ k230-kpu = { workspace = true, optional = true }
 crab-usb.workspace = true
 usb-serial.workspace = true
 rdrive.workspace = true
+ax-media = { workspace = true, optional = true }
+media-uvc = { workspace = true, optional = true }
+ax-sync = { workspace = true, features = ["sleep"] }
+anyhow.workspace = true
 
 axbacktrace = { workspace = true }
 ax-cgroup = { workspace = true }
 axfs-ng-vfs = { workspace = true }
 rdif-block = { workspace = true }
+rdif-gpu.workspace = true
 rdif-pinctrl = { workspace = true, optional = true }
-rdif-pwm = { workspace = true, optional = true }
+rdif-pwm.workspace = true
 ax-io = { workspace = true }
 axhvc = { workspace = true }
 axivc = { workspace = true }
@@ -172,7 +176,6 @@ kbpf-basic = "0.6"
 rbpf = { version = "0.4", default-features = false }
 
 [dev-dependencies]
-axtest = { path = "../../../components/axtest/axtest" }
 ax-std = { path = "../../arceos/ulib/axstd", default-features = false, features = [
     "alloc",
     "fd",
@@ -191,7 +194,7 @@ ax-runtime = { workspace = true, features = ["host-test", "smp"] }
 name = "axtest_kernel"
 path = "src/axtest_kernel.rs"
 harness = false
-required-features = ["axtest", "smp"]
+required-features = ["axtest"]
 
 [package.metadata.axtest]
 runtime = "starry"

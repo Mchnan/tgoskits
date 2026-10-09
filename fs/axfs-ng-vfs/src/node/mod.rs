@@ -53,6 +53,12 @@ bitflags! {
         /// This could prevent higher layers from attempting to add unnecessary
         /// non-blocking handling.
         const BLOCKING = 0x0008;
+
+        /// Indicates that every read or write transfers exactly one record.
+        ///
+        /// The direct backend then calls the node once per request instead
+        /// of filling or draining the caller's buffer across records.
+        const PACKET = 0x0010;
     }
 }
 
@@ -89,6 +95,12 @@ pub trait NodeOps: Send + Sync + 'static {
 
     /// Returns the optional persistent extended-attribute capability.
     fn xattr_ops(&self) -> Option<&dyn XattrOps> {
+        None
+    }
+
+    /// Returns inode-owned state that survives eviction of directory entries.
+    /// Memory filesystems use this for file contents shared by hard links.
+    fn inode_user_data(&self) -> Option<&Mutex<TypeMap>> {
         None
     }
 }
@@ -404,7 +416,10 @@ impl DirEntry {
     }
 
     pub fn user_data(&self) -> MutexGuard<'_, TypeMap> {
-        self.0.user_data.lock()
+        match self.0.node.inode_user_data() {
+            Some(state) => state.lock(),
+            None => self.0.user_data.lock(),
+        }
     }
 
     pub fn get_xattr(&self, name: &[u8]) -> VfsResult<Vec<u8>> {

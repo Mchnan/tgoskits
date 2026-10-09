@@ -1,4 +1,5 @@
 features = [
+  "ax-runtime/display",
   "ax-runtime/rtc",
   "ax-driver/serial",
   "ax-driver/nvme",
@@ -7,7 +8,6 @@ features = [
   "ax-driver/virtio-input",
   "ax-driver/virtio-socket",
   "ax-driver/xhci-pci",
-  "starry-kernel/input",
 ]
 max_cpu_num = 4
 log = "Warn"

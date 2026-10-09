@@ -10,12 +10,11 @@ mod tests;
 pub type AxvisorBuildInfo = config::AxvisorBuildInfo;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, anyhow};
 pub(crate) use config::AxvisorBoardFile;
 pub use config::{AXVISOR_PACKAGE, AxvisorBoardConfig};
 pub(crate) use load::{
     default_build_info_path, load_board_file, load_target_from_build_config,
-    resolve_build_info_path, workspace_root_from_axvisor_dir,
+    resolve_build_info_path,
 };
 use ostool::build::config::Cargo;
 
@@ -24,23 +23,25 @@ use self::{
     load::load_build_config, metadata::platform_feature_names,
 };
 pub use crate::build::LogLevel;
-use crate::context::ResolvedAxvisorRequest;
+use crate::context::{ResolvedAxvisorRequest, WorkspaceContext};
 
-pub(crate) fn load_cargo_config(request: &ResolvedAxvisorRequest) -> anyhow::Result<Cargo> {
+pub(crate) fn load_cargo_config(
+    request: &ResolvedAxvisorRequest,
+    workspace: &WorkspaceContext,
+) -> anyhow::Result<Cargo> {
     let makefile_features = crate::build::makefile_features_from_env();
-    load_cargo_config_with_makefile_features(request, &makefile_features)
+    load_cargo_config_with_makefile_features(request, workspace, &makefile_features)
 }
 
 fn load_cargo_config_with_makefile_features(
     request: &ResolvedAxvisorRequest,
+    workspace: &WorkspaceContext,
     makefile_features: &[String],
 ) -> anyhow::Result<Cargo> {
-    let metadata =
-        crate::build::cached_workspace_metadata().context("failed to load workspace metadata")?;
     to_cargo_config(
         load_build_config(request)?,
         request,
-        metadata,
+        workspace,
         makefile_features,
     )
 }
@@ -48,25 +49,26 @@ fn load_cargo_config_with_makefile_features(
 fn to_cargo_config(
     mut config: LoadedAxvisorBuildConfig,
     request: &ResolvedAxvisorRequest,
-    metadata: &cargo_metadata::Metadata,
+    workspace: &WorkspaceContext,
     makefile_features: &[String],
 ) -> anyhow::Result<Cargo> {
     config.target = request.target.clone();
     crate::build::apply_makefile_features(&mut config.build_info, makefile_features)?;
-    let known_platforms = platform_feature_names(metadata);
+    let known_platforms = platform_feature_names(workspace.metadata());
     reject_unsupported_nested_platform_features(&config.build_info.features, &known_platforms)?;
     let mut cargo = config
         .build_info
-        .into_prepared_std_cargo_config_with_metadata(&request.package, &config.target, metadata)?;
-    patch_axvisor_cargo_config(&mut cargo, request, &config.vm_configs)?;
+        .into_prepared_std_cargo_config_with_metadata(
+            &request.package,
+            &config.target,
+            workspace.metadata(),
+            &workspace.axbuild_artifact_dir(),
+        )?;
+    patch_axvisor_cargo_config(&mut cargo, request);
     Ok(cargo)
 }
 
-fn patch_axvisor_cargo_config(
-    cargo: &mut Cargo,
-    request: &ResolvedAxvisorRequest,
-    config_vmconfigs: &[PathBuf],
-) -> anyhow::Result<()> {
+fn patch_axvisor_cargo_config(cargo: &mut Cargo, request: &ResolvedAxvisorRequest) {
     cargo.package = request.package.clone();
     ensure_axvisor_bin_arg(&mut cargo.args);
     cargo
@@ -75,35 +77,34 @@ fn patch_axvisor_cargo_config(
     cargo
         .env
         .insert("AX_TARGET".to_string(), request.target.clone());
-    let configured_vmconfigs = if request.vmconfigs.is_empty() {
-        config_vmconfigs
+    cargo.features.sort();
+    cargo.features.dedup();
+}
+
+/// Resolves bundle inputs independently of Cargo's compilation identity.
+pub(crate) fn load_vmconfigs(
+    request: &ResolvedAxvisorRequest,
+    workspace: &WorkspaceContext,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let config = load_build_config(request)?;
+    let paths = if request.vmconfigs.is_empty() {
+        config
+            .vm_configs
             .iter()
             .map(|path| resolve_build_config_vmconfig_path(request, path))
-            .collect::<Vec<_>>()
+            .collect()
     } else {
         request.vmconfigs.clone()
     };
-    let vmconfigs = vm_config::resolve_vmconfigs(request, &configured_vmconfigs)?;
-    if !vmconfigs.is_empty() {
-        let joined = std::env::join_paths(&vmconfigs)
-            .map_err(|e| anyhow!("failed to join vmconfig paths: {e}"))?;
-        cargo.env.insert(
-            "AXVISOR_VM_CONFIGS".to_string(),
-            joined.to_string_lossy().into_owned(),
-        );
-    }
-
-    cargo.features.sort();
-    cargo.features.dedup();
-    Ok(())
+    resolve_vmconfigs(request, &paths, workspace)
 }
 
-pub(crate) fn vmconfigs_from_cargo(cargo: &Cargo) -> Vec<PathBuf> {
-    cargo
-        .env
-        .get("AXVISOR_VM_CONFIGS")
-        .map(|paths| std::env::split_paths(paths).collect())
-        .unwrap_or_default()
+pub(crate) fn resolve_vmconfigs(
+    request: &ResolvedAxvisorRequest,
+    paths: &[PathBuf],
+    workspace: &WorkspaceContext,
+) -> anyhow::Result<Vec<PathBuf>> {
+    vm_config::resolve_vmconfigs(request, paths, workspace)
 }
 
 fn resolve_build_config_vmconfig_path(request: &ResolvedAxvisorRequest, path: &Path) -> PathBuf {

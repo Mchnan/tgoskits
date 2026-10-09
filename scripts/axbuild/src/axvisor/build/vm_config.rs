@@ -11,25 +11,20 @@ use tempfile::NamedTempFile;
 
 use crate::context::ResolvedAxvisorRequest;
 
-const IMAGE_PATH_FIELDS: [&str; 5] = [
-    "kernel_path",
-    "dtb_path",
-    "bios_path",
-    "uefi_firmware_path",
-    "ramdisk_path",
-];
-
 pub(super) fn resolve_vmconfigs(
     request: &ResolvedAxvisorRequest,
     configured_paths: &[PathBuf],
+    workspace: &crate::context::WorkspaceContext,
 ) -> anyhow::Result<Vec<PathBuf>> {
-    let workspace_root = super::workspace_root_from_axvisor_dir(&request.axvisor_dir);
+    let workspace_root = workspace.root().to_path_buf();
     let scope = VariableScope::new(
         workspace_root.clone(),
         request.axvisor_dir.clone(),
         std::env::temp_dir(),
     );
-    let output_dir = workspace_root.join("tmp/axbuild/axvisor/resolved-vm-configs");
+    let output_dir = workspace
+        .axbuild_artifact_dir()
+        .join("axvisor/resolved-vm-configs");
 
     configured_paths
         .iter()
@@ -39,7 +34,13 @@ pub(super) fn resolve_vmconfigs(
             } else {
                 workspace_root.join(path)
             };
-            resolve_vmconfig(&source, &scope, &output_dir)
+            resolve_vmconfig(
+                &source,
+                &scope,
+                &output_dir,
+                &workspace_root,
+                workspace.target_dir(),
+            )
         })
         .collect()
 }
@@ -48,6 +49,8 @@ fn resolve_vmconfig(
     source: &Path,
     scope: &VariableScope,
     output_dir: &Path,
+    workspace_root: &Path,
+    target_dir: &Path,
 ) -> anyhow::Result<PathBuf> {
     let content = fs::read_to_string(source)
         .with_context(|| format!("failed to read VM config {}", source.display()))?;
@@ -59,8 +62,8 @@ fn resolve_vmconfig(
     };
 
     let mut paths = Vec::new();
-    let mut expanded_any = false;
-    for field in IMAGE_PATH_FIELDS {
+
+    for field in axvmconfig::BOOT_IMAGE_PATH_FIELDS {
         let Some(value) = kernel.get(field) else {
             continue;
         };
@@ -76,27 +79,24 @@ fn resolve_vmconfig(
                 source.display()
             )
         })?;
-        expanded_any |= expanded != Path::new(value);
-        paths.push((field, expanded));
+        let expanded = if expanded.is_absolute() {
+            expanded
+        } else {
+            source
+                .parent()
+                .with_context(|| format!("VM config path has no parent: {}", source.display()))?
+                .join(expanded)
+        };
+        let resolved =
+            crate::context::resolve_axbuild_artifact_path(workspace_root, target_dir, &expanded);
+        paths.push((field, resolved));
     }
 
-    if !expanded_any {
-        return Ok(source.to_path_buf());
-    }
-
-    let source_dir = source
-        .parent()
-        .with_context(|| format!("VM config path has no parent: {}", source.display()))?;
     let kernel = document
         .get_mut("kernel")
         .and_then(toml::Value::as_table_mut)
         .expect("kernel table was validated above");
     for (field, path) in paths {
-        let path = if path.is_absolute() {
-            path
-        } else {
-            source_dir.join(path)
-        };
         kernel.insert(
             field.to_string(),
             toml::Value::String(path.to_string_lossy().into_owned()),
@@ -177,7 +177,9 @@ ramdisk_path = "../images/initramfs.cpio"
         let output = resolve_vmconfig(
             &source,
             &scope,
-            &workspace.join("tmp/axbuild/axvisor/resolved-vm-configs"),
+            &workspace.join("custom-target/axbuild/axvisor/resolved-vm-configs"),
+            workspace,
+            &workspace.join("custom-target"),
         )
         .unwrap();
         let resolved = fs::read_to_string(output)

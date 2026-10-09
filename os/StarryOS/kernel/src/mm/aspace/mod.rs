@@ -14,8 +14,8 @@ use ax_mm::RootEntryShare;
 use ax_runtime::hal::{
     mem::phys_to_virt,
     paging::{
-        InstalledHugeSplit, MappingFlags, PageTable, PageTableEntry, PageTableMapDeposit,
-        PageTableMapPlan, PageTableMovePlan, PagingAllocator, PagingError,
+        DeferredPageTableFrames, InstalledHugeSplit, MappingFlags, PageTable, PageTableEntry,
+        PageTableMapDeposit, PageTableMapPlan, PageTableMovePlan, PagingAllocator, PagingError,
     },
     trap::PageFaultFlags,
 };
@@ -61,8 +61,9 @@ pub use self::mutation::{
 use self::{
     accounting::ResidentWatermark,
     backend::{
-        FaultFallback, FaultMaterialization, FaultPteSnapshot, PopulateRequest, PreparedPteOwner,
-        ProviderPublication, PteMaterialization, PteOwnerTransition,
+        FaultFallback, FaultMaterialization, FaultPteSnapshot, MappingMutationContext,
+        PopulateRequest, PreparedPteOwner, ProviderPublication, PteMaterialization,
+        PteOwnerTransition,
     },
 };
 pub use self::{
@@ -539,6 +540,7 @@ struct RetiredMappingOwners {
     backends: Vec<MappingOperation>,
     pages: Vec<Arc<PageObject>>,
     cache_pins: Vec<CachedPagePin>,
+    page_tables: Vec<DeferredPageTableFrames>,
     /// File pages whose eviction stopped after PTE publication but before
     /// every target CPU acknowledged the receipt.  Releasing this owner marks
     /// the existing EvictionLease resumable; it must never make the page
@@ -551,6 +553,7 @@ impl RetiredMappingOwners {
         self.backends.is_empty()
             && self.pages.is_empty()
             && self.cache_pins.is_empty()
+            && self.page_tables.is_empty()
             && self.deferred_evictions.is_empty()
     }
 }
@@ -748,6 +751,8 @@ pub struct AddrSpace {
     /// and `mm->brk`, not a process-side mirror.
     heap: HeapState,
     executable_data: ExecutableDataLayout,
+    /// The main image remains write-protected until this MM is retired.
+    executable_file: Option<Arc<ax_fs_ng::file::ExecutableFile>>,
     pt: PageTable,
     /// Fixed-order PTE/structure lock domains.  The page-table root remains a
     /// materialized view; ownership is carried by VMA/page records.
@@ -814,6 +819,28 @@ impl AddrSpace {
     /// Returns the current program break while the address-space lock is held.
     pub(crate) const fn heap_break(&self) -> usize {
         self.heap.current
+    }
+
+    /// Transfers the loader's exclusion lease to the address-space lifetime.
+    pub(crate) fn set_executable_file(&mut self, file: ax_fs_ng::file::ExecutableFile) {
+        self.executable_file = Some(Arc::new(file));
+    }
+
+    /// Ends file exclusion at last-user exit, separately from physical reclaim.
+    /// Returned leases must be destroyed after releasing the MM metadata lock.
+    fn take_file_accesses(
+        &mut self,
+    ) -> (
+        Option<Arc<ax_fs_ng::file::ExecutableFile>>,
+        Vec<Arc<ax_fs_ng::file::WriteAccess>>,
+    ) {
+        let mut writers = Vec::new();
+        for entry in self.vma_root.iter_entries() {
+            if let Some(access) = entry.operation().take_write_access() {
+                writers.push(access);
+            }
+        }
+        (self.executable_file.take(), writers)
     }
 
     /// Publishes the main executable's Linux `start_data`/`end_data` pair.
@@ -1286,9 +1313,25 @@ impl AddrSpace {
                 _ => StarryError::BadState,
             })?;
 
-        let deposit = old_slot
+        let mut deposit = old_slot
             .take_huge_split_deposit()
             .ok_or(StarryError::BadState)?;
+        if deposit.requires_tlb_confirmation() {
+            if ax_runtime::hal::cache::flush_tlb_range_all_cpus(
+                block_range.start,
+                block_range.size(),
+            )
+            .is_err()
+            {
+                if old_slot.restore_huge_split_deposit(deposit).is_err() {
+                    self.mutation_gate.mark_needs_repair();
+                }
+                return Err(StarryError::BadState);
+            }
+            // SAFETY: the all-ready-CPU shootdown completed before taking the
+            // IRQ-saving PTE stripe. CPUs joining later flush on publication.
+            unsafe { deposit.confirm_tlb_retirement() };
+        }
         let mutation_gate = &self.mutation_gate;
         let pte_domain = &self.pte_domain;
         let pt = &mut self.pt;
@@ -1567,6 +1610,7 @@ impl AddrSpace {
             vma_root: Arc::new(VmaMap::default()),
             heap: HeapState::new(USER_HEAP_BASE),
             executable_data: ExecutableDataLayout::default(),
+            executable_file: None,
             pt: PageTable::new(PagingAllocator).map_err(|_| StarryError::NoMemory)?,
             pte_domain: PageTableDomain::new(),
             mutation_gate: MutationGate::new(),
@@ -1893,6 +1937,18 @@ impl AddrSpace {
         Ok(owners)
     }
 
+    /// Reserves ownership for every intermediate page-table frame that an
+    /// unmap may detach. The occupied-leaf count is a strict upper bound: one
+    /// leaf removal returns at most one move-only reclaim token.
+    fn prepare_page_table_reclaims(
+        &self,
+        ranges: &[VirtAddrRange],
+    ) -> StarryResult<MappingMutationContext> {
+        try_reserve_irq_vec(&self.retired_mapping_batches, 1).map_err(|_| StarryError::NoMemory)?;
+        let capacity = self.occupied_pte_leaves_overlapping(ranges)?.len();
+        MappingMutationContext::for_published_mutation(capacity)
+    }
+
     /// Reserves the post-publication owner used by rmap-driven file eviction.
     /// Both allocations happen before the PTE is detached, so an allocation
     /// failure is an ordinary retry with no visible state change.
@@ -1904,6 +1960,10 @@ impl AddrSpace {
         let mut owners = RetiredMappingOwners::default();
         owners
             .deferred_evictions
+            .try_reserve(1)
+            .map_err(|_| StarryError::NoMemory)?;
+        owners
+            .page_tables
             .try_reserve(1)
             .map_err(|_| StarryError::NoMemory)?;
         owners.deferred_evictions.push(page.clone());
@@ -1921,6 +1981,17 @@ impl AddrSpace {
             .push(RetiredMappingBatch { epoch, owners });
     }
 
+    fn park_page_table_reclaims(&self, epoch: VmEpoch, context: MappingMutationContext) {
+        if context.is_empty() {
+            return;
+        }
+        let owners = RetiredMappingOwners {
+            page_tables: context.into_page_tables(),
+            ..RetiredMappingOwners::default()
+        };
+        self.park_retired_mapping_owners(epoch, owners);
+    }
+
     fn release_retired_mapping_owners(&self, epoch: VmEpoch) {
         loop {
             let batch = {
@@ -1930,12 +2001,17 @@ impl AddrSpace {
                     .position(|batch| batch.epoch == epoch)
                     .map(|index| batches.swap_remove(index))
             };
-            let Some(batch) = batch else {
+            let Some(mut batch) = batch else {
                 break;
             };
             debug_assert!(!batch.owners.is_empty());
             for page in &batch.owners.deferred_evictions {
                 page.complete_eviction_tlb();
+            }
+            for tables in batch.owners.page_tables.drain(..) {
+                // SAFETY: this batch is removed only after the matching
+                // address-space receipt has no pending CPU acknowledgement.
+                unsafe { tables.reclaim() };
             }
             // Cache pins may take the page-cache lock in Drop.  Release them
             // only after the IRQ-safe batch lock is gone.
@@ -1945,6 +2021,27 @@ impl AddrSpace {
 
     fn pending_retired_mapping_batches(&self) -> usize {
         self.retired_mapping_batches.lock().len()
+    }
+
+    #[cfg(test)]
+    fn pending_retired_page_table_reclaims(&self) -> usize {
+        self.retired_mapping_batches
+            .lock()
+            .iter()
+            .map(|batch| batch.owners.page_tables.len())
+            .sum()
+    }
+
+    fn confirm_restored_mapping_owners(
+        &self,
+        epoch: VmEpoch,
+        ranges: &[VirtAddrRange],
+    ) -> StarryResult {
+        for range in ranges {
+            crate::mm::flush_tlb_range_sync(range.start, range.size())?;
+        }
+        self.release_retired_mapping_owners(epoch);
+        Ok(())
     }
 
     /// Number of mutations whose remote TLB obligations are not complete.
@@ -2143,8 +2240,13 @@ impl AddrSpace {
     ) -> Result<EvictMappingOutcome, StarryError> {
         match self.restore_mapping_preimage(range, preimage) {
             Ok(()) => {
-                if let Some(epoch) = parked_epoch {
-                    self.release_retired_mapping_owners(epoch);
+                if let Some(epoch) = parked_epoch
+                    && self
+                        .confirm_restored_mapping_owners(epoch, &[range])
+                        .is_err()
+                {
+                    self.mutation_gate.mark_needs_repair();
+                    return Ok(EvictMappingOutcome::NeedsRepair);
                 }
                 self.mutation_gate.clear_repair();
                 Err(original_error)
@@ -2185,8 +2287,13 @@ impl AddrSpace {
     ) -> StarryResult {
         match self.restore_mapping_preimage_ranges(ranges, preimage) {
             Ok(()) => {
-                if let Some(epoch) = parked_epoch {
-                    self.release_retired_mapping_owners(epoch);
+                if let Some(epoch) = parked_epoch
+                    && self
+                        .confirm_restored_mapping_owners(epoch, ranges)
+                        .is_err()
+                {
+                    self.mutation_gate.mark_needs_repair();
+                    return Err(StarryError::BadState);
                 }
                 self.mutation_gate.clear_repair();
                 Err(original_error)
@@ -2235,8 +2342,13 @@ impl AddrSpace {
             .is_ok()
             && self.rollback_applied_huge_splits(splits)
         {
-            if let Some(epoch) = parked_epoch {
-                self.release_retired_mapping_owners(epoch);
+            if let Some(epoch) = parked_epoch
+                && self
+                    .confirm_restored_mapping_owners(epoch, ranges)
+                    .is_err()
+            {
+                self.mutation_gate.mark_needs_repair();
+                return Err(StarryError::BadState);
             }
             self.mutation_gate.clear_repair();
             Err(original_error)
@@ -3006,7 +3118,7 @@ impl AddrSpace {
 
         let range = VirtAddrRange::from_start_size(key.va, PAGE_SIZE_4K);
         let preimage = self.capture_mapping_preimage(range)?;
-        let retired_owner = self.prepare_deferred_eviction_owner(page)?;
+        let mut retired_owner = self.prepare_deferred_eviction_owner(page)?;
         let mut mutation = self.prepare_mutation_range(key.va, PAGE_SIZE_4K);
         let retire_epoch = mutation
             .receipt()
@@ -3035,10 +3147,13 @@ impl AddrSpace {
                 let range = VirtAddrRange::from_start_size(key.va, PAGE_SIZE_4K);
                 let _structure = pte_domain.lock_structure();
                 let _stripe = pte_domain.lock_range(range);
-                pt.try_unmap_page_with(unmap_plan)?
+                pt.unmap_page_deferred(key.va)?
             };
             if slot.mapped_paddr() != Some(unmapped.0) || unmapped.2 != PAGE_SIZE_4K {
                 return Err(StarryError::BadState);
+            }
+            if !unmapped.3.is_empty() {
+                retired_owner.page_tables.push(unmapped.3);
             }
             // `page` and the caller's EvictionLease keep the frame owned until
             // this receipt is acknowledged.  No independent all-CPU flush is
@@ -3260,9 +3375,26 @@ impl AddrSpace {
         {
             return false;
         }
-        leaves
+        let Ok(mut context) = MappingMutationContext::for_rollback(leaves.len()) else {
+            return false;
+        };
+        let detached = leaves
             .into_iter()
-            .all(|leaf| operation.unmap_range(leaf, &mut self.pt).is_ok())
+            .all(|leaf| {
+                operation
+                    .unmap_range(leaf, &mut context, &mut self.pt)
+                    .is_ok()
+            });
+        if !context.pte_changed() {
+            return detached;
+        }
+        if crate::mm::flush_tlb_range_sync(range.start, range.size()).is_err() {
+            return false;
+        }
+        // SAFETY: the synchronous all-CPU invalidation above covers every
+        // detached leaf in this rollback range.
+        unsafe { context.reclaim() };
+        detached
     }
 
     /// Detaches every occupied leaf covered by the currently unpublished VMA
@@ -3270,6 +3402,7 @@ impl AddrSpace {
     /// a sparse multi-gigabyte mapping does not scan every virtual base page.
     fn detach_current_materialized_ranges(&mut self, ranges: &[VirtAddrRange]) -> StarryResult {
         let leaves = self.occupied_pte_leaves_overlapping(ranges)?;
+        let mut context = MappingMutationContext::for_rollback(leaves.len())?;
         let mut operations = Vec::new();
         operations
             .try_reserve(leaves.len())
@@ -3289,8 +3422,22 @@ impl AddrSpace {
             return Err(StarryError::BadState);
         }
         for (leaf, operation) in operations {
-            operation.unmap_range(leaf, &mut self.pt)?;
+            if let Err(error) = operation.unmap_range(leaf, &mut context, &mut self.pt) {
+                for range in ranges {
+                    crate::mm::flush_tlb_range_sync(range.start, range.size())?;
+                }
+                // SAFETY: the synchronous invalidations cover every token
+                // collected before the backend reported failure.
+                unsafe { context.reclaim() };
+                return Err(error);
+            }
         }
+        for range in ranges {
+            crate::mm::flush_tlb_range_sync(range.start, range.size())?;
+        }
+        // SAFETY: all detached ranges completed synchronous system-wide
+        // invalidation before any intermediate table frame is returned.
+        unsafe { context.reclaim() };
         Ok(())
     }
 
@@ -3337,6 +3484,7 @@ impl AddrSpace {
         permissions: MappingPermissions,
         operation: &MappingOperation,
         replace: bool,
+        context: &mut MappingMutationContext,
     ) -> StarryResult<PteMaterialization> {
         let replaced = if replace {
             self.mapping_operation_fragments(range, false)?
@@ -3351,7 +3499,7 @@ impl AddrSpace {
             return Err(StarryError::BadState);
         }
         for (fragment, old) in &replaced {
-            old.unmap_range(*fragment, &mut self.pt)?;
+            old.unmap_range(*fragment, context, &mut self.pt)?;
         }
         match operation.map_range(range, permissions.current, &mut self.pt) {
             Ok(materialization) => Ok(materialization),
@@ -3378,6 +3526,7 @@ impl AddrSpace {
         advice_policy: VmaAdvicePolicy,
         memlock_limit: Option<MemlockLimit>,
         replace: bool,
+        context: &mut MappingMutationContext,
     ) -> StarryResult<PteMaterialization> {
         let successor = self.prepare_mapping_successor(
             range,
@@ -3389,13 +3538,22 @@ impl AddrSpace {
             replace,
         )?;
         self.validate_memlock_successor(&successor, memlock_limit)?;
-        let materialization =
-            self.apply_mapping_pages_unpublished(range, permissions, operation, replace)?;
+        let materialization = self.apply_mapping_pages_unpublished(
+            range,
+            permissions,
+            operation,
+            replace,
+            context,
+        )?;
         self.vma_root = Arc::new(successor);
         Ok(materialization)
     }
 
-    fn apply_unmap_pages_unpublished(&mut self, range: VirtAddrRange) -> StarryResult {
+    fn apply_unmap_pages_unpublished(
+        &mut self,
+        range: VirtAddrRange,
+        context: &mut MappingMutationContext,
+    ) -> StarryResult {
         let operations = self.mapping_operation_fragments(range, false)?;
         if operations
             .iter()
@@ -3404,7 +3562,7 @@ impl AddrSpace {
             return Err(StarryError::BadState);
         }
         for (fragment, operation) in operations {
-            operation.unmap_range(fragment, &mut self.pt)?;
+            operation.unmap_range(fragment, context, &mut self.pt)?;
         }
         Ok(())
     }
@@ -3412,12 +3570,16 @@ impl AddrSpace {
     /// Applies VMA/PTE removal from one precomputed persistent-tree successor.
     /// Holes are accepted, matching Linux `munmap`; every intersecting backend
     /// is validated before the first PTE is detached.
-    fn apply_unmap_unpublished(&mut self, range: VirtAddrRange) -> StarryResult {
+    fn apply_unmap_unpublished(
+        &mut self,
+        range: VirtAddrRange,
+        context: &mut MappingMutationContext,
+    ) -> StarryResult {
         let successor = self
             .vma_root
             .without_range(range)
             .ok_or(StarryError::BadState)?;
-        self.apply_unmap_pages_unpublished(range)?;
+        self.apply_unmap_pages_unpublished(range, context)?;
         self.vma_root = Arc::new(successor);
         Ok(())
     }
@@ -3512,6 +3674,7 @@ impl AddrSpace {
         }
 
         let operation = MappingOperation::new_linear(start_vaddr, start_paddr, false);
+        let mut page_table_reclaims = MappingMutationContext::for_published_mutation(0)?;
         let materialization = match self.apply_mapping_unpublished(
             range,
             MappingPermissions {
@@ -3525,6 +3688,7 @@ impl AddrSpace {
             VmaAdvicePolicy::default(),
             None,
             false,
+            &mut page_table_reclaims,
         ) {
             Ok(materialization) => materialization,
             Err(error) => {
@@ -3771,9 +3935,14 @@ impl AddrSpace {
             .base_epoch
             .checked_next()
             .ok_or(StarryError::BadState)?;
-        let retired_owners = replace
+        let mut retired_owners = replace
             .then(|| self.prepare_retired_mapping_owners(range))
             .transpose()?;
+        let mut page_table_reclaims = if replace {
+            self.prepare_page_table_reclaims(&[range])?
+        } else {
+            MappingMutationContext::for_published_mutation(0)?
+        };
 
         // Keep the identities of shared memfd VMAs so their writable-count
         // side band can be recomputed only after the replacement commits.  A
@@ -3794,17 +3963,28 @@ impl AddrSpace {
             advice_policy,
             memlock_limit,
             replace,
+            &mut page_table_reclaims,
         ) {
             Ok(materialization) => materialization,
             Err(error) => {
+                if let Some(owners) = retired_owners.take() {
+                    self.park_retired_mapping_owners(retire_epoch, owners);
+                }
+                self.park_page_table_reclaims(retire_epoch, page_table_reclaims);
                 return self
-                    .abort_unpublished_mapping_mutation(range, mapping_preimage, error)
+                    .abort_unpublished_parked_mapping_mutation(
+                        range,
+                        mapping_preimage,
+                        replace.then_some(retire_epoch),
+                        error,
+                    )
                     .map(|()| AddressSpaceMutationOutcome::Complete);
             }
         };
-        if let Some(owners) = retired_owners {
+        if let Some(owners) = retired_owners.take() {
             self.park_retired_mapping_owners(retire_epoch, owners);
         }
+        self.park_page_table_reclaims(retire_epoch, page_table_reclaims);
         if removed_pages != 0
             && let Err(error) = self.detach_mapping_slots(range)
         {
@@ -4119,6 +4299,18 @@ impl AddrSpace {
                 );
             }
         };
+        let mut page_table_reclaims = match self.prepare_page_table_reclaims(&[retired_range]) {
+            Ok(reclaims) => reclaims,
+            Err(error) => {
+                return self.abort_unpublished_split_mapping_mutation(
+                    retired_range,
+                    preimage,
+                    None,
+                    splits,
+                    error,
+                );
+            }
+        };
         let Ok((detached_slots, retired_pages, retired_resident)) =
             self.mapping_slot_summary(retired_range)
         else {
@@ -4143,33 +4335,32 @@ impl AddrSpace {
             );
         };
 
-        let deferred_tlb = DeferredTlbRetireGuard::enter();
         for (range, backend) in frags {
-            if let Err(error) = backend.unmap_range(range, &mut self.pt) {
-                drop(deferred_tlb);
-                if let Err(flush_error) = crate::mm::flush_tlb_range_sync(start, size) {
-                    warn!("discard repair could not invalidate {start:?}+{size:#x}: {flush_error}");
-                }
+            if let Err(error) =
+                backend.unmap_range(range, &mut page_table_reclaims, &mut self.pt)
+            {
+                self.park_retired_mapping_owners(retire_epoch, retired_owners);
+                self.park_page_table_reclaims(retire_epoch, page_table_reclaims);
                 return self.abort_unpublished_split_mapping_mutation(
                     retired_range,
                     preimage,
-                    None,
+                    Some(retire_epoch),
                     splits,
                     error,
                 );
             }
         }
-        drop(deferred_tlb);
+        self.park_retired_mapping_owners(retire_epoch, retired_owners);
+        self.park_page_table_reclaims(retire_epoch, page_table_reclaims);
         if let Err(error) = self.detach_mapping_slots(retired_range) {
             return self.abort_unpublished_split_mapping_mutation(
                 retired_range,
                 preimage,
-                None,
+                Some(retire_epoch),
                 splits,
                 error,
             );
         }
-        self.park_retired_mapping_owners(retire_epoch, retired_owners);
         mutation.set_pte_delta(PteDelta {
             unmapped: u32::try_from(retired_pages).unwrap_or(u32::MAX),
             ..PteDelta::default()
@@ -4459,6 +4650,20 @@ impl AddrSpace {
             Err(error) => {
                 return self
                     .abort_unpublished_huge_splits(splits, error)
+                .map(|()| AddressSpaceMutationOutcome::Complete);
+            }
+        };
+        let mut page_table_reclaims = match self.prepare_page_table_reclaims(&[range]) {
+            Ok(reclaims) => reclaims,
+            Err(error) => {
+                return self
+                    .abort_unpublished_split_mapping_mutation(
+                        range,
+                        preimage,
+                        None,
+                        splits,
+                        error,
+                    )
                     .map(|()| AddressSpaceMutationOutcome::Complete);
             }
         };
@@ -4491,23 +4696,32 @@ impl AddrSpace {
             })
             .sum();
 
-        let deferred_tlb = DeferredTlbRetireGuard::enter();
-        if let Err(error) = self.apply_unmap_unpublished(range) {
-            drop(deferred_tlb);
-            if let Err(flush_error) = crate::mm::flush_tlb_range_sync(start, size) {
-                warn!("unmap repair could not invalidate {start:?}+{size:#x}: {flush_error}");
-            }
+        if let Err(error) = self.apply_unmap_unpublished(range, &mut page_table_reclaims) {
+            self.park_retired_mapping_owners(retire_epoch, retired_owners);
+            self.park_page_table_reclaims(retire_epoch, page_table_reclaims);
             return self
-                .abort_unpublished_split_mapping_mutation(range, preimage, None, splits, error)
-                .map(|()| AddressSpaceMutationOutcome::Complete);
-        }
-        drop(deferred_tlb);
-        if let Err(error) = self.detach_mapping_slots(range) {
-            return self
-                .abort_unpublished_split_mapping_mutation(range, preimage, None, splits, error)
+                .abort_unpublished_split_mapping_mutation(
+                    range,
+                    preimage,
+                    Some(retire_epoch),
+                    splits,
+                    error,
+                )
                 .map(|()| AddressSpaceMutationOutcome::Complete);
         }
         self.park_retired_mapping_owners(retire_epoch, retired_owners);
+        self.park_page_table_reclaims(retire_epoch, page_table_reclaims);
+        if let Err(error) = self.detach_mapping_slots(range) {
+            return self
+                .abort_unpublished_split_mapping_mutation(
+                    range,
+                    preimage,
+                    Some(retire_epoch),
+                    splits,
+                    error,
+                )
+                .map(|()| AddressSpaceMutationOutcome::Complete);
+        }
         mutation.set_pte_delta(PteDelta {
             unmapped: u32::try_from(detached_resident_pages).unwrap_or(u32::MAX),
             ..PteDelta::default()
@@ -5017,7 +5231,7 @@ impl AddrSpace {
             Ok(preimage) => preimage,
             Err(error) => return self.abort_unpublished_huge_splits(splits, error),
         };
-        let target_owners = match replace_target
+        let mut target_owners = match replace_target
             .then(|| self.prepare_retired_mapping_owners(target_range))
             .transpose()
         {
@@ -5032,7 +5246,7 @@ impl AddrSpace {
                 );
             }
         };
-        let tail_owners = match tail_range
+        let mut tail_owners = match tail_range
             .map(|range| self.prepare_retired_mapping_owners(range))
             .transpose()
         {
@@ -5046,6 +5260,22 @@ impl AddrSpace {
                     error,
                 );
             }
+        };
+        let mut page_table_reclaims = if replace_target || tail_range.is_some() {
+            match self.prepare_page_table_reclaims(&rollback_ranges) {
+                Ok(reclaims) => reclaims,
+                Err(error) => {
+                    return self.abort_unpublished_split_mapping_mutation_ranges(
+                        &rollback_ranges,
+                        preimage,
+                        None,
+                        splits,
+                        error,
+                    );
+                }
+            }
+        } else {
+            MappingMutationContext::for_published_mutation(0)?
         };
 
         let mut memfd_deltas = crate::syscall::memfd_prepare_aspace_replace_deltas(
@@ -5077,6 +5307,7 @@ impl AddrSpace {
                 permissions,
                 &target_backend,
                 replace_target,
+                &mut page_table_reclaims,
             )?;
             self.vma_root = Arc::new(target_successor.clone());
 
@@ -5084,7 +5315,7 @@ impl AddrSpace {
             let prepared_moved_slots =
                 self.prepare_moved_slots(&moved_pages, target_backend.mapping_id())?;
             if !dontunmap && let Some(tail) = tail_range {
-                self.apply_unmap_pages_unpublished(tail)?;
+                self.apply_unmap_pages_unpublished(tail, &mut page_table_reclaims)?;
             }
 
             if replace_target {
@@ -5121,21 +5352,32 @@ impl AddrSpace {
         let moved_leaves = match apply_result {
             Ok(moved) => moved,
             Err(error) => {
+                let parked = target_owners.is_some()
+                    || tail_owners.is_some()
+                    || page_table_reclaims.pte_changed();
+                if let Some(owners) = target_owners.take() {
+                    self.park_retired_mapping_owners(retire_epoch, owners);
+                }
+                if let Some(owners) = tail_owners.take() {
+                    self.park_retired_mapping_owners(retire_epoch, owners);
+                }
+                self.park_page_table_reclaims(retire_epoch, page_table_reclaims);
                 return self.abort_unpublished_split_mapping_mutation_ranges(
                     &rollback_ranges,
                     preimage,
-                    None,
+                    parked.then_some(retire_epoch),
                     splits,
                     error,
                 );
             }
         };
-        if let Some(owners) = target_owners {
+        if let Some(owners) = target_owners.take() {
             self.park_retired_mapping_owners(retire_epoch, owners);
         }
-        if let Some(owners) = tail_owners {
+        if let Some(owners) = tail_owners.take() {
             self.park_retired_mapping_owners(retire_epoch, owners);
         }
+        self.park_page_table_reclaims(retire_epoch, page_table_reclaims);
 
         let after_vmas = self.vma_root.len();
         mutation.set_vma_delta(VmaDelta {
@@ -5485,51 +5727,60 @@ impl AddrSpace {
         Ok(())
     }
 
-    /// Removes every user mapping after the caller has proved that this page
-    /// table cannot be installed on a CPU.  This is the shared apply step for
-    /// unpublished-image abort and retired-MM reclaim; it deliberately does
-    /// not publish an epoch or side-band event by itself.
-    fn clear_quiescent_contents(&mut self) -> StarryResult {
+    /// Releases user mappings after the caller has proved that this page table
+    /// cannot be installed on a CPU. Unpublished images keep their root for
+    /// reuse; retired MMs detach the entire root after lifecycle quiescence.
+    /// This step does not publish an epoch or side-band event by itself.
+    fn clear_quiescent_contents(&mut self, retired: bool) -> StarryResult {
         self.ensure_quiescent_for_content_clear()?;
-        let range = self.layout.range();
-        let operations = self.mapping_operation_fragments(range, false)?;
-        if operations
-            .iter()
-            .any(|(fragment, operation)| !operation.validate_unmap_range(*fragment, &self.pt))
-        {
-            return Err(StarryError::BadState);
-        }
-
-        let deferred_tlb = DeferredTlbRetireGuard::enter();
-        // A retired MM has no users, pins, activations, pending receipts or
-        // page-table walkers.  An unpublished loader image is likewise held by
-        // one `&mut AddrSpace`.  Linux uses the same isolation proof to run
-        // `free_pgtables()` without a PTL after VMAs have been detached.  Do
-        // not acquire the IRQ-saving structure lock here: backend validation,
-        // occupied-leaf vectors, page-table frame release and Arc destruction
-        // are all allowed to allocate or enter the allocator's reclaim path.
-        let clear_result = operations
-            .into_iter()
-            .try_for_each(|(fragment, operation)| operation.unmap_range(fragment, &mut self.pt));
-        drop(deferred_tlb);
-        if let Err(error) = clear_result {
-            if let Err(flush_error) = crate::mm::flush_tlb_range_sync(range.start, range.size()) {
-                warn!(
-                    "quiescent address-space clear could not invalidate {:?}+{:#x}: {flush_error}",
-                    range.start,
-                    range.size()
-                );
+        if retired {
+            // No CPU or walker can reach this retired root, and MappingSlot
+            // owns each data frame independently of its PTE. Unlike Linux's
+            // unmap_vmas/free_pgtables sequence, this teardown can release
+            // the root and all owners without per-VMA or per-leaf unmapping.
+            // SAFETY: RetirePermit has quiesced all users, and the check above
+            // excludes active CPUs, pending TLB receipts and retained owners.
+            unsafe { self.pt.detach(|token| token.reclaim()) };
+        } else {
+            let range = self.layout.range();
+            let operations = self.mapping_operation_fragments(range, false)?;
+            if operations
+                .iter()
+                .any(|(fragment, operation)| !operation.validate_unmap_range(*fragment, &self.pt))
+            {
+                return Err(StarryError::BadState);
             }
-            self.mutation_gate.mark_needs_repair();
-            return Err(error);
+            let leaf_count = self.occupied_pte_leaves_overlapping(&[range])?.len();
+            let mut page_table_reclaims =
+                MappingMutationContext::for_published_mutation(leaf_count)?;
+            // An unpublished loader image is held by one `&mut AddrSpace`.
+            // Keep its root reusable and reclaim detached intermediate tables
+            // only after every backend has finished changing its PTEs.
+            let clear_result = operations
+                .into_iter()
+                .try_for_each(|(fragment, operation)| {
+                    operation.unmap_range(fragment, &mut page_table_reclaims, &mut self.pt)
+                });
+            // SAFETY: the quiescence check above excludes page-table users
+            // and pending TLB receipts for this unpublished image.
+            unsafe { page_table_reclaims.reclaim() };
+            if let Err(error) = clear_result {
+                self.mutation_gate.mark_needs_repair();
+                return Err(error);
+            }
         }
         let slots = core::mem::take(&mut self.mapping_slots);
         for slot in slots.into_values() {
+            // SAFETY: the retired root has no hardware users, or this loader
+            // image was never installed; the check above excludes pending
+            // shootdowns and retained page-table owners.
+            unsafe { slot.confirm_quiescent_huge_split_deposit() };
             slot.detach();
         }
         self.resident_watermark.reset();
         self.vm_stat.on_clear();
         self.vma_root = Arc::new(VmaMap::default());
+        self.executable_file = None;
         // Once every materialized and software owner is empty, a prior repair
         // bit belonging solely to this unpublished/retired image is resolved.
         self.mutation_gate.clear_repair();
@@ -5549,7 +5800,7 @@ impl AddrSpace {
         let range = self.layout.range();
         let memfd_deltas =
             crate::syscall::memfd_prepare_aspace_unmap_deltas(self, range.start, range.size());
-        self.clear_quiescent_contents()?;
+        self.clear_quiescent_contents(false)?;
         self.resident_pages = ResidentPageCounts::default();
         self.heap = HeapState::new(USER_HEAP_BASE);
         self.executable_data = ExecutableDataLayout::default();
@@ -5558,7 +5809,7 @@ impl AddrSpace {
     }
 
     /// Clears a retired, formerly published MM and records that teardown in
-    /// the ordinary mutation protocol before page-table frames are detached.
+    /// the ordinary mutation protocol after quiescent whole-tree detach.
     fn clear_retired_contents(&mut self) -> StarryResult {
         self.ensure_quiescent_for_content_clear()?;
         let base_epoch = self.vm_epoch();
@@ -5589,7 +5840,7 @@ impl AddrSpace {
             ..MappingDelta::default()
         });
         mutation.set_resident_delta(self.resident_pages.checked_negated_delta()?);
-        self.clear_quiescent_contents()?;
+        self.clear_quiescent_contents(true)?;
         let result = self.commit_mutation(mutation);
         if self.vm_epoch() != base_epoch {
             crate::syscall::memfd_apply_shared_writable_deltas(&memfd_deltas);
@@ -5611,25 +5862,6 @@ impl AddrSpace {
             return Err(StarryError::ResourceBusy);
         }
         self.clear_retired_contents()?;
-        let epoch = self.vm_epoch();
-
-        // Detach page-table frames from the materialized tree before allocator
-        // release. Lifecycle quiescence is the zero-target form of Linux's
-        // mmu-gather contract: no CPU can still walk this root, so the typed
-        // allocator capability may be consumed immediately. Published
-        // mutations with remote observers take the ordinary TLB quarantine
-        // path before an MM can reach Retired.
-        let targets = self.tlb_targets.load(core::sync::atomic::Ordering::Acquire);
-        let request = TlbRequest::new(self.id, epoch, targets);
-        debug_assert!(request.is_complete());
-        // SAFETY: lifecycle only calls this after all user/kernel references
-        // and scheduler activations are quiescent.  `PageTable::detach` leaves
-        // the owning table inert and transfers each frame to a token. The
-        // completed zero-target request proves that consuming each token in
-        // the callback cannot race an architectural page-table walk.
-        unsafe {
-            self.pt.detach(|token| token.reclaim());
-        }
         Ok(())
     }
 
@@ -6547,6 +6779,7 @@ impl AddrSpace {
         let mut guard = new_aspace.lock_nested(CLONED_ADDR_SPACE_LOCK_SUBCLASS);
         guard.heap = self.heap;
         guard.executable_data = self.executable_data;
+        guard.executable_file = self.executable_file.clone();
         let mut child_memfd_deltas = Vec::new();
         let mut child_vss_pages = 0u64;
 
@@ -6562,27 +6795,19 @@ impl AddrSpace {
                     self_modify,
                     &mut guard.pt,
                 )?;
-                let start = entry.start();
-                child_memfd_deltas.extend(crate::syscall::memfd_prepare_aspace_replace_deltas(
-                    &guard,
-                    start,
-                    entry.size(),
+                // Parent VMAs do not overlap, and the child is built from an
+                // empty root. No prior child mapping can be replaced here.
+                if let Some(delta) = crate::syscall::memfd_prepare_new_mapping_delta(
+                    guard.address_space_id(),
                     entry.rights(),
                     &new_backend,
-                ));
+                ) {
+                    child_memfd_deltas.push(delta);
+                }
 
                 let child_entry = guard
                     .vma_root
-                    .prepare_mapping_entry(
-                        entry.range(),
-                        entry.rights(),
-                        entry.reported_rights(),
-                        entry.max_rights(),
-                        entry.snapshot().huge_page_advice,
-                        VmaLockMode::Unlocked,
-                        entry.snapshot().advice_policy,
-                        new_backend.clone(),
-                    )
+                    .prepare_fork_mapping_entry(&entry, new_backend.clone())
                     .ok_or(StarryError::BadState)?;
                 let child_root = guard
                     .vma_root
@@ -6911,5 +7136,47 @@ mod tests {
     #[axtest::axtest]
     fn refault_waits_for_pending_discard_full_flush() {
         refault_waits_for_discard_shootdown(true);
+    }
+
+    #[cfg(axtest)]
+    #[axtest::axtest]
+    fn page_table_reclaim_waits_for_last_tlb_acknowledgement() {
+        use ax_memory_addr::PhysAddr;
+
+        use super::{AddrSpace, MappingFlags, RetiredMappingOwners};
+
+        let start = VirtAddr::from(0x7300_0000);
+        let mut aspace = AddrSpace::new_empty(start, PAGE_SIZE_4K).unwrap();
+        aspace
+            .pt
+            .map_page(
+                start,
+                PhysAddr::from(0x1000_0000),
+                PAGE_SIZE_4K,
+                MappingFlags::READ | MappingFlags::USER,
+            )
+            .unwrap();
+        let (_, _, _, deferred) = aspace.pt.unmap_page_deferred(start).unwrap();
+        assert!(!deferred.is_empty());
+
+        let epoch = VmEpoch::new(1);
+        let mut owners = RetiredMappingOwners::default();
+        owners.page_tables.try_reserve(1).unwrap();
+        owners.page_tables.push(deferred);
+        aspace.park_retired_mapping_owners(epoch, owners);
+
+        let mut mutation = aspace.mutation_gate.begin(aspace.id, 0b11);
+        mutation.add_tlb_range(TlbRange::new(start, PAGE_SIZE_4K).unwrap());
+        assert!(matches!(
+            aspace.mutation_gate.commit(mutation),
+            Err(MutationError::TlbPending)
+        ));
+        assert_eq!(aspace.pending_retired_page_table_reclaims(), 1);
+
+        assert!(aspace.acknowledge_tlb(aspace.id, epoch, 0).unwrap().is_empty());
+        assert_eq!(aspace.pending_retired_page_table_reclaims(), 1);
+
+        assert!(aspace.acknowledge_tlb(aspace.id, epoch, 1).unwrap().is_empty());
+        assert_eq!(aspace.pending_retired_page_table_reclaims(), 0);
     }
 }

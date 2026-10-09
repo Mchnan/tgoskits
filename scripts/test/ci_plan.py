@@ -21,6 +21,7 @@ from ci_runner_profiles import (
     load_runner_profiles,
 )
 from ci_suite import (
+    ARCEOS_GENERIC_QEMU_GROUPS,
     SUITE_FIELDS,
     SUPPORTED_SUITE_KINDS,
     SuiteRouteError,
@@ -41,8 +42,33 @@ MAIN_MANIFESTS = (
 )
 STARRY_APPS_MANIFEST = CHECKS_ROOT / "starry-apps.toml"
 RUNNER_PROFILES_MANIFEST = CHECKS_ROOT.parent / "runner-profiles.toml"
+# Performance measurements live in one scope-clear `benchmarks.toml` manifest.
+# Loading a manifest with this file name is the single authority that makes
+# every check inside it a nightly benchmark that produces a performance report.
+# AxVisor and Starry benchmarks share the file, but only `build_benchmarks_plan`
+# owns their execution; each check's `group` selects the result matrix and
+# report artifact prefix.
+BENCHMARK_MANIFEST = CHECKS_ROOT / "benchmarks.toml"
+AXVISOR_BENCHMARK_GROUP = "AxVisor"
+STARRY_APPS_BENCHMARK_GROUP = "Starry Apps"
+BENCHMARK_GROUPS = {AXVISOR_BENCHMARK_GROUP, STARRY_APPS_BENCHMARK_GROUP}
+# AxVisor scenarios that only run on the nightly schedule but produce no
+# performance report. Keeping them in their own manifest stops the default main
+# CI matrix from treating every `axvisor.toml` check as nightly coverage.
+AXVISOR_NIGHTLY_MANIFEST = CHECKS_ROOT / "axvisor-nightly.toml"
+BENCHMARK_MANIFEST_NAME = "benchmarks.toml"
+# The main plan must resolve `benchmarks/{axvisor,starry}` and AxVisor nightly
+# changes to the checks that own those suite paths. Their `benchmark`/`nightly`
+# phases and automatic nightly-only semantics keep them out of the default
+# static/test matrices, so including the manifests only adds suite routing.
+MAIN_PLAN_MANIFESTS = (
+    *MAIN_MANIFESTS,
+    STARRY_APPS_MANIFEST,
+    AXVISOR_NIGHTLY_MANIFEST,
+    BENCHMARK_MANIFEST,
+)
 
-SUPPORTED_PHASES = {"static", "test", "starry_apps"}
+SUPPORTED_PHASES = {"static", "test", "starry_apps", "benchmark", "nightly"}
 SUPPORTED_PREFLIGHTS = {"none", "qemu-user", "full"}
 TEST_GROUP_OUTPUT_PREFIXES = {
     "Workspace": "workspace",
@@ -65,14 +91,17 @@ TOP_LEVEL_FIELDS = {
     "check",
 }
 CHECK_FIELDS = {
+    "performance_artifact_prefix",
     "id",
     "name",
+    "group",
     "runner",
     "command",
     "required_base_branch",
     "fetch_depth",
     "timeout_minutes",
     "cache_key",
+    "resource_group",
     "wifi_secrets",
     "apk_region",
     "upload_xtask_bin_artifact",
@@ -103,9 +132,11 @@ class PlanContext:
     repository: str
     repository_owner: str
     event_name: str
+    head_repository: str = ""
     base_ref: str = ""
     enabled_boolean_inputs: frozenset[str] = frozenset()
     impact: CiImpact | None = None
+    include_nightly: bool = False
 
 
 def load_catalog(manifests: Iterable[Path]) -> list[dict[str, Any]]:
@@ -118,6 +149,11 @@ def load_catalog(manifests: Iterable[Path]) -> list[dict[str, Any]]:
         phase = document["phase"]
         group = document["group"]
         default_runner = document.get("default_runner", GLOBAL_DEFAULT_RUNNER)
+        # The manifest file name and phase are the only authority for the
+        # automatic nightly / performance-report semantics; individual checks
+        # no longer repeat `nightly_only` or `performance_report` booleans.
+        is_benchmark_manifest = manifest.name == BENCHMARK_MANIFEST_NAME
+        is_nightly_manifest = phase == "nightly"
         if default_runner not in runner_profiles:
             raise PlanError(
                 f"{manifest} references unknown default_runner '{default_runner}'"
@@ -135,8 +171,17 @@ def load_catalog(manifests: Iterable[Path]) -> list[dict[str, Any]]:
                 raise PlanError(f"duplicate check id '{check_id}' at {location}")
             seen_ids.add(check_id)
             check["phase"] = phase
-            check["group"] = group
+            # A check may override the manifest-level group. This lets one
+            # `benchmarks.toml` hold the AxVisor and Starry Apps performance
+            # checks while each workflow plan selects only its own group.
+            check["group"] = check.get("group", group)
             check["source"] = str(manifest.relative_to(WORKSPACE_ROOT))
+            if is_benchmark_manifest:
+                check["benchmark"] = True
+                check["nightly_only"] = True
+                check["performance_report"] = True
+            elif is_nightly_manifest:
+                check["nightly_only"] = True
             checks.append(check)
 
     _validate_artifact_contract(checks)
@@ -149,7 +194,7 @@ def load_catalog(manifests: Iterable[Path]) -> list[dict[str, Any]]:
 
 
 def build_main_plan(context: PlanContext) -> dict[str, Any]:
-    checks = load_catalog(MAIN_MANIFESTS)
+    checks = load_catalog(MAIN_PLAN_MANIFESTS)
     context = _resolve_input_fallbacks(checks, context)
     return _build_main_plan(checks, context)
 
@@ -169,7 +214,10 @@ def _build_main_plan(
         if suite_only
         else _plan_phase(checks, "test", context) + _plan_suite_rows(checks, context)
     )
-    if not test_rows:
+    if suite_only and not test_rows:
+        # A PR changing only nightly scenarios still receives static checks.
+        static_rows = _plan_phase(checks, "static", context)
+    if not test_rows and not suite_only:
         raise PlanError("main CI must resolve to a non-empty test matrix")
     if not suite_only and not static_rows:
         raise PlanError("main CI must resolve to a non-empty static matrix")
@@ -204,11 +252,85 @@ def _build_test_group_outputs(
 def build_starry_apps_plan(
     context: PlanContext,
 ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    # Starry Apps owns application smoke, NixOS and optional Clippy coverage.
+    # Performance checks are owned by the separate Benchmarks workflow.
     checks = load_catalog((STARRY_APPS_MANIFEST,))
-    rows = _plan_phase(checks, "starry_apps", context)
-    if not rows:
+    app_rows = _plan_phase(checks, "starry_apps", context)
+    if not app_rows:
         raise PlanError("Starry Apps must resolve to a non-empty matrix")
-    return {"starry_apps_matrix": {"include": rows}}
+    return {
+        "starry_apps_matrix": {"include": app_rows},
+    }
+
+
+def build_axvisor_nightly_plan(context: PlanContext) -> dict[str, Any]:
+    if context.event_name not in {"schedule", "workflow_dispatch"}:
+        raise PlanError("AxVisor nightly requires schedule or workflow_dispatch")
+    context = replace(context, include_nightly=True)
+    rows = [
+        _normalize_check(check, context)
+        for check in load_catalog((AXVISOR_NIGHTLY_MANIFEST,))
+        if _is_enabled(check, context)
+    ]
+    if not rows:
+        raise PlanError("AxVisor nightly must resolve to a non-empty matrix")
+    return {"axvisor_matrix": {"include": rows}}
+
+
+def build_benchmarks_plan(context: PlanContext) -> dict[str, Any]:
+    if context.event_name not in {"schedule", "workflow_dispatch"}:
+        raise PlanError("Benchmarks require schedule or workflow_dispatch")
+    context = replace(context, include_nightly=True)
+    checks = load_catalog((BENCHMARK_MANIFEST,))
+    rows = [
+        _normalize_check(check, context)
+        for check in checks
+        if _is_enabled(check, context)
+    ]
+    unknown_groups = sorted({check["group"] for check in checks} - BENCHMARK_GROUPS)
+    if unknown_groups:
+        raise PlanError(
+            "Benchmarks contain unsupported groups: " + ", ".join(unknown_groups)
+        )
+
+    axvisor_rows = [
+        row for row in rows if row["group"] == AXVISOR_BENCHMARK_GROUP
+    ]
+    starry_rows = [
+        row for row in rows if row["group"] == STARRY_APPS_BENCHMARK_GROUP
+    ]
+    starry_qemu_rows = [
+        row for row in starry_rows if "board" not in row["runs_on"]
+    ]
+    starry_board_rows = [
+        row for row in starry_rows if "board" in row["runs_on"]
+    ]
+    if not axvisor_rows or not starry_qemu_rows or not starry_board_rows:
+        raise PlanError(
+            "Benchmarks must resolve to non-empty AxVisor, Starry QEMU "
+            "and Starry board matrices"
+        )
+
+    # Starry benchmark rows consume the standalone xtask artifact instead of
+    # rebuilding it in every matrix entry.
+    main_checks = load_catalog(MAIN_MANIFESTS)
+    producer = next(
+        check
+        for check in main_checks
+        if check.get("upload_xtask_bin_artifact")
+    )
+    prepare = _normalize_check(producer, context)
+    prepare.update(
+        id="benchmarks-build-xtask",
+        name="Build tg-xtask",
+        command="cargo build -p tg-xtask",
+    )
+    return {
+        "prepare_matrix": {"include": [prepare]},
+        "axvisor_performance_matrix": {"include": axvisor_rows},
+        "starry_performance_matrix": {"include": starry_qemu_rows},
+        "starry_board_performance_matrix": {"include": starry_board_rows},
+    }
 
 
 def write_github_outputs(outputs: dict[str, Any], output_file: Path) -> None:
@@ -275,6 +397,9 @@ def _validate_check(
     check["name"] = check["name"].strip()
     if CHECK_ID_PATTERN.fullmatch(check["id"]) is None:
         raise PlanError(f"{location} field 'id' must use lowercase kebab-case")
+    group = check.get("group")
+    if group is not None and (not isinstance(group, str) or not group.strip()):
+        raise PlanError(f"{location} field 'group' must be a non-empty string")
     runs_on = check["runs_on"]
     required_base = check.get("required_base_branch")
     if required_base is not None and (
@@ -324,6 +449,14 @@ def _validate_check(
         raise PlanError(f"{location} cache_key must be a string")
     if "self-hosted" in runs_on and cache_key:
         raise PlanError(f"{location} self-hosted checks must use an empty cache_key")
+
+    resource_group = check.get("resource_group", "")
+    if not isinstance(resource_group, str) or (
+        resource_group and CHECK_ID_PATTERN.fullmatch(resource_group) is None
+    ):
+        raise PlanError(f"{location} resource_group must use lowercase kebab-case")
+    if resource_group and "board" not in runs_on:
+        raise PlanError(f"{location} resource_group requires a board runner")
 
     artifact_name = check.get("xtask_bin_artifact_name")
     if artifact_name is not None and (
@@ -391,7 +524,11 @@ def _validate_suite_registrations(suite: Any, location: str) -> None:
         if kind not in SUPPORTED_SUITE_KINDS:
             raise PlanError(f"{suite_location} has an unsupported kind")
         group = registration.get("group")
-        if group is not None and (kind != "arceos-qemu" or group != "cpu"):
+        if group is not None and (
+            kind != "arceos-qemu"
+            or not isinstance(group, str)
+            or group not in ARCEOS_GENERIC_QEMU_GROUPS
+        ):
             raise PlanError(f"{suite_location} has unsupported ArceOS group")
         is_qemu = kind.endswith("-qemu")
         arch = registration.get("arch")
@@ -525,7 +662,11 @@ def _plan_suite_rows(
     rows = []
     for selection in selections:
         template = checks_by_id[selection.template_id]
+        if template.get("nightly_only", False) and not context.include_nightly:
+            continue
         if not _is_enabled(template, context):
+            if not _runner_is_available(template, context):
+                continue
             raise PlanError(
                 f"test suite path `{selection.source_path}` requires unavailable "
                 f"check '{selection.template_id}'"
@@ -554,6 +695,10 @@ def _normalize_suite_selection(
 
 
 def _is_enabled(check: dict[str, Any], context: PlanContext) -> bool:
+    if check.get("nightly_only", False) and not context.include_nightly:
+        return False
+    if not _runner_is_available(check, context):
+        return False
     required_owner = check.get("required_owner")
     if required_owner and context.repository_owner != required_owner:
         return False
@@ -573,6 +718,23 @@ def _is_enabled(check: dict[str, Any], context: PlanContext) -> bool:
             return False
 
     return True
+
+
+def _runner_is_available(check: dict[str, Any], context: PlanContext) -> bool:
+    if (
+        "self-hosted" not in check.get("runs_on", ())
+        or _allows_self_hosted(context)
+    ):
+        return True
+    return "fallback_environment" in check
+
+
+def _allows_self_hosted(context: PlanContext) -> bool:
+    if context.event_name != "pull_request":
+        return True
+    return bool(context.head_repository) and (
+        context.head_repository.casefold() == context.repository.casefold()
+    )
 
 
 def _matches_impact(check: dict[str, Any], context: PlanContext) -> bool:
@@ -609,6 +771,8 @@ def _suite_path_os(path: str) -> str | None:
         Path("test-suit/arceos"): "arceos",
         Path("test-suit/starryos"): "starry",
         Path("test-suit/axvisor"): "axvisor",
+        Path("benchmarks/axvisor"): "axvisor",
+        Path("benchmarks/starry"): "starry",
     }
     for prefix, os_name in prefixes.items():
         if normalized == prefix or prefix in normalized.parents:
@@ -621,7 +785,10 @@ def _normalize_check(check: dict[str, Any], context: PlanContext) -> dict[str, A
     environment = check["environment"]
     fallback = bool(
         check.get("self_hosted_owner")
-        and context.repository_owner != check["self_hosted_owner"]
+        and (
+            context.repository_owner != check["self_hosted_owner"]
+            or not _allows_self_hosted(context)
+        )
     )
     if fallback:
         runs_on = ["ubuntu-latest"]
@@ -658,11 +825,17 @@ def _normalize_check(check: dict[str, Any], context: PlanContext) -> dict[str, A
         "container_preflight": preflight,
         "command": command.strip(),
         "cache_key": check.get("cache_key", ""),
+        "resource_group": "" if fallback else check.get("resource_group", ""),
         "apk_region": check.get("apk_region", "china"),
         "wifi_secrets": check.get("wifi_secrets", False),
         "fetch_depth": fetch_depth,
         "timeout_minutes": check.get("timeout_minutes", 360),
         "require_kvm": check.get("require_kvm", False),
+        "performance_report": check.get("performance_report", False),
+        "performance_artifact_prefix": check.get(
+            "performance_artifact_prefix",
+            f"{check['group'].lower().replace(' ', '-')}-nightly-performance",
+        ),
         "upload_xtask_bin_artifact": check.get("upload_xtask_bin_artifact", False),
         "download_xtask_bin_artifact": download_xtask,
         "xtask_bin_artifact_name": check.get("xtask_bin_artifact_name", "tg-xtask-bin"),
@@ -692,10 +865,15 @@ def _matrix_rows(outputs: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plan TGOSKits CI matrices")
-    parser.add_argument("--mode", choices=("main", "starry-apps"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("main", "starry-apps", "axvisor-nightly", "benchmarks"),
+        required=True,
+    )
     parser.add_argument("--repository", required=True)
     parser.add_argument("--repository-owner", required=True)
     parser.add_argument("--event-name", required=True)
+    parser.add_argument("--head-repository", default="")
     parser.add_argument("--base-ref", default="")
     parser.add_argument("--since-ref", default="")
     parser.add_argument("--boolean-input", action="append", default=[])
@@ -727,16 +905,21 @@ def main() -> int:
         repository=args.repository,
         repository_owner=args.repository_owner,
         event_name=args.event_name,
+        head_repository=args.head_repository,
         base_ref=args.base_ref,
         enabled_boolean_inputs=frozenset(args.boolean_input),
         impact=impact,
     )
     try:
         if args.mode == "main":
-            checks = load_catalog(MAIN_MANIFESTS)
+            checks = load_catalog(MAIN_PLAN_MANIFESTS)
             context = _resolve_input_fallbacks(checks, context)
             impact = context.impact
             outputs = _build_main_plan(checks, context)
+        elif args.mode == "benchmarks":
+            outputs = build_benchmarks_plan(context)
+        elif args.mode == "axvisor-nightly":
+            outputs = build_axvisor_nightly_plan(context)
         else:
             outputs = build_starry_apps_plan(context)
     except (OSError, PlanError, tomllib.TOMLDecodeError) as error:

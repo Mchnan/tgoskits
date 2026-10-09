@@ -1,46 +1,36 @@
-use crate::{DisplayError, DisplayInfo, DriverGeneric, FrameBuffer};
+use rdif_gpu::{Completion, CompletionStatus, GpuDevice};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Event {
-    pub handled: bool,
-    pub changed: bool,
+use crate::{DisplayError, DisplayEvent, DisplayState, DriverGeneric, OutputId, OutputInfo};
+
+/// Display output and scanout control, independent of a GPU renderer.
+pub trait DisplayController: DriverGeneric {
+    fn output_count(&self) -> u32;
+    fn output(&self, id: OutputId) -> Result<OutputInfo, DisplayError>;
+    fn current_state(&self, id: OutputId) -> Result<Option<DisplayState>, DisplayError>;
+
+    /// Validate the complete state without changing the current scanout,
+    /// allocating a hardware resource or submitting a command. This is the
+    /// `TEST_ONLY` path. A state with no framebuffer must remain valid after
+    /// its output disconnects, so a former scanout can always be disabled.
+    fn check(&self, state: &DisplayState) -> Result<(), DisplayError>;
+
+    /// Revalidate `state` under this exclusive access before touching hardware.
+    /// On error the previous state and its backing remain active, except when
+    /// [`DisplayError::DeviceLost`] reports that the device has stopped using
+    /// all scanout backing. On success the driver retains both new and old
+    /// resources until the returned completion confirms that the old scanout
+    /// is no longer used.
+    fn commit(&mut self, state: &DisplayState) -> Result<Completion, DisplayError>;
+
+    /// `DeviceLost` ends every outstanding display completion.
+    fn commit_status(&mut self, completion: Completion) -> Result<CompletionStatus, DisplayError>;
+
+    /// Drain one event after the GPU control owner has serviced IRQ work.
+    fn poll_event(&mut self) -> Option<DisplayEvent>;
 }
 
-impl Event {
-    pub const fn none() -> Self {
-        Self {
-            handled: false,
-            changed: false,
-        }
-    }
-}
+/// One registered device implements both GPU and display capabilities.
+/// A GPU without an output may be registered as `dyn GpuDevice` instead.
+pub trait GpuDisplay: GpuDevice + DisplayController {}
 
-pub trait Interface: DriverGeneric {
-    fn info(&self) -> DisplayInfo;
-
-    fn framebuffer(&mut self) -> Result<FrameBuffer<'_>, DisplayError>;
-
-    fn irq_num(&self) -> Option<usize> {
-        None
-    }
-
-    fn need_flush(&self) -> bool {
-        false
-    }
-
-    fn flush(&mut self) -> Result<(), DisplayError> {
-        Ok(())
-    }
-
-    fn enable_irq(&mut self) {}
-
-    fn disable_irq(&mut self) {}
-
-    fn is_irq_enabled(&self) -> bool {
-        false
-    }
-
-    fn handle_irq(&mut self) -> Event {
-        Event::none()
-    }
-}
+impl<T: GpuDevice + DisplayController + ?Sized> GpuDisplay for T {}

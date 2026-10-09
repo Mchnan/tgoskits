@@ -26,6 +26,7 @@
 //!
 //! - `service`: owns the smoltcp interface and control plane.
 //! - `poll_runtime`: owns generation-based protocol scheduling.
+//! - `observe`: owns the narrow observation ports the events are reported on.
 //! - `queue_runtime`: owns IRQ affinity domains and queue executors.
 //! - `router`: aggregates protocol ports, route lookup, and loopback.
 //! - `socket`, `tcp`, `udp`, `raw`: POSIX-like IP socket surface.
@@ -51,6 +52,7 @@ mod error;
 mod general;
 mod ip_tos;
 mod listen_table;
+mod observe;
 /// Socket option types and the [`Configurable`](options::Configurable) trait.
 pub mod options;
 mod orphan;
@@ -91,7 +93,7 @@ use axpoll_set::PollSet;
 pub use error::{NetError, NetResult};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
-pub use rd_net::{WifiLinkPolicy, WifiOperation, WifiTransaction, Wpa2Pmk};
+pub use rd_net::{NetPollGroupId, WifiLinkPolicy, WifiOperation, WifiTransaction, Wpa2Pmk};
 use smoltcp::{
     socket::dns::{self, GetQueryResultError, StartQueryError},
     wire::{DnsQueryType, EthernetAddress, IpAddress, Ipv4Address, Ipv4Cidr},
@@ -113,11 +115,26 @@ pub use self::{
         DeviceBinding, InterfaceConfig, InterfaceFlags, InterfaceId, InterfaceInfo, InterfaceKind,
         InterfaceMatcher, Ipv4InterfaceConfig, NetworkConfig, RouteInfo, StaticIpConfig,
     },
-    device::{ArpEntry, EthernetFramePort, EthernetFramePortList, NetDeviceError, NetDeviceResult},
+    device::{
+        ArpEntry, EthernetFramePort, EthernetFramePortList, NetDeviceError, NetDeviceResult,
+        TunShared,
+    },
+    observe::{
+        ProtoYieldObserver, ProtoYieldReason, ProtoYieldReport, install_proto_yield_observer,
+        publish_proto_yield_gate,
+    },
     queue_runtime::{
-        NetQueueStats, NetworkDeviceInput, NetworkQueueRuntime, NetworkRuntimeBuilder,
-        NetworkRuntimeError, PinnedNetIrqAction, PinnedNetIrqError, PinnedNetIrqOutcome,
-        PinnedNetIrqRegistrar, PinnedNetIrqRegistration, ResolvedNetIrqSource, TxQueueDiscipline,
+        NetQueueIdentity, NetQueueSnapshot, NetQueueStats, NetworkDeviceInput, NetworkQueueRuntime,
+        NetworkRuntimeBuilder, NetworkRuntimeError, PinnedNetIrqAction, PinnedNetIrqError,
+        PinnedNetIrqOutcome, PinnedNetIrqRegistrar, PinnedNetIrqRegistration,
+        QueueBackpressureObserver, QueueBackpressureReason, QueueBackpressureReport,
+        QueueBackpressureStage, QueuePollObserver, QueuePollOutcome, QueuePollReport,
+        QueueRearmObserver, QueueRearmOutcome, QueueRearmReport, ResolvedNetIrqSource,
+        RxPublishObserver, RxPublishReport, TxQueueDiscipline, TxSubmitObserver, TxSubmitReport,
+        install_queue_backpressure_observer, install_queue_poll_observer,
+        install_queue_rearm_observer, install_rx_publish_observer, install_tx_submit_observer,
+        publish_queue_backpressure_gate, publish_queue_poll_gate, publish_queue_rearm_gate,
+        publish_rx_publish_gate, publish_tx_submit_gate,
     },
     readiness::poll_socket_io,
     router::NetDevStats,
@@ -141,6 +158,9 @@ type DeferredPollEntry = (Arc<PollSet>, IoEvents);
 static DEFERRED_POLL_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
 static DEFERRED_POLL_WAKES: LazyLock<Mutex<Vec<DeferredPollEntry>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+/// `/dev/net/tun` state of every TUN and TAP interface, so `TUNSETIFF` can
+/// reattach a persistent one by name.
+static TUN_DEVICES: LazyLock<Mutex<Vec<Arc<TunShared>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 struct WifiInterfaceControl {
     ifname: alloc::string::String,
@@ -375,7 +395,7 @@ mod wifi_entropy_tests {
 ///
 /// Panics if called more than once, or if the configuration contains invalid values.
 pub fn init_network(
-    queue_runtime: NetworkQueueRuntime,
+    mut queue_runtime: NetworkQueueRuntime,
     mut frame_ports: EthernetFramePortList,
     config: NetworkConfig,
 ) {
@@ -403,6 +423,7 @@ pub fn init_network(
     let mut eth_ips = Vec::new();
     let mut wifi_dhcp_servers = Vec::new();
     let mut wifi_interfaces = Vec::new();
+    let mut published_interfaces = Vec::with_capacity(frame_ports.len());
 
     for (order, dev) in frame_ports.drain(..).enumerate() {
         info!("  use NIC {}: {:?}", order, dev.device_name());
@@ -422,6 +443,7 @@ pub fn init_network(
             panic!("interface name conflict: {}", name);
         }
         let id = InterfaceId::new((order as u32) + 2);
+        published_interfaces.push(id);
         let metric = cfg.map_or(100, |cfg| cfg.metric);
         let wifi_policy = queue_runtime.initial_wifi_policy(order);
         let static_ip = cfg.and_then(|cfg| cfg.static_ip.as_ref());
@@ -538,6 +560,7 @@ pub fn init_network(
     }
     let dhcp_enabled = service.dhcp_enabled();
     let protocol_owner_cpu = queue_runtime.protocol_owner_cpu();
+    queue_runtime.bind_published_interfaces(published_interfaces);
     NET_CONTROL.call_once(|| control);
     SERVICE.call_once(|| Mutex::new(service));
     WIFI_INTERFACES.call_once(|| wifi_interfaces);
@@ -700,7 +723,14 @@ pub fn init_vsock(
 fn poll_protocol_until_idle(budget: &mut ProtocolPollBudget) {
     loop {
         let more = get_service().poll(&mut SOCKET_SET.inner.lock());
-        if budget.consume(ax_hal::time::monotonic_time_nanos()) {
+        if let Some(reason) = budget.consume(ax_hal::time::monotonic_time_nanos()) {
+            // The protocol executor runs on the protocol owner CPU, and the
+            // executor thread is pinned there, so the current CPU is its owner.
+            observe::report_proto_yield(observe::ProtoYieldReport {
+                owner_cpu: ax_hal::percpu::this_cpu_id(),
+                reason,
+                work_pending: more,
+            });
             // Device owners share this CPU with the protocol executor. Deliver
             // readiness and release CPU ownership with all network locks dropped.
             drain_deferred_poll_wakes();
@@ -777,6 +807,22 @@ pub fn net_dev_stats() -> Vec<NetDevStats> {
     get_service().net_dev_stats()
 }
 
+/// Returns one snapshot per surviving poll group.
+///
+/// Each snapshot carries the group's immutable identity, the interface its
+/// device is published as, and the group's counters; the counters are read
+/// field by field, so they are independent samples rather than one instant.
+/// Identify a group by its identity rather than by position in the list.
+///
+/// The list is empty while the network runtime is not published (no network
+/// configuration, or initialization that has not finished), so an empty list
+/// means "nothing to report", not "no queues exist".
+pub fn net_queue_snapshots() -> Vec<NetQueueSnapshot> {
+    QUEUE_RUNTIME
+        .get()
+        .map_or_else(Vec::new, |runtime| runtime.lock().queue_snapshots())
+}
+
 /// Returns a snapshot of all configured network interfaces.
 pub fn interfaces() -> Vec<InterfaceInfo> {
     get_control().interfaces()
@@ -815,6 +861,100 @@ pub fn remove_interface_ipv4(interface_id: InterfaceId, ip: Ipv4Addr, prefix_len
     }
     request_poll();
     Ok(())
+}
+
+/// Creates a TUN or TAP interface driven by a `/dev/net/tun` file.
+pub fn create_tun(name: &str, kind: InterfaceKind) -> NetResult<Arc<TunShared>> {
+    let shared = get_service().create_tun(name, kind)?;
+    TUN_DEVICES.lock().push(shared.clone());
+    Ok(shared)
+}
+
+/// Finds the `/dev/net/tun` state of an existing TUN or TAP interface.
+pub fn tun_shared_by_name(name: &str) -> Option<Arc<TunShared>> {
+    TUN_DEVICES
+        .lock()
+        .iter()
+        .find(|shared| shared.name() == name)
+        .cloned()
+}
+
+/// Unregisters a TUN or TAP interface once its last file is closed without
+/// `IFF_PERSIST`.
+pub fn destroy_tun(name: &str) {
+    let removed = {
+        let mut devices = TUN_DEVICES.lock();
+        devices
+            .iter()
+            .position(|shared| shared.name() == name)
+            .map(|index| devices.swap_remove(index))
+    };
+    if removed.is_none() {
+        return;
+    }
+    if let Some(interface) = interface_by_name(name) {
+        get_service().remove_tun_interface(interface.id);
+    }
+    request_poll();
+}
+
+/// Brings a TUN or TAP interface up or down (`SIOCSIFFLAGS`).
+pub fn set_interface_up(interface_id: InterfaceId, up: bool) -> NetResult {
+    let name = get_control().set_tun_up(interface_id, up)?;
+    if let Some(shared) = tun_shared_by_name(&name) {
+        shared.set_up(up);
+    }
+    request_poll();
+    Ok(())
+}
+
+/// Sets the MTU of a TUN or TAP interface (`SIOCSIFMTU`).
+pub fn set_interface_mtu(interface_id: InterfaceId, mtu: usize) -> NetResult {
+    let name = get_control().set_tun_mtu(interface_id, mtu)?;
+    if let Some(shared) = tun_shared_by_name(&name) {
+        shared.set_mtu(mtu);
+    }
+    Ok(())
+}
+
+/// Adds an IPv4 route through an interface (`SIOCADDRT`).
+pub fn add_route(
+    interface_id: InterfaceId,
+    destination: Ipv4Addr,
+    prefix_len: u8,
+    gateway: Option<Ipv4Addr>,
+) -> NetResult {
+    let destination = route_destination(destination, prefix_len)?;
+    let gateway = gateway.map(|gateway| Ipv4Address::from(gateway.octets()));
+    get_service().add_route(interface_id, destination, gateway)?;
+    request_poll();
+    Ok(())
+}
+
+/// Removes an IPv4 route from an interface (`SIOCDELRT`).
+pub fn del_route(
+    interface_id: InterfaceId,
+    destination: Ipv4Addr,
+    prefix_len: u8,
+    gateway: Option<Ipv4Addr>,
+) -> NetResult {
+    let destination = route_destination(destination, prefix_len)?;
+    let gateway = gateway.map(|gateway| Ipv4Address::from(gateway.octets()));
+    get_service().del_route(interface_id, destination, gateway)?;
+    request_poll();
+    Ok(())
+}
+
+/// `rtentry_to_fib_config` rejects a destination with host bits set.
+fn route_destination(destination: Ipv4Addr, prefix_len: u8) -> NetResult<Ipv4Cidr> {
+    if prefix_len > 32 {
+        return Err(NetError::InvalidInput);
+    }
+    let cidr = Ipv4Cidr::new(Ipv4Address::from(destination.octets()), prefix_len);
+    if cidr.network() != cidr {
+        return Err(NetError::InvalidInput);
+    }
+    Ok(cidr)
 }
 
 /// Returns public snapshots of configured IPv4 default routes.

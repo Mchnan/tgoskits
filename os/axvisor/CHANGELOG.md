@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.8.1...axvisor-v0.8.2) - 2026-09-22
+
+### Fixed
+
+- *(axvisor)* drain accepted console output before detaching guest ([#2488](https://github.com/rcore-os/tgoskits/pull/2488))
+- *(axvisor)* preserve guest console output under backpressure ([#2473](https://github.com/rcore-os/tgoskits/pull/2473))
+
+### Other
+
+- *(axvisor)* verify dual guest ext4 mounts in QEMU ([#2485](https://github.com/rcore-os/tgoskits/pull/2485))
+
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.8.0...axvisor-v0.8.1) - 2026-09-21
+
+### Fixed
+
+- *(axvisor)* validate guest kernels and complete shell editing ([#2462](https://github.com/rcore-os/tgoskits/pull/2462))
+- *(axvm)* unify targeted vCPU unblock and kick handling ([#1934](https://github.com/rcore-os/tgoskits/pull/1934))
+
+### Other
+
+- *(axbuild)* move generated artifacts into Cargo target ([#2460](https://github.com/rcore-os/tgoskits/pull/2460))
+
+## [0.8.0](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.7.5...axvisor-v0.8.0) - 2026-09-18
+
+### Added
+
+- *(axvm)* support LoongArch PCI direct boot ([#2405](https://github.com/rcore-os/tgoskits/pull/2405))
+- *(axvm)* support x86 virtio-blk file backends ([#2390](https://github.com/rcore-os/tgoskits/pull/2390))
+
+### Fixed
+
+- *(axvm)* reduce redundant vCPU scheduling and add board perf CI ([#2362](https://github.com/rcore-os/tgoskits/pull/2362))
+
+### Other
+
+- *(axvisor)* remove test-only features and normalize test layout ([#2450](https://github.com/rcore-os/tgoskits/pull/2450))
+
 ## [0.7.5](https://github.com/rcore-os/tgoskits/compare/axvisor-v0.7.4...axvisor-v0.7.5) - 2026-09-13
 
 ### Other

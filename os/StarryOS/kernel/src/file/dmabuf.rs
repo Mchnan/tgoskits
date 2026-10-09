@@ -8,14 +8,16 @@
 //! fd is closed first; it is freed only when both the fd and every mmap drop.
 
 use alloc::{borrow::Cow, sync::Arc};
-use core::{any::Any, ffi::c_int};
+use core::any::Any;
+#[cfg(any(feature = "jpeg", feature = "rknpu", feature = "rga"))]
+use core::ffi::c_int;
 
 use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr, PhysAddrRange};
 use axpoll::{IoEvents, Pollable};
 use dma_api::{CoherentArray, DmaError};
 use linux_raw_sys::general::O_RDWR;
 
-use super::{FileLike, Kstat};
+use super::{FileLike, Kstat, dma_buf_seek};
 use crate::{StarryError, StarryResult, pseudofs::DeviceMmap};
 
 const DMA_BUF_MASK: u64 = u32::MAX as u64;
@@ -135,6 +137,7 @@ impl ContiguousDmaBuf for DmaBufFile {
 ///
 /// This is the single seam every accelerator node uses to turn an fd into a
 /// physical address, so JPU / RGA / NPU all resolve shared buffers identically.
+#[cfg(any(feature = "jpeg", feature = "rknpu", feature = "rga"))]
 pub fn resolve_contiguous_dmabuf(fd: c_int) -> Option<Arc<DmaBufFile>> {
     let file = super::get_file_like(fd).ok()?;
     file.downcast_arc::<DmaBufFile>().ok()
@@ -154,6 +157,14 @@ impl Pollable for DmaBufFile {
 }
 
 impl FileLike for DmaBufFile {
+    fn seek(&self, pos: ax_io::SeekFrom) -> StarryResult<u64> {
+        dma_buf_seek(self.alloc.size as u64, pos)
+    }
+
+    fn validate_write_access(&self) -> StarryResult {
+        Err(StarryError::InvalidInput)
+    }
+
     fn stat(&self) -> StarryResult<Kstat> {
         Ok(Kstat {
             size: self.alloc.size as u64,
@@ -265,6 +276,12 @@ mod tests {
         assert_eq!(file.alloc.size, PAGE_SIZE_4K);
         assert_eq!(file.phys_base(), 0x2000);
         assert_eq!(ALLOC_MASK.load(Ordering::SeqCst), DMA_BUF_MASK);
+        assert_eq!(file.seek(ax_io::SeekFrom::Start(0)).unwrap(), 0);
+        assert_eq!(
+            file.seek(ax_io::SeekFrom::End(0)).unwrap(),
+            PAGE_SIZE_4K as u64
+        );
+        assert!(file.seek(ax_io::SeekFrom::Current(0)).is_err());
 
         let mmap_owner = file.alloc.clone();
         drop(file);

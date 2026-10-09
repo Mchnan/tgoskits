@@ -146,7 +146,7 @@ ArceOS Rust app、StarryOS 和 Axvisor 共用 `into_prepared_base_cargo_config_w
 2. 将 `ax-std/foo` 规范成逻辑能力 `foo`，保留 `ax-hal/*`、`ax-driver/*`、`ax-runtime/*` 边界。
 3. 根据应用 package 和 `ax-std` 的 Cargo metadata，仅把实际存在的 feature 分发到应用或 `ax-std`。
 4. 将裸机 target 映射到 musl PIE JSON target，并启用 `build-std = ["std", "panic_abort"]`。
-5. 生成 `tmp/axbuild/std-libs/` 下的占位库和 linker wrapper，避免宿主静态库污染内核链接。
+5. 生成 `<target_directory>/axbuild/std-libs/` 下的占位库和 linker wrapper，避免宿主静态库污染内核链接。
 6. 设置对应的 musl `CC_*`、`AR_*`、`CFLAGS_*` 和 bindgen 参数；release profile 使用 `panic = "abort"` 且关闭 LTO。
 
 Build Config 中 `[env]` 的以下键会补充 Rust 工具链选项：
@@ -178,7 +178,7 @@ to_bin = true
 
 ## 5. 虚拟化后端
 
-x86_64 的虚拟化后端属于 Build Config 的显式能力：Intel 配置声明 `vmx`，AMD 配置声明 `svm`。`patch_axvisor_cargo_config()` 将已解析的 feature 与 VM 配置写入 Cargo 环境；QEMU CPU flags 由测试或运行 TOML 声明，例如 VMX 用例使用 `+vmx-ept`，SVM 用例使用 `+svm,+npt,+nrip-save`。
+x86_64 的虚拟化后端属于 Build Config 的显式能力：Intel 配置声明 `vmx`，AMD 配置声明 `svm`。`patch_axvisor_cargo_config()` 将已解析的 feature、package/bin 和目标架构写入 Cargo 环境；VM 配置仅用于宿主 initramfs 打包。QEMU CPU flags 由测试或运行 TOML 声明，例如 VMX 用例使用 `+vmx-ept`，SVM 用例使用 `+svm,+npt,+nrip-save`。
 
 仓库中的参考配置包括：
 
@@ -206,8 +206,8 @@ guest 内核驱动不属于该迁移。
 | `AXBUILD_TEST_TIMEOUT_SCALE` | 按整数倍放大测试 QEMU timeout |
 | `STARRY_APK_REGION` | Starry managed rootfs 的 APK 区域，支持 `china`/`cn`、`us`/`usa` |
 | `TGOS_IMAGE_DOWNLOAD_DIR` | 覆盖镜像归档下载目录；Linux 默认 `/tmp/tgosimages` |
-| `TGOS_IMAGE_EXTRACT_DIR` | 覆盖可修改镜像的解压目录；默认 `<workspace>/tmp/axbuild/rootfs` |
+| `TGOS_IMAGE_EXTRACT_DIR` | 覆盖可修改镜像的解压目录；默认 `<workspace>/target/axbuild/rootfs` |
 | `TGOS_OVMF_DIR` | 覆盖 Ostool 格式的 OVMF 缓存根目录；不绕过版本选择和 SHA-256 校验 |
 | `TGOSKITS_KEEP_QEMU_LOG` | 保留 QEMU 日志，便于事后符号化 |
 
-`AX_LOG`、`SMP`、`AX_TARGET`、`AX_ARCH` 和 `AXVISOR_VM_CONFIGS` 主要由 axbuild 根据上述配置生成，不建议用外部环境绕过请求解析。
+`AX_LOG`、`SMP`、`AX_TARGET` 和 `AX_ARCH` 主要由 axbuild 根据上述配置生成，不建议用外部环境绕过请求解析。

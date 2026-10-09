@@ -1,18 +1,29 @@
+//! VirtIO GPU discovery, DMA preparation and IRQ transport gate.
+
 extern crate alloc;
 
-use alloc::format;
+use alloc::{boxed::Box, format, string::ToString, sync::Arc};
+use core::{
+    cell::UnsafeCell,
+    hint::spin_loop,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+};
 
-use rdif_display::{DisplayError, DisplayInfo, Event, FrameBuffer, PixelFormat};
-use rdrive::{DriverGeneric, PlatformDevice, probe::OnProbeError};
+use ax_sync::PreemptIrqSaveGuard;
+use dma_api::{DmaCoherency, DmaConstraints, DmaDeviceInfo, DmaDomainId};
+use rdif_display::DisplayController;
+use rdif_gpu::{BusIdentity, GpuIrqEndpoint, GpuIrqEvent, PciIdentity};
+use rdrive::{PlatformDevice, probe::OnProbeError};
 #[cfg(feature = "pci")]
 use virtio_drivers::transport::DeviceType;
 use virtio_drivers::{
-    Error as VirtIoError,
-    device::gpu::VirtIOGpu,
-    transport::{InterruptStatus, Transport},
+    PhysAddr, Result as VirtIoResult,
+    transport::{DeviceStatus, InterruptStatus, Transport},
 };
+use virtio_gpu::{VirtIoGpu, VirtIoGpuDevice};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::{BindingInfo, display::PlatformDeviceDisplay, virtio::VirtIoHalImpl};
+use crate::{BindingInfo, display::PlatformDeviceGpu, virtio::VirtIoHalImpl};
 #[cfg(feature = "pci")]
 use crate::{PciIrqRequirement, binding_info_from_pci};
 
@@ -21,176 +32,304 @@ crate::model_register!(
     name: "VirtIO GPU",
     level: ProbeLevel::PostKernel,
     priority: ProbePriority::DEFAULT,
-    probe_kinds: &[ProbeKind::Pci {
-        on_probe: probe_pci,
-    }],
+    probe_kinds: &[ProbeKind::Pci { on_probe: probe_pci }],
 );
 
 #[cfg(feature = "pci")]
 fn probe_pci(mut probe: rdrive::probe::pci::ProbePci<'_>) -> Result<(), OnProbeError> {
+    let endpoint = probe.endpoint();
+    let class = endpoint.revision_and_class();
+    let bus = BusIdentity::Pci(PciIdentity {
+        vendor: endpoint.vendor_id(),
+        device: endpoint.device_id(),
+        subsystem_vendor: endpoint.subsystem_vendor_id(),
+        subsystem_device: endpoint.subsystem_id(),
+        revision: class.revision_id,
+        class: (u32::from(class.base_class) << 16)
+            | (u32::from(class.sub_class) << 8)
+            | u32::from(class.interface),
+    });
     let transport =
         crate::pci::take_virtio_transport_masked(probe.endpoint_mut(), DeviceType::GPU)?;
     let info = binding_info_from_pci(probe.info(), PciIrqRequirement::Optional)?;
-    register_transport_with_info(probe.into_platform_device(), transport, info)
+    let coherency = if probe.info().dma_coherent {
+        DmaCoherency::Coherent
+    } else {
+        DmaCoherency::NonCoherent
+    };
+    register_transport_prepared(
+        probe.into_platform_device(),
+        transport,
+        info,
+        coherency,
+        bus,
+    )
 }
 
-pub fn register_transport<T: Transport + 'static>(
-    plat_dev: PlatformDevice,
+pub fn register_transport<T: Transport + Send + 'static>(
+    platform: PlatformDevice,
     transport: T,
 ) -> Result<(), OnProbeError> {
-    register_transport_with_info(plat_dev, transport, BindingInfo::empty())
+    register_transport_prepared(
+        platform,
+        transport,
+        BindingInfo::empty(),
+        crate::binding_resolver::platform_default_dma_coherency(),
+        BusIdentity::Platform {
+            name: "virtio-gpu".to_string(),
+            compatible: Some("virtio,mmio".to_string()),
+        },
+    )
 }
 
-pub fn register_transport_with_info<T: Transport + 'static>(
-    plat_dev: PlatformDevice,
+pub fn register_transport_with_info<T: Transport + Send + 'static>(
+    platform: PlatformDevice,
     transport: T,
     info: BindingInfo,
+    coherency: DmaCoherency,
 ) -> Result<(), OnProbeError> {
-    let irq_num = info.irq_num();
-    let dev = VirtIoDisplay::new(transport, irq_num)
-        .map_err(|err| OnProbeError::other(format!("failed to initialize virtio-gpu: {err:?}")))?;
-    let irq = plat_dev.register_display_with_info(dev, info);
-    log::info!("registered virtio GPU device irq={irq:?}");
+    register_transport_prepared(
+        platform,
+        transport,
+        info,
+        coherency,
+        BusIdentity::Platform {
+            name: "virtio-gpu".to_string(),
+            compatible: Some("virtio,mmio".to_string()),
+        },
+    )
+}
+
+fn register_transport_prepared<T: Transport + Send + 'static>(
+    platform: PlatformDevice,
+    transport: T,
+    info: BindingInfo,
+    coherency: DmaCoherency,
+    bus: BusIdentity,
+) -> Result<(), OnProbeError> {
+    let dma = axklib::dma::device(DmaDeviceInfo::new(
+        DmaDomainId::Direct,
+        coherency,
+        DmaConstraints::new(u64::MAX),
+    ));
+    let (transport, irq_endpoint) = SharedGpuTransport::new(transport);
+    // The monotonic clock bounds the driver's blocking waits (`wait_fence`,
+    // teardown drains), so a stalled host unwedges the holder of the GPU lock
+    // with a typed timeout instead of spinning forever.
+    let raw = VirtIoGpu::<VirtIoHalImpl, _>::new(transport, axklib::time::monotonic_nanos)
+        .map_err(|error| OnProbeError::other(format!("virtio-gpu init: {error:?}")))?;
+    let mut identity = VirtIoGpuDevice::<VirtIoHalImpl, SharedGpuTransport<T>>::virtual_identity();
+    identity.bus = bus;
+    identity.modalias = Some("platform:virtio-gpu".to_string());
+    let device = VirtIoGpuDevice::new(raw, dma.info().domain(), identity, Some(irq_endpoint))
+        .map_err(|error| OnProbeError::other(format!("virtio-gpu outputs: {error:?}")))?;
+    let count = device.output_count();
+    let irq = platform.register_gpu_display_with_info(device, dma, info);
+    log::info!("registered virtio GPU outputs={count} irq={irq:?}");
     Ok(())
 }
 
-struct VirtIoDisplay<T: Transport + 'static> {
-    raw: VirtIOGpu<VirtIoHalImpl, T>,
-    info: DisplayInfo,
-    fb_base: *mut u8,
-    irq_num: Option<usize>,
-    irq_enabled: bool,
+struct SharedGpuTransport<T: Transport + Send + 'static> {
+    inner: Arc<GpuTransportCell<T>>,
 }
 
-unsafe impl<T: Transport + 'static> Send for VirtIoDisplay<T> {}
-
-impl<T: Transport + 'static> VirtIoDisplay<T> {
-    fn new(transport: T, irq_num: Option<usize>) -> Result<Self, VirtIoError> {
-        let mut raw = VirtIOGpu::new(transport)?;
-        let framebuffer = raw.setup_framebuffer()?;
-        let fb_base = framebuffer.as_mut_ptr();
-        let fb_size = framebuffer.len();
-        let (width, height) = raw.resolution()?;
-        let info = DisplayInfo {
-            width,
-            height,
-            stride: width as usize * 4,
-            format: PixelFormat::Xrgb8888,
-            fb_size,
-        };
-        let _ = raw.ack_interrupt();
-        Ok(Self {
-            raw,
-            info,
-            fb_base,
-            irq_num,
-            irq_enabled: false,
-        })
+impl<T: Transport + Send + 'static> SharedGpuTransport<T> {
+    fn new(transport: T) -> (Self, Box<dyn GpuIrqEndpoint>) {
+        let inner = Arc::new(GpuTransportCell::new(transport));
+        (
+            Self {
+                inner: Arc::clone(&inner),
+            },
+            Box::new(GpuIrq { inner }),
+        )
     }
 }
 
-impl<T: Transport + 'static> DriverGeneric for VirtIoDisplay<T> {
-    fn name(&self) -> &str {
-        "virtio-gpu"
+impl<T: Transport + Send + 'static> Drop for SharedGpuTransport<T> {
+    fn drop(&mut self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
     }
 }
 
-impl<T: Transport + 'static> rdif_display::Interface for VirtIoDisplay<T> {
-    fn info(&self) -> DisplayInfo {
-        self.info
+struct GpuTransportCell<T: Transport + Send + 'static> {
+    transport: UnsafeCell<T>,
+    access_active: AtomicBool,
+    ack_deferred: AtomicBool,
+    pending_status: AtomicU32,
+    shutting_down: AtomicBool,
+}
+
+// SAFETY: every mutable transport access is guarded by access_active. Task
+// access disables local IRQs; the hard IRQ only try-acquires and never waits.
+unsafe impl<T: Transport + Send + 'static> Send for GpuTransportCell<T> {}
+// SAFETY: shared references can reach transport only under the same gate.
+unsafe impl<T: Transport + Send + 'static> Sync for GpuTransportCell<T> {}
+
+impl<T: Transport + Send + 'static> GpuTransportCell<T> {
+    fn new(transport: T) -> Self {
+        Self {
+            transport: UnsafeCell::new(transport),
+            access_active: AtomicBool::new(false),
+            ack_deferred: AtomicBool::new(false),
+            pending_status: AtomicU32::new(0),
+            shutting_down: AtomicBool::new(false),
+        }
     }
 
-    fn framebuffer(&mut self) -> Result<FrameBuffer<'_>, DisplayError> {
-        Ok(unsafe { FrameBuffer::from_raw_parts_mut(self.fb_base, self.info.fb_size) })
+    fn with_task<R>(&self, operation: impl FnOnce(&mut T) -> R) -> R {
+        let _irq_guard = PreemptIrqSaveGuard::new();
+        while self
+            .access_active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+        // SAFETY: the gate excludes all task and IRQ transport borrows.
+        let transport = unsafe { &mut *self.transport.get() };
+        self.ack_deferred(transport);
+        let result = operation(transport);
+        self.ack_deferred(transport);
+        self.access_active.store(false, Ordering::Release);
+        result
     }
 
-    fn irq_num(&self) -> Option<usize> {
-        self.irq_num
+    fn ack_deferred(&self, transport: &mut T) {
+        if self.ack_deferred.swap(false, Ordering::AcqRel) {
+            let status = transport.ack_interrupt();
+            self.pending_status
+                .fetch_or(status.bits(), Ordering::Release);
+        }
     }
 
-    fn need_flush(&self) -> bool {
-        true
-    }
-
-    fn flush(&mut self) -> Result<(), DisplayError> {
-        self.raw.flush().map_err(map_display_err)
-    }
-
-    fn enable_irq(&mut self) {
-        self.irq_enabled = true;
-    }
-
-    fn disable_irq(&mut self) {
-        self.irq_enabled = false;
-    }
-
-    fn is_irq_enabled(&self) -> bool {
-        self.irq_enabled
-    }
-
-    fn handle_irq(&mut self) -> Event {
-        let status = self.raw.ack_interrupt();
-        display_irq_event(self.irq_enabled, status)
+    fn handle_irq(&self) -> GpuIrqEvent {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return GpuIrqEvent {
+                handled: false,
+                work_pending: false,
+            };
+        }
+        if self
+            .access_active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.ack_deferred.store(true, Ordering::Release);
+            return GpuIrqEvent {
+                handled: false,
+                work_pending: true,
+            };
+        }
+        // SAFETY: this hard IRQ owns the non-blocking gate and only performs
+        // the transport's bounded ISR read/ack. No queue or resource is touched.
+        let status = unsafe { &mut *self.transport.get() }.ack_interrupt();
+        self.pending_status
+            .fetch_or(status.bits(), Ordering::Release);
+        self.access_active.store(false, Ordering::Release);
+        GpuIrqEvent {
+            handled: !status.is_empty(),
+            work_pending: !status.is_empty(),
+        }
     }
 }
 
-fn display_irq_event(irq_enabled: bool, status: InterruptStatus) -> Event {
-    if !irq_enabled {
-        return Event::none();
-    }
-    Event {
-        handled: !status.is_empty(),
-        changed: status.contains(InterruptStatus::DEVICE_CONFIGURATION_INTERRUPT),
+struct GpuIrq<T: Transport + Send + 'static> {
+    inner: Arc<GpuTransportCell<T>>,
+}
+
+impl<T: Transport + Send + 'static> GpuIrqEndpoint for GpuIrq<T> {
+    fn handle_irq(&self) -> GpuIrqEvent {
+        self.inner.handle_irq()
     }
 }
 
-fn map_display_err(err: VirtIoError) -> DisplayError {
-    match err {
-        VirtIoError::Unsupported => DisplayError::NotSupported,
-        VirtIoError::NotReady => DisplayError::NotAvailable,
-        _ => DisplayError::Other(alloc::boxed::Box::new(err)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn display_irq_is_ignored_until_driver_enables_it() {
-        let status =
-            InterruptStatus::QUEUE_INTERRUPT | InterruptStatus::DEVICE_CONFIGURATION_INTERRUPT;
-
-        assert_eq!(display_irq_event(false, status), Event::none());
+impl<T: Transport + Send + 'static> Transport for SharedGpuTransport<T> {
+    fn device_type(&self) -> virtio_drivers::transport::DeviceType {
+        self.inner.with_task(|transport| transport.device_type())
     }
 
-    #[test]
-    fn display_irq_reports_configuration_changes() {
-        assert_eq!(
-            display_irq_event(true, InterruptStatus::DEVICE_CONFIGURATION_INTERRUPT),
-            Event {
-                handled: true,
-                changed: true,
-            }
-        );
+    fn read_device_features(&mut self) -> u64 {
+        self.inner.with_task(Transport::read_device_features)
     }
 
-    #[test]
-    fn display_irq_reports_non_configuration_interrupt_as_handled_only() {
-        assert_eq!(
-            display_irq_event(true, InterruptStatus::QUEUE_INTERRUPT),
-            Event {
-                handled: true,
-                changed: false,
-            }
-        );
+    fn write_driver_features(&mut self, features: u64) {
+        self.inner
+            .with_task(|transport| transport.write_driver_features(features));
     }
 
-    #[test]
-    fn display_irq_empty_status_is_not_claimed() {
-        assert_eq!(
-            display_irq_event(true, InterruptStatus::empty()),
-            Event::none()
-        );
+    fn max_queue_size(&mut self, queue: u16) -> u32 {
+        self.inner
+            .with_task(|transport| transport.max_queue_size(queue))
+    }
+
+    fn notify(&mut self, queue: u16) {
+        self.inner.with_task(|transport| transport.notify(queue));
+    }
+
+    fn get_status(&self) -> DeviceStatus {
+        self.inner.with_task(|transport| transport.get_status())
+    }
+
+    fn set_status(&mut self, status: DeviceStatus) {
+        self.inner
+            .with_task(|transport| transport.set_status(status));
+    }
+
+    fn set_guest_page_size(&mut self, size: u32) {
+        self.inner
+            .with_task(|transport| transport.set_guest_page_size(size));
+    }
+
+    fn requires_legacy_layout(&self) -> bool {
+        self.inner
+            .with_task(|transport| transport.requires_legacy_layout())
+    }
+
+    fn queue_set(
+        &mut self,
+        queue: u16,
+        size: u32,
+        descriptors: PhysAddr,
+        driver_area: PhysAddr,
+        device_area: PhysAddr,
+    ) {
+        self.inner.with_task(|transport| {
+            transport.queue_set(queue, size, descriptors, driver_area, device_area)
+        });
+    }
+
+    fn queue_unset(&mut self, queue: u16) {
+        self.inner
+            .with_task(|transport| transport.queue_unset(queue));
+    }
+
+    fn queue_used(&mut self, queue: u16) -> bool {
+        self.inner
+            .with_task(|transport| transport.queue_used(queue))
+    }
+
+    fn ack_interrupt(&mut self) -> InterruptStatus {
+        let direct = self.inner.with_task(Transport::ack_interrupt);
+        let pending = self.inner.pending_status.swap(0, Ordering::AcqRel);
+        direct | InterruptStatus::from_bits_retain(pending)
+    }
+
+    fn read_config_generation(&self) -> u32 {
+        self.inner
+            .with_task(|transport| transport.read_config_generation())
+    }
+
+    fn read_config_space<U: FromBytes + IntoBytes>(&self, offset: usize) -> VirtIoResult<U> {
+        self.inner
+            .with_task(|transport| transport.read_config_space(offset))
+    }
+
+    fn write_config_space<U: IntoBytes + Immutable>(
+        &mut self,
+        offset: usize,
+        value: U,
+    ) -> VirtIoResult<()> {
+        self.inner
+            .with_task(|transport| transport.write_config_space(offset, value))
     }
 }

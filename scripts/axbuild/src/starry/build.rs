@@ -16,7 +16,9 @@ pub type StarryBuildInfo = crate::build::BuildInfo;
 pub use crate::build::LogLevel;
 use crate::{
     build::BareKernelLinkMode,
-    context::{ResolvedStarryRequest, STARRY_PACKAGE, starry_arch_for_target_checked},
+    context::{
+        ResolvedStarryRequest, STARRY_PACKAGE, WorkspaceContext, starry_arch_for_target_checked,
+    },
     support::process::ProcessExt,
 };
 
@@ -91,11 +93,12 @@ pub(crate) fn load_build_info(request: &ResolvedStarryRequest) -> anyhow::Result
     Ok(build_info)
 }
 
-pub(crate) fn load_cargo_config(request: &ResolvedStarryRequest) -> anyhow::Result<Cargo> {
-    let metadata =
-        crate::build::cached_workspace_metadata().context("failed to load workspace metadata")?;
+pub(crate) fn load_cargo_config(
+    request: &ResolvedStarryRequest,
+    workspace: &WorkspaceContext,
+) -> anyhow::Result<Cargo> {
+    let metadata = workspace.metadata();
     let mut build_info = load_build_info(request)?;
-    enable_starry_smp_capability(&mut build_info.features);
     build_info.features.sort();
     build_info.features.dedup();
     let mut cargo = build_info.into_prepared_no_std_cargo_config_with_metadata(
@@ -107,12 +110,6 @@ pub(crate) fn load_cargo_config(request: &ResolvedStarryRequest) -> anyhow::Resu
     patch_starry_cargo_config(&mut cargo, request, metadata)?;
     crate::build::append_cargo_rustflags(&mut cargo, &["-D", "warnings"]);
     Ok(cargo)
-}
-
-fn enable_starry_smp_capability(features: &mut Vec<String>) {
-    // Starry always compiles the SMP kernel paths. `SMP` limits the CPUs exposed
-    // at runtime; board configurations may intentionally leave that limit unset.
-    features.push("smp".to_string());
 }
 
 fn patch_starry_cargo_config(
@@ -143,10 +140,8 @@ pub(crate) async fn build_starry_artifact(
         cargo.package, request.target, request.arch
     ));
     let report_session = if request.arch == "aarch64" {
-        let target_dir =
-            crate::build::cargo_target_dir_for(starry.app.workspace_root(), &cargo.args)?;
         Some(crate::build::start_future_incompat_report_session(
-            &target_dir,
+            starry.app.target_dir(),
         )?)
     } else {
         None

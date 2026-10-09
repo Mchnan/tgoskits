@@ -7,12 +7,12 @@
 
 use alloc::sync::Arc;
 
-#[cfg(feature = "rga")]
+#[cfg(any(feature = "rga", feature = "rknpu"))]
 use linux_raw_sys::general::CAP_SYS_RAWIO;
 use linux_raw_sys::general::{
-    CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_IPC_LOCK, CAP_KILL, CAP_LAST_CAP, CAP_NET_RAW,
-    CAP_PERFMON, CAP_SETGID, CAP_SETPCAP, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_MODULE,
-    CAP_SYS_NICE, CAP_SYS_PTRACE, CAP_SYS_RESOURCE, CAP_SYS_TIME,
+    CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_IPC_LOCK, CAP_KILL,
+    CAP_LAST_CAP, CAP_NET_RAW, CAP_PERFMON, CAP_SETGID, CAP_SETPCAP, CAP_SETUID, CAP_SYS_ADMIN,
+    CAP_SYS_BOOT, CAP_SYS_MODULE, CAP_SYS_NICE, CAP_SYS_PTRACE, CAP_SYS_RESOURCE, CAP_SYS_TIME,
 };
 
 const CAP_MASK: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
@@ -228,6 +228,12 @@ impl Cred {
         self.has_cap(CAP_DAC_OVERRIDE)
     }
 
+    /// Check whether this credential may bypass directory read and search
+    /// permission checks (equivalent to `CAP_DAC_READ_SEARCH`).
+    pub fn has_cap_dac_read_search(&self) -> bool {
+        self.has_cap(CAP_DAC_READ_SEARCH)
+    }
+
     /// Check whether this credential may perform broad system administration
     /// operations (equivalent to `CAP_SYS_ADMIN`).
     pub fn has_cap_sys_admin(&self) -> bool {
@@ -258,7 +264,7 @@ impl Cred {
     /// capability Linux requires for `/dev/mem`-class access). Gates handing a
     /// raw physical address to a DMA engine, which can otherwise reach arbitrary
     /// system memory.
-    #[cfg(feature = "rga")]
+    #[cfg(any(feature = "rga", feature = "rknpu"))]
     pub fn has_cap_sys_rawio(&self) -> bool {
         self.has_cap(CAP_SYS_RAWIO)
     }
@@ -353,9 +359,9 @@ fn credential_capability_rules_hold_for_test() -> bool {
 
     // Exercise every has_cap_* helper at least once on a root credential so
     // the bit checks are covered. All of these must be true for root.
-    #[cfg(feature = "rga")]
+    #[cfg(any(feature = "rga", feature = "rknpu"))]
     let root_rawio = root.has_cap_sys_rawio();
-    #[cfg(not(feature = "rga"))]
+    #[cfg(not(any(feature = "rga", feature = "rknpu")))]
     let root_rawio = true;
     let root_capability_helpers = root.has_cap_setuid()
         && root.has_cap_setgid()
@@ -381,9 +387,9 @@ fn credential_capability_rules_hold_for_test() -> bool {
     // remaining capability helpers report false for non-root.
     let mut net_raw_only = Cred::unprivileged(1000, 100);
     net_raw_only.cap_effective = cap_bit(CAP_NET_RAW);
-    #[cfg(feature = "rga")]
+    #[cfg(any(feature = "rga", feature = "rknpu"))]
     let net_raw_lacks_rawio = !net_raw_only.has_cap_sys_rawio();
-    #[cfg(not(feature = "rga"))]
+    #[cfg(not(any(feature = "rga", feature = "rknpu")))]
     let net_raw_lacks_rawio = true;
     let selective_capability_helpers = net_raw_only.has_cap_net_raw()
         && !net_raw_only.has_cap_setuid()

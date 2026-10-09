@@ -6,7 +6,9 @@ pub mod sync;
 pub mod task;
 pub mod time;
 
-pub use dma::{dma_op, has_dma_op, install_dma_op};
+pub use dma::{
+    DmaDeviceResolver, dma_device, dma_op, has_dma_op, install_dma_device_resolver, install_dma_op,
+};
 pub use entropy::{FsEntropyProvider, fill_entropy, has_entropy_provider, set_entropy_provider};
 pub use irq::{
     BlockIrqOutcome, BlockIrqRegistrar, BlockIrqRegistration, has_irq_registrar,
@@ -41,4 +43,6 @@ pub fn install(
     if let Some(entropy_provider) = entropy_provider {
         entropy::set_entropy_provider(entropy_provider);
     }
+    #[cfg(feature = "vfs")]
+    crate::file::start_background_writeback(runtime_ops);
 }

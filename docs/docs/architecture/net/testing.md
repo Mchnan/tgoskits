@@ -158,19 +158,21 @@ Ethernet 发送回归检查 IPv4/IPv6 组播 MAC、有限广播和子网广播�
 回压后重试时不进入 ARP、不改写 IP payload 或请求 checksum 卸载。
 
 板端验证还需要确认每轮退出前的 `flush()` 真正推动已发布发送、replacement refill
-不会饿死 RX，以及接收端数据正确；显式驱动 checksum 请求需单独验证。Orange Pi 5 Plus 的 iperf3 矩阵
-使用 `apps/starry/iperf3/iperf-bench.sh`，记录构建提交、FIT 与脚本 SHA-256、链路速率、
-每轮 receiver 结果。吞吐数据单独记录，不能替代 token 生命周期与 IRQ 状态机断言。
+不会饿死 RX，以及接收端数据正确；显式驱动 checksum 请求需单独验证。Orange Pi 5 Plus 的 HTTP 流式吞吐矩阵
+使用 `apps/starry/network-throughput/network-bench.sh`，记录构建提交、FIT 与脚本 SHA-256、链路速率、
+每轮上传及下载结果；nightly iperf3 矩阵使用 `benchmarks/starry/iperf3/iperf-bench.sh`，
+记录构建提交、FIT 与脚本 SHA-256、链路速率和每轮 receiver 结果。吞吐数据单独记录，
+不能替代 token 生命周期与 IRQ 状态机断言。
 
 ## 3. StarryOS 系统测试
 
 StarryOS 系统测试在 QEMU 中运行真实用户态程序和 syscall 路径，覆盖单元测试无法观察的 ABI 编解码、fd 生命周期和 proc/netlink 输出。测试分组位于 `test-suit/starryos/qemu/system`，应通过 xtask 入口运行以保持镜像、参数和成功正则一致。
 
-`bugfix-bug-proc-comm-tcp-partial-send` 使用 `O_NONBLOCK`，不设置
-`MSG_DONTWAIT`。准备阶段以 4 KiB 分块填满固定容量的 socket，等待持续背压后，
-最多排空 64 KiB 来重新打开发送窗口，再检查 1 MiB 发送返回正的部分字节数。
-这样保留原 nonblocking 回归的断言，同时避免逐字节填充在仿真 CPU 上耗尽测试时限。
-排空过程同时等待接收数据和发送端可写，适配 Linux 大 loopback 分段的内存回收时机。
+2026-09-14 的 LTP 迁移允许部分覆盖，并在
+`scripts/test/ltp-syscalls/migration.csv` 记录未承接的行为。
+原 `bugfix-bug-proc-comm-tcp-partial-send` 已由 `prctl05` 部分替代，仅承接线程名与
+proc comm 内容一致性；其填满 socket、排空部分接收窗口后检查非阻塞 TCP 短发送的
+断言随原程序清理，不再由该项提供。
 
 ### 3.1 运行方式
 
@@ -196,7 +198,7 @@ Socket 数据面用例从 StarryOS 用户态调用真实 syscall，覆盖连接�
 | 测试 | 位置 | 覆盖点 |
 | --- | --- | --- |
 | `syscall-test-socket-dataplane` | `test-suit/starryos/qemu/system/syscall-test-socket-dataplane` | TCP/UDP/raw socket 数据面基础行为 |
-| `bugfix-bug-tcp-send-no-epoll-notify` | `test-suit/starryos/qemu/system/bugfix-bug-tcp-send-no-epoll-notify` | TCP send 后 epoll waiter 唤醒 |
+| LTP `epoll_wait01` | `test-suit/starryos/qemu/system/ltp-syscalls` | pipe LT 读写就绪、fd 与事件位；不承接原 TCP send 后对端 EPOLLET 通知 |
 | `test-tcp-napi-runtime` | `test-suit/starryos/qemu/system/test-tcp-napi-runtime` | blocking/nonblocking connect+accept、send/recv、poll/epoll、peer close、socket wait 的 signal/EINTR |
 | `bugfix-bug-ip-mtu-discover-udp-flush` | `test-suit/starryos/qemu/system/bugfix-bug-ip-mtu-discover-udp-flush` | `IP_MTU_DISCOVER` 读回和 UDP send 后立即 close 的交付 |
 | `syscall-test-so-reuseport` | `test-suit/starryos/qemu/system/syscall-test-so-reuseport` | TCP/UDP `SO_REUSEPORT` 共同绑定边界 |
@@ -214,11 +216,14 @@ Linux 管理 ABI 用例验证 ioctl、rtnetlink 和 procfs 是否观察到同一
 | `bugfix-bug-netlink-getaddr` | `test-suit/starryos/qemu/system/bugfix-bug-netlink-getaddr` | `RTM_GETADDR`、loopback address、link/address dump |
 | `c-regression-test-netlink-rtnetlink` | `test-suit/starryos/qemu/system/c-regression-test-netlink-rtnetlink` | route dump、IPv4 `RTM_NEWADDR/DELADDR` 及错误映射 |
 | `c-regression-test-socket-device-ioctl` | `test-suit/starryos/qemu/system/c-regression-test-socket-device-ioctl` | 跨 socket family 的 `SIOCGIFNAME`/device ioctl |
-| `syscall-test-netlink-recvmsg` | `test-suit/starryos/qemu/system/syscall-test-netlink-recvmsg` | netlink recvmsg 基础语义 |
 | `bugfix-bug-proc-net-arp` | `test-suit/starryos/qemu/system/bugfix-bug-proc-net-arp` | `/proc/net/arp` 格式和真实 device 字段 |
 | `syscall-test-procstats` | `test-suit/starryos/qemu/system/syscall-test-procstats` | `/proc/net/dev` 列格式与 loopback 真实计数增长 |
 
 管理 ABI 表要求多个接口共享 `InterfaceId` 和状态来源，能够捕获结构编码正确但数据源分裂的问题。AF_PACKET 使用二层地址与 frame 语义，因此需要在相同身份基础上另行验证。
+
+原 `syscall-test-netlink-recvmsg` 已部分迁移到 LTP `recvmsg02`，仅检查 IPv6 UDP 的
+`MSG_PEEK` 调用返回非负值。它不保留原 netlink 的消息消费、截断及错误边界；上游
+内容不匹配分支也会报告通过，因此该项不能作为消息内容正确的证明。
 
 ### 3.4 AF_PACKET
 
@@ -228,7 +233,14 @@ AF_PACKET 测试关注接口选择、二层地址和 frame 收发，与普通 `S
 | --- | --- | --- |
 | `bugfix-bug-packet-arping` | `test-suit/starryos/qemu/system/bugfix-bug-packet-arping` | `AF_PACKET` bind、`SIOCGIFINDEX`、`RTM_GETLINK` 一致性、模拟 gateway ARP reply |
 
-Unix 辅助数据与 record 语义由 `syscall-test-seqpacket`、`bugfix-unix-passcred`、`bugfix-socket-timestamp`、`test-unix-msg-peek`、`test-unix-scm-rights` 和 `test-unix-cmsg-byte-marks` 覆盖，均位于 `test-suit/starryos/qemu/system/`。
+Unix 辅助数据与 peek 相关回归包括 `bugfix-socket-timestamp`、`test-unix-msg-peek`、`test-unix-scm-rights` 和 `test-unix-cmsg-byte-marks`，均位于 `test-suit/starryos/qemu/system/`。
+原 `bugfix-unix-passcred` 已部分迁移到 LTP `getsockopt02`，只承接 `SO_PEERCRED` 的
+对端 PID 检查；其 `SO_PASSCRED`/`SCM_CREDENTIALS` 自动投递、PID namespace 映射等
+断言未被该用例保留。
+
+原 `syscall-test-seqpacket` 已部分迁移到 LTP `socketpair02`，仅检查 STREAM socketpair
+的 `CLOEXEC`/`NONBLOCK` 标志置位；原 SEQPACKET 的记录边界、截断、PEEK、EOF 和
+`SCM_RIGHTS` 等断言不再由该程序提供。
 
 这些 system 测试验证的是 StarryOS Linux ABI 层是否正确使用 `ax_net::interfaces()`、`InterfaceId`、`arp_entries()` 和 socket facade。它们不替代 `ax-net` crate 单元测试；两者覆盖层级不同。
 
@@ -243,6 +255,52 @@ cargo xtask starry test qemu --arch x86_64 -c qemu-e1000/system
 guest 用例 `test-e1000-napi-runtime` 等待 DHCP，然后 fork 两个进程并发从 QEMU user-network gateway 下载 payload。每个进程必须读取并逐字节校验完整的 4 MiB body；成功标记为 `E1000_NAPI_TEST_PASSED`。这能捕获只完成 DHCP、短包可用但 burst 期间 IRQ 未正确 rearm，或者两个 socket 并发时 queue/protocol generation 停止推进的问题。
 
 rootfs 参数补全按 `-device` 的 `netdev=net0` 连接关系识别已有网卡，而不是维护 virtio/E1000 型号白名单。`ensure_disk_boot_net_preserves_custom_network_device_bound_to_net0` 固定该契约，防止测试配置被额外注入同名默认 NIC 后在 QEMU 启动前失败。
+
+### 3.6 队列诊断出口
+
+`qemu/system/net-queue` 读取 `/sys/kernel/debug/net_queue`：每条记录必须解析出 16 个
+字段，接口名必须同时出现在 `/proc/net/dev`，owner CPU 必须落在在线 CPU 集合内；测试
+镜像的四种 QEMU 配置都挂了网卡，因此找不到非 loopback 接口或找不到任何 group 记录
+都判失败。该用例证明记录格式完整，并在真实内核里走通从 group 建立到 debugfs 输出的
+装配链路。
+
+它不校验身份取值（单网卡下发现序与发布序同为 0，取值不可区分），也不区分多设备下的
+接口归属；身份配对、接口映射与计数口径由 `ax-net` 的 crate 单元测试在构造的运行时上
+验证，渲染列序由 `starry-kernel` 的 `net_queue_tests` 验证。builder 写入身份与
+`init_network` 产出发布序这两处取值目前没有自动证据，只有真实的多设备运行时才能暴露
+错位。
+
+```bash
+cargo xtask starry test qemu --arch x86_64 -c qemu/system/net-queue
+```
+
+四种 QEMU 配置的 virtio-net 环境都报告 `groups=1 interfaces=1`，成功标记为
+`NET_QUEUE_PASSED`。
+
+### 3.7 网络事件出口
+
+`qemu/system/net-events` 读取 `/sys/kernel/debug/tracing/events/net/` 下的六个事件目录：每个事件的
+`id` 必须可读、`format` 必须声明文档化字段；启用后向 QEMU 用户态网络网关发送数据报驱动真实队列轮询与协议
+推进（loopback 流量不经过物理队列，不能用），流量驱动的四个事件（`queue_poll_round`、`tx_submit`、
+`rx_publish`、`proto_yield`）必须在 `trace` 缓冲里出现自洽记录（结果码在取值范围内、工作量不超过预算、
+owner CPU 落在在线集合内、帧长与待办标志取值合法）。四个事件由不同边界产生，因此等待条件是「全部出现或
+有界超时」，而不是只看最早出现的 `queue_poll_round`；关闭、清空缓冲并对同样流量等待同样长的时间后，六个
+事件都不得再出现新记录。
+`queue_rearm` 的非空闲结局与 `queue_backpressure` 需要设备真的竞态或真的忙，QEMU 下不保证触发，
+这两个事件在本用例中只验证可发现、`format` 与关闭后无记录；它们的语义由 `ax-net` 单元测试覆盖
+（rearm 的四种结局、背压的 TX 提交重试、TX 提交链路不可用、RX 补投重试，以及永久拒绝不产生记录）。
+事件的触发与字段契约见[网络事件](events.md)。
+
+```bash
+cargo xtask starry test qemu --arch x86_64 -c qemu/system/net-events
+```
+
+四种 QEMU 配置都在真实流量下读到 `queue_poll_round` 记录并通过，成功标记为 `NET_EVENTS_PASSED`；
+每轮读到的记录数取决于该轮触发了几次队列轮询（观察到 2 至 12 条）。`proto_yield` 的记录数取决于协议
+执行器的预算判定：轻载下每个唤醒周期至多一条。
+
+附着链路的 eBPF 冒烟是独立 app `apps/starry/ebpf/net_queue_poll`：它按 `PERF_TYPE_TRACEPOINT` 附着该
+事件并读回记录，只证明 `load → attach → enable → read` 连通，不定义事件语义。
 
 ## 4. 双网卡集成测试
 

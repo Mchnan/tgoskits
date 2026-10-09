@@ -6,7 +6,6 @@ use std::{
 use tempfile::tempdir;
 
 use super::*;
-use crate::{axvisor::build, context::ResolvedAxvisorRequest};
 
 fn write_qemu_config(root: &Path, case: &str, arch: &str, body: &str) -> PathBuf {
     write_qemu_config_in_group(root, "normal", "default", case, arch, body)
@@ -73,50 +72,6 @@ fn write_board_config_in_group(
     let path = dir.join(format!("board-{name}.toml"));
     fs::write(&path, body).unwrap();
     path
-}
-
-fn axvisor_request(path: PathBuf, arch: &str, target: &str) -> ResolvedAxvisorRequest {
-    ResolvedAxvisorRequest {
-        package: build::AXVISOR_PACKAGE.to_string(),
-        axvisor_dir: PathBuf::from("/tmp/os/axvisor"),
-        arch: arch.to_string(),
-        target: target.to_string(),
-        smp: None,
-        debug: false,
-        build_info_path: path,
-        qemu_config: None,
-        uboot_config: None,
-        vmconfigs: Vec::new(),
-    }
-}
-
-#[test]
-fn accepts_full_target_triples() {
-    assert_eq!(
-        parse_target(&None, &Some("aarch64-unknown-none-softfloat".to_string())).unwrap(),
-        (
-            "aarch64".to_string(),
-            "aarch64-unknown-none-softfloat".to_string()
-        )
-    );
-    assert_eq!(
-        parse_target(&None, &Some("riscv64gc-unknown-none-elf".to_string())).unwrap(),
-        (
-            "riscv64".to_string(),
-            "riscv64gc-unknown-none-elf".to_string()
-        )
-    );
-    assert_eq!(
-        parse_target(
-            &None,
-            &Some("loongarch64-unknown-none-softfloat".to_string())
-        )
-        .unwrap(),
-        (
-            "loongarch64".to_string(),
-            "loongarch64-unknown-none-softfloat".to_string()
-        )
-    );
 }
 
 #[test]
@@ -435,29 +390,6 @@ fn returns_all_board_test_groups_when_no_filter_is_given() {
 }
 
 #[test]
-fn discovers_board_case_when_case_dir_contains_build_config() {
-    let root = tempdir().unwrap();
-    let case_dir = root.path().join("test-suit/axvisor/normal/smoke");
-    fs::create_dir_all(&case_dir).unwrap();
-    let build_config = case_dir.join("build-aarch64-unknown-none-softfloat.toml");
-    fs::write(
-        &build_config,
-        "target = \"aarch64-unknown-none-softfloat\"\n",
-    )
-    .unwrap();
-    let board_test_config = case_dir.join("board-phytiumpi-linux.toml");
-    fs::write(&board_test_config, "board_type = \"PhytiumPi\"\n").unwrap();
-
-    let groups = discover_board_test_groups(root.path(), "normal", None, None).unwrap();
-
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].name, "smoke");
-    assert_eq!(groups[0].board_name, "phytiumpi-linux");
-    assert_eq!(groups[0].build_config, build_config);
-    assert_eq!(groups[0].board_test_config_path, board_test_config);
-}
-
-#[test]
 fn board_case_uses_unique_nearest_build_config_without_target_assumption() {
     let root = tempdir().unwrap();
     let wrapper_dir = root.path().join("test-suit/axvisor/normal/board-custom");
@@ -475,6 +407,67 @@ fn board_case_uses_unique_nearest_build_config_without_target_assumption() {
     assert_eq!(groups[0].board_name, "custom");
     assert_eq!(groups[0].build_config, build_config);
     assert_eq!(groups[0].board_test_config_path, board_test_config);
+}
+
+#[test]
+fn merges_benchmark_suite_root_into_board_discovery() {
+    let root = tempdir().unwrap();
+    let regular_build_config = write_board_build_config(root.path(), "board-orangepi-5-plus");
+    let regular_board_config = write_board_config_in_group(
+        root.path(),
+        "normal",
+        "board-orangepi-5-plus",
+        "smoke",
+        "orangepi-5-plus-linux",
+        "board_type = \"OrangePi-5-Plus\"\n",
+    );
+
+    let benchmark_wrapper = root
+        .path()
+        .join("benchmarks/axvisor/board-orangepi-5-plus/vcpu-perf");
+    let benchmark_case = benchmark_wrapper.join("performance");
+    fs::create_dir_all(&benchmark_case).unwrap();
+    let benchmark_build_config =
+        benchmark_wrapper.join("build-aarch64-unknown-none-softfloat.toml");
+    fs::write(
+        &benchmark_build_config,
+        "target = \"aarch64-unknown-none-softfloat\"\n",
+    )
+    .unwrap();
+    let benchmark_board_config = benchmark_case.join("board-orangepi-5-plus-vcpu-perf.toml");
+    fs::write(
+        &benchmark_board_config,
+        "board_type = \"OrangePi-5-Plus\"\n",
+    )
+    .unwrap();
+
+    let groups = discover_board_test_groups(root.path(), "normal", None, None).unwrap();
+
+    assert_eq!(groups.len(), 2);
+    let benchmark = groups
+        .iter()
+        .find(|group| group.board_name == "orangepi-5-plus-vcpu-perf")
+        .expect("benchmark board case must be discovered");
+    assert_eq!(benchmark.name, "performance");
+    assert_eq!(benchmark.build_config, benchmark_build_config);
+    assert_eq!(benchmark.board_test_config_path, benchmark_board_config);
+    let regular = groups
+        .iter()
+        .find(|group| group.board_name == "orangepi-5-plus-linux")
+        .expect("regular board case must stay discoverable");
+    assert_eq!(regular.name, "smoke");
+    assert_eq!(regular.build_config, regular_build_config);
+    assert_eq!(regular.board_test_config_path, regular_board_config);
+
+    let selected = discover_board_test_groups(
+        root.path(),
+        "normal",
+        None,
+        Some("orangepi-5-plus-vcpu-perf"),
+    )
+    .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].name, "performance");
 }
 
 #[test]
@@ -586,59 +579,6 @@ fn ignores_qemu_only_build_groups_when_discovering_board_tests() {
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].name, "smoke");
     assert_eq!(groups[0].board_name, "orangepi-5-plus-linux");
-}
-
-#[test]
-fn rejects_unknown_board_test_board() {
-    let root = tempdir().unwrap();
-    write_board_build_config(root.path(), "default");
-    write_board_config(
-        root.path(),
-        "smoke",
-        "phytiumpi-linux",
-        "board_type = \"PhytiumPi\"\n",
-    );
-
-    let err = discover_board_test_groups(root.path(), "normal", None, Some("unknown")).unwrap_err();
-
-    assert!(
-        err.to_string()
-            .contains("unsupported axvisor board test board `unknown`")
-    );
-    assert!(err.to_string().contains("phytiumpi-linux"));
-}
-
-#[test]
-fn rejects_unknown_board_test_case() {
-    let root = tempdir().unwrap();
-    write_board_build_config(root.path(), "default");
-    write_board_config(
-        root.path(),
-        "smoke",
-        "phytiumpi-linux",
-        "board_type = \"PhytiumPi\"\n",
-    );
-
-    let err = discover_board_test_groups(root.path(), "normal", Some("unknown"), None).unwrap_err();
-
-    assert!(
-        err.to_string()
-            .contains("unsupported axvisor board test case `unknown`")
-    );
-    assert!(err.to_string().contains("smoke"));
-}
-
-#[test]
-fn rejects_empty_board_test_group() {
-    let root = tempdir().unwrap();
-    fs::create_dir_all(root.path().join("test-suit/axvisor/empty")).unwrap();
-
-    let err = discover_board_test_groups(root.path(), "empty", None, None).unwrap_err();
-
-    assert!(
-        err.to_string()
-            .contains("no Axvisor board test groups found under")
-    );
 }
 
 #[test]

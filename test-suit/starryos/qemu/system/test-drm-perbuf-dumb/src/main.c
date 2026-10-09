@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE
 #include "test_framework.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <string.h>
@@ -34,6 +35,10 @@ struct drm_mode_map_dumb {
 };
 struct drm_mode_destroy_dumb {
     uint32_t handle;
+};
+struct drm_prime_handle {
+    uint32_t handle, flags;
+    int32_t fd;
 };
 struct drm_clip_rect {
     uint16_t x1, y1, x2, y2;
@@ -84,9 +89,18 @@ struct drm_mode_create_blob {
     uint64_t data;
     uint32_t length, blob_id;
 };
+struct dma_heap_allocation_data {
+    uint64_t len;
+    uint32_t fd, fd_flags;
+    uint64_t heap_flags;
+};
 
+#define DMA_HEAP_IOCTL_ALLOC            _IOWR('H', 0, struct dma_heap_allocation_data)
 #define DRM_IOCTL_MODE_GETRESOURCES      _IOWR('d', 0xA0, struct drm_mode_card_res)
+#define DRM_IOCTL_PRIME_HANDLE_TO_FD     _IOWR('d', 0x2D, struct drm_prime_handle)
+#define DRM_IOCTL_PRIME_FD_TO_HANDLE     _IOWR('d', 0x2E, struct drm_prime_handle)
 #define DRM_IOCTL_MODE_GETCONNECTOR      _IOWR('d', 0xA7, struct drm_mode_get_connector)
+#define DRM_IOCTL_MODE_RMFB              _IOWR('d', 0xAF, uint32_t)
 #define DRM_IOCTL_MODE_GETPROPERTY       _IOWR('d', 0xAA, struct drm_mode_get_property)
 #define DRM_IOCTL_MODE_DIRTYFB           _IOWR('d', 0xB1, struct drm_mode_dirtyfb)
 #define DRM_IOCTL_MODE_CREATE_DUMB       _IOWR('d', 0xB2, struct drm_mode_create_dumb)
@@ -164,12 +178,41 @@ int main(void) {
     CHECK(d1.handle != d2.handle, "distinct dumb handles");
     CHECK(d1.pitch == d2.pitch && d1.size == d2.size, "consistent pitch/size");
 
+    struct drm_mode_create_dumb small = { .width = 17, .height = 17, .bpp = 32 };
+    int small_ret = ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &small);
+    CHECK_RET(small_ret, 0, "CREATE_DUMB with non-page-aligned image size");
+    if (small_ret == 0) {
+        CHECK(small.pitch == 68 && small.size == 4096,
+              "CREATE_DUMB reports page-aligned allocation size");
+        struct drm_mode_destroy_dumb destroy = { .handle = small.handle };
+        CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy), 0,
+                  "DESTROY_DUMB small buffer");
+    }
+
+    /* Linux virtio_gpu_mode_dumb_create accepts only 32 bpp. */
+    struct drm_mode_create_dumb unsupported = { .width = w, .height = h, .bpp = 16 };
+    errno = 0;
+    CHECK(ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &unsupported) == -1 && errno == EINVAL,
+          "unsupported dumb format returns EINVAL");
+
     /* --- 两次 MAP_DUMB，期望拿到不同的 offset --- */
     struct drm_mode_map_dumb m1 = { .handle = d1.handle };
     struct drm_mode_map_dumb m2 = { .handle = d2.handle };
     CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &m1), 0, "MAP_DUMB m1");
     CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &m2), 0, "MAP_DUMB m2");
     CHECK(m1.offset != m2.offset, "distinct mmap offsets");
+
+    /* Linux GEM handles belong to struct drm_file, not to a process or the
+     * shared device node. A separate open must not resolve fd's handle. */
+    int other_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    CHECK(other_fd >= 0, "second open /dev/dri/card0");
+    if (other_fd >= 0) {
+        struct drm_mode_map_dumb foreign = { .handle = d1.handle };
+        errno = 0;
+        CHECK(ioctl(other_fd, DRM_IOCTL_MODE_MAP_DUMB, &foreign) == -1
+              && errno == EINVAL,
+              "GEM handle is private to one open file description");
+    }
 
     /* --- 各自 mmap，验证物理隔离 --- */
     uint8_t *p1 = mmap(NULL, d1.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, m1.offset);
@@ -186,6 +229,110 @@ int main(void) {
     /* 关键断言：两个 buffer 真的是独立物理内存 */
     CHECK(p1[0] == 0xAA && p1[d1.size - 1] == 0xAA, "p1 untouched after p2 write");
     CHECK(p2[0] == 0x55 && p2[d2.size - 1] == 0x55, "p2 untouched after p1 write");
+
+    /* Dumb PRIME must export guest pages, not a host-only 3D wrapper. Import
+     * into another drm_file, map the alias, and verify both mappings observe
+     * the same backing. The imported handle must also be usable by ADDFB2. */
+    if (other_fd >= 0) {
+        struct drm_prime_handle exported = {
+            .handle = d1.handle,
+            .flags = O_CLOEXEC,
+            .fd = -1,
+        };
+        int export_ret = ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &exported);
+        CHECK_RET(export_ret, 0, "PRIME_HANDLE_TO_FD dumb");
+        if (export_ret == 0) {
+            struct drm_prime_handle imported = { .fd = exported.fd };
+            int import_ret = ioctl(other_fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &imported);
+            CHECK_RET(import_ret, 0, "PRIME_FD_TO_HANDLE dumb on second open");
+            if (import_ret == 0) {
+                struct drm_mode_map_dumb imported_map = { .handle = imported.handle };
+                int map_ret = ioctl(other_fd, DRM_IOCTL_MODE_MAP_DUMB, &imported_map);
+                CHECK_RET(map_ret, 0, "MAP_DUMB imported PRIME handle");
+                if (map_ret == 0) {
+                    uint8_t *prime_map = mmap(NULL, d1.size, PROT_READ | PROT_WRITE,
+                                              MAP_SHARED, other_fd, imported_map.offset);
+                    CHECK(prime_map != MAP_FAILED, "mmap imported PRIME dumb");
+                    if (prime_map != MAP_FAILED) {
+                        prime_map[2] = 0x3C;
+                        CHECK(p1[2] == 0x3C, "PRIME import shares guest backing pages");
+                        munmap(prime_map, d1.size);
+                    }
+                }
+
+                struct drm_mode_fb_cmd2 imported_fb = {
+                    .width = w,
+                    .height = h,
+                    .pixel_format = DRM_FORMAT_XRGB8888,
+                    .handles = { imported.handle },
+                    .pitches = { d1.pitch },
+                };
+                int addfb_ret = ioctl(other_fd, DRM_IOCTL_MODE_ADDFB2, &imported_fb);
+                CHECK_RET(addfb_ret, 0, "ADDFB2 imported PRIME dumb");
+                if (addfb_ret == 0) {
+                    CHECK_RET(ioctl(other_fd, DRM_IOCTL_MODE_RMFB, &imported_fb.fb_id), 0,
+                              "RMFB imported PRIME dumb");
+                }
+
+                struct drm_mode_destroy_dumb imported_destroy = {
+                    .handle = imported.handle,
+                };
+                CHECK_RET(ioctl(other_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &imported_destroy), 0,
+                          "DESTROY_DUMB imported PRIME handle");
+            }
+            close(exported.fd);
+        }
+        close(other_fd);
+    }
+
+    /* Import a dma-heap fd through the standard PRIME path, then create a
+     * framebuffer from its device-visible backing. */
+    int heap_fd = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+    CHECK(heap_fd >= 0, "open dma-heap for external PRIME import");
+    if (heap_fd >= 0) {
+        struct dma_heap_allocation_data heap = {
+            .len = 4096,
+            .fd_flags = O_RDWR | O_CLOEXEC,
+        };
+        int heap_ret = ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &heap);
+        CHECK_RET(heap_ret, 0, "DMA_HEAP_IOCTL_ALLOC for PRIME import");
+        if (heap_ret == 0) {
+            struct drm_prime_handle imported = { .fd = (int)heap.fd };
+            int import_ret = ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &imported);
+            CHECK_RET(import_ret, 0, "PRIME_FD_TO_HANDLE dma-heap buffer");
+            if (import_ret == 0) {
+                struct drm_mode_map_dumb mapped = { .handle = imported.handle };
+                CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mapped), 0,
+                          "MAP_DUMB imported dma-heap buffer");
+                struct drm_mode_fb_cmd2 heap_fb = {
+                    .width = 16, .height = 16, .pixel_format = DRM_FORMAT_XRGB8888,
+                    .handles = { imported.handle }, .pitches = { 64 },
+                };
+                int addfb_ret = ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &heap_fb);
+                CHECK_RET(addfb_ret, 0, "ADDFB2 imported dma-heap buffer");
+                if (addfb_ret == 0) {
+                    CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_RMFB, &heap_fb.fb_id), 0,
+                              "RMFB imported dma-heap buffer");
+                }
+                close((int)heap.fd);
+                uint8_t *import_map = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                           MAP_SHARED, fd, mapped.offset);
+                CHECK(import_map != MAP_FAILED,
+                      "imported dma-heap backing survives source fd close");
+                if (import_map != MAP_FAILED) {
+                    import_map[0] = 0x5a;
+                    CHECK(import_map[0] == 0x5a, "imported dma-heap mmap is writable");
+                    munmap(import_map, 4096);
+                }
+                struct drm_mode_destroy_dumb destroy = { .handle = imported.handle };
+                CHECK_RET(ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy), 0,
+                          "DESTROY_DUMB imported dma-heap buffer");
+            } else {
+                close((int)heap.fd);
+            }
+        }
+        close(heap_fd);
+    }
 
     /* 在 p1 上画一个梯度，验证用户态写穿透到内核 GlobalPage */
     uint32_t *px1 = (uint32_t *)p1;

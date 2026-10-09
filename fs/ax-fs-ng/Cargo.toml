@@ -1,6 +1,6 @@
 [package]
 name = "ax-fs-ng"
-version = "0.10.2"
+version = "0.11.2"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = ["Mivik <mivikq@gmail.com>"]
@@ -30,6 +30,7 @@ heapless.workspace = true
 intrusive-collections = "0.9"
 irq-framework = { workspace = true }
 log = { workspace = true }
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 lru = "0.16"
 rdif-block = { workspace = true }
 scope-local = { workspace = true }

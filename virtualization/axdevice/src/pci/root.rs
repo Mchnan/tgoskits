@@ -1,9 +1,8 @@
 //! Architecture-neutral PCI root-owned config and BAR decode state.
 //!
 //! Frontends pass already-decoded BDF/config accesses into this object. The
-//! root owns only conventional config bytes and BAR routes; endpoint objects,
-//! runtime identities, and lifecycle callbacks are introduced by later
-//! integration layers.
+//! root owns config bytes and BAR routes; endpoint objects, runtime identities,
+//! and lifecycle callbacks are introduced by later integration layers.
 
 use alloc::{
     boxed::Box,
@@ -17,13 +16,14 @@ use core::{fmt, ops::Range};
 use ax_sync::SpinLock;
 use axdevice_base::DeviceId;
 
+#[cfg(target_arch = "x86_64")]
+use super::config_layout::CONFIG_SPACE_SIZE;
 use super::{
     EndpointRouteToken, FOUR_GIB, PciBarIndex, PciBdf, PciCommandState, PciConfigReadEffect,
     PciConfigWriteEffect, PciError, PciResult, ResolvedPciTopology,
     config::{BarWriteAction, FunctionState},
     config_layout::{
-        CONFIG_COMMAND_OFFSET, CONFIG_COMMAND_SIZE, CONFIG_SPACE_SIZE, CONFIG_STATUS_OFFSET,
-        STATUS_INTERRUPT_PENDING,
+        CONFIG_COMMAND_OFFSET, CONFIG_COMMAND_SIZE, CONFIG_STATUS_OFFSET, STATUS_INTERRUPT_PENDING,
     },
 };
 use crate::{AccessWidth, ConfigOffset};
@@ -146,7 +146,7 @@ impl PciRootState {
         &self.topology
     }
 
-    /// Reads one conventional config access.
+    /// Reads one PCI config access.
     ///
     /// An absent BDF reads as all ones for the requested width.
     ///
@@ -171,7 +171,7 @@ impl PciRootState {
         }
     }
 
-    /// Applies one conventional config write.
+    /// Applies one PCI config write.
     ///
     /// Writes to absent functions or read-only fields have no effect. BAR
     /// probe and relocation writes are classified after merging the complete
@@ -266,6 +266,7 @@ impl PciRootState {
         })
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn config_access_intersects_effect(
         &self,
         bdf: PciBdf,
@@ -510,6 +511,16 @@ impl PciRootState {
     /// Revokes every root route before router teardown starts.
     pub(crate) fn unbind_all_routes(&self) {
         self.state.lock_irqsave().bindings.clear();
+    }
+
+    pub(crate) fn endpoint_bus_master_enabled(&self, device: DeviceId) -> bool {
+        let state = self.state.lock_irqsave();
+        state.bindings.iter().any(|(bdf, token)| {
+            token.device_id() == device
+                && state.functions.iter().any(|function| {
+                    function.bdf() == *bdf && function.command_state().bus_master_enable()
+                })
+        })
     }
 
     /// Restores every function's root-owned power-on config and BAR route.

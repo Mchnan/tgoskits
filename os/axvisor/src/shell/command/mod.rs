@@ -32,7 +32,6 @@ pub static COMMAND_TREE: LazyLock<BTreeMap<String, CommandNode>> =
     LazyLock::new(build_command_tree);
 
 pub(super) fn shutdown(exit_code: i32) -> ! {
-    #[cfg(feature = "fs")]
     if let Err(error) = axvm::host::shutdown_filesystems() {
         println!("Warning: failed to shut down host filesystems: {error}");
     }
@@ -454,16 +453,11 @@ pub fn print_prompt() {
 }
 
 pub fn prompt_string() -> String {
-    #[cfg(feature = "fs")]
     {
         match std::env::current_dir() {
             Ok(dir) => format!("axvisor:{}$ ", dir.display()),
             Err(_) => "axvisor:$ ".to_string(),
         }
-    }
-    #[cfg(not(feature = "fs"))]
-    {
-        "axvisor:$ ".to_string()
     }
 }
 
@@ -506,6 +500,31 @@ fn print_parse_error(error: ParseError) {
             println!("Error: Command '{}' has no handler function", cmd);
         }
     }
+}
+
+/// Completes an unquoted command word using the same tree as command parsing.
+pub(super) fn command_completions(context: &str, prefix: &str) -> Vec<String> {
+    let mut tree = &*COMMAND_TREE;
+    for word in context.split_whitespace() {
+        let Some(node) = tree.get(word) else {
+            return Vec::new();
+        };
+        tree = &node.subcommands;
+    }
+    let mut matches: Vec<String> = tree
+        .keys()
+        .filter(|name| name.starts_with(prefix))
+        .cloned()
+        .collect();
+    if context.trim().is_empty() {
+        matches.extend(
+            ["help", "clear", "exit", "quit"]
+                .into_iter()
+                .filter(|name| name.starts_with(prefix) && !tree.contains_key(*name))
+                .map(String::from),
+        );
+    }
+    matches
 }
 
 // Built-in command handler

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/axfs-ng-vfs-v0.8.0...axfs-ng-vfs-v0.8.1) - 2026-09-22
+
+### Added
+
+- *(vfs)* enhance file opening with mutation credentials and status … ([#2468](https://github.com/rcore-os/tgoskits/pull/2468))
+
+## [0.8.0](https://github.com/rcore-os/tgoskits/compare/axfs-ng-vfs-v0.7.1...axfs-ng-vfs-v0.8.0) - 2026-09-18
+
+### Added
+
+- *(vfs)* implement mutation credentials for directory operations an… ([#2287](https://github.com/rcore-os/tgoskits/pull/2287))
+
+### Fixed
+
+- *(starry-kernel)* enforce executable inode write exclusion ([#2375](https://github.com/rcore-os/tgoskits/pull/2375))
+- *(starry-kernel)* make FIFO opens interruptible ([#2368](https://github.com/rcore-os/tgoskits/pull/2368))
+
+### Other
+
+- *(repo)* remove nonfunctional and redundant test assertions ([#2440](https://github.com/rcore-os/tgoskits/pull/2440))
+
 ## [0.7.1](https://github.com/rcore-os/tgoskits/compare/axfs-ng-vfs-v0.7.0...axfs-ng-vfs-v0.7.1) - 2026-09-09
 
 ### Other

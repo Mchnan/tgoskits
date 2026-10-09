@@ -1,9 +1,10 @@
-//! Architecture-neutral conventional PCI topology and root state.
+//! Architecture-neutral PCI topology and root state.
 //!
 //! This module owns Type-0 function identities, deterministic BDF and
-//! 32-bit memory-BAR placement, the 256-byte conventional config image, and
-//! mutable root-owned config/BAR decode state. Architecture frontends and
-//! runtime endpoint binding are separate layers.
+//! 32-bit memory-BAR placement, the 4 KiB Type-0 config image, and mutable
+//! root-owned config/BAR decode state. Conventional capabilities remain in
+//! the first 256 bytes. Architecture frontends and runtime endpoint binding
+//! are separate layers.
 
 mod address;
 mod bar;
@@ -11,6 +12,7 @@ mod capability;
 mod config;
 mod config_layout;
 mod error;
+mod frontend;
 mod function;
 mod graph;
 mod placement;
@@ -18,6 +20,7 @@ mod root;
 mod runtime;
 mod topology;
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) use config::read_bytes;
 pub(crate) use root::all_ones;
 
@@ -30,6 +33,7 @@ pub use capability::{
     PciCapabilityLayout, PciCapabilitySnapshot, PciCapabilitySpec, PciConfigEffectId,
 };
 pub use error::{PciError, PciResult};
+pub use frontend::{PciEcamConfigFrontend, PciMemoryApertureDevice, PciRootLifecycle};
 pub use function::{PciClass, PciEndpointIdentity, PciFunctionSpec};
 pub use graph::{
     PciFunctionRequirement, PciHostKey, PciHostProvider, PciIntxPin, PciIntxRequirement,

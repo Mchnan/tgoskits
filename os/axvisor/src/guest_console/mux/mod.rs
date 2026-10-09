@@ -7,7 +7,10 @@ use alloc::{
 };
 
 use anyhow::{Result, bail};
-use ax_std::os::arceos::sync::{NoPreemptMutex, NoPreemptMutexGuard};
+use ax_std::os::arceos::{
+    modules::ax_runtime::RuntimeError,
+    sync::{NoPreemptMutex, NoPreemptMutexGuard},
+};
 use axvm::{SerialBackend, SerialBackendFactory, VMId, VmStatus};
 use core::ops::Bound::{Excluded, Unbounded};
 use log::warn;
@@ -109,6 +112,15 @@ struct GuestState {
     backend_generation: Option<BackendGeneration>,
     input: VecDeque<u8>,
     input_overflow_reported: bool,
+    /// Generation whose ordered-queue submission last reported `WouldBlock`.
+    ///
+    /// The rejected bytes are retained by the UART model, not here; this only
+    /// records that releasing ordered-queue capacity must ask the VM to poll
+    /// its devices again. It is stored on the existing `GuestState` so the
+    /// atomic producer callback only flips a flag and never allocates.
+    retained_tx: Option<BackendGeneration>,
+    /// Accepted output bytes not yet replayed from the ordered queue.
+    queued_output_bytes: usize,
 }
 
 impl GuestState {
@@ -116,6 +128,7 @@ impl GuestState {
         self.backend_generation = None;
         self.input.clear();
         self.input_overflow_reported = false;
+        self.retained_tx = None;
     }
 
     fn invalidate_backend_generation(&mut self, generation: BackendGeneration) {
@@ -217,9 +230,17 @@ impl GuestConsoleMux {
             state.output.register_guest(vm_id);
         }
 
+        // A stopped guest may still own accepted records in the ordered queue.
+        // Keep its physical line until the shell replays the last such byte.
+        let draining_attached = state.attached.filter(|vm_id| {
+            state
+                .guests
+                .get(vm_id)
+                .is_some_and(|guest| guest.queued_output_bytes != 0)
+        });
         let detached = state
             .attached
-            .filter(|vm_id| !state.running.contains(vm_id));
+            .filter(|vm_id| !state.running.contains(vm_id) && draining_attached != Some(*vm_id));
         let host_output = if detached.is_some() {
             state.attached = None;
             state.shortcut_prefix_pending = false;
@@ -229,7 +250,10 @@ impl GuestConsoleMux {
         } else {
             Vec::new()
         };
-        let output_active = state.output_active.keys().copied().collect::<BTreeSet<_>>();
+        let mut output_active = state.output_active.keys().copied().collect::<BTreeSet<_>>();
+        if let Some(vm_id) = draining_attached {
+            output_active.insert(vm_id);
+        }
         state.output.reconcile_running(&output_active);
         drop(state);
         submit_host_bytes(&host_output);
@@ -335,6 +359,10 @@ impl GuestConsoleMux {
 
     fn attached_vm(&self) -> Option<VMId> {
         self.core.lock_state().attached
+    }
+
+    fn take_retained_tx_retry_vms(&self) -> Vec<VMId> {
+        self.core.take_retained_tx_retry_vms()
     }
 
     fn activate(&self, vm_id: VMId) -> Option<Vec<u8>> {
@@ -619,10 +647,20 @@ impl ConsoleCore {
         Some(state.output.format(vm_id, multiple_running, bytes))
     }
 
-    fn write_guest_output(&self, vm_id: VMId, generation: BackendGeneration, bytes: &[u8]) -> bool {
+    fn write_guest_output(
+        &self,
+        vm_id: VMId,
+        generation: BackendGeneration,
+        bytes: &[u8],
+    ) -> usize {
         if bytes.is_empty() {
-            return false;
+            return 0;
         }
+        // Hold `output_lock` across admission, the ordered-queue submit and the
+        // retained-TX bookkeeping. A pop that frees queue capacity is drained by
+        // `take_retained_tx_retry_vms` under the same lock, so a `WouldBlock`
+        // result cannot be followed by a capacity release that consults the
+        // pending set before this backend is recorded.
         let guard = self.lock_output();
         if !self
             .lock_state()
@@ -630,14 +668,72 @@ impl ConsoleCore {
             .get(&vm_id)
             .is_some_and(|guest| guest.backend_generation == Some(generation))
         {
-            return false;
+            return 0;
         }
         let tag = ((vm_id as u128) << 64) | generation.0 as u128;
-        if super::host::queue_guest_output(tag, bytes) {
-            return true;
+        match super::host::queue_guest_output(tag, bytes) {
+            Ok(true) => {
+                let mut state = self.lock_state();
+                let guest = state
+                    .guests
+                    .get_mut(&vm_id)
+                    .expect("the output lock protects admitted backend identity");
+                guest.retained_tx = None;
+                guest.queued_output_bytes = guest
+                    .queued_output_bytes
+                    .checked_add(bytes.len())
+                    .expect("bounded ordered output queue cannot overflow byte count");
+                return bytes.len();
+            }
+            Err(RuntimeError::WouldBlock) => {
+                self.set_retained_tx(vm_id, generation, true);
+                return 0;
+            }
+            Err(_) => return 0,
+            Ok(false) => {}
         }
+        // No ordered subscription: the byte replays directly onto the host
+        // transport, so any earlier backpressure marker is stale.
+        self.set_retained_tx(vm_id, generation, false);
         drop(guard);
-        self.replay_guest_output(vm_id, generation, bytes)
+        usize::from(self.replay_guest_output(vm_id, generation, bytes)) * bytes.len()
+    }
+
+    /// Records or clears the retained-TX retry marker of one live backend.
+    ///
+    /// Callers already hold `output_lock`; this only takes `state`, preserving
+    /// the `output_lock` → `state` order. The marker is ignored once the
+    /// generation is no longer active, so the producer never needs a fallible
+    /// path.
+    fn set_retained_tx(&self, vm_id: VMId, generation: BackendGeneration, retained: bool) {
+        let mut state = self.lock_state();
+        if let Some(guest) = state.guests.get_mut(&vm_id)
+            && guest.backend_generation == Some(generation)
+        {
+            guest.retained_tx = retained.then_some(generation);
+        }
+    }
+
+    /// Drains the VMs that must poll their devices after ordered-queue capacity
+    /// was released.
+    ///
+    /// Capacity is shared by every producer, so a freed slot may be retried by
+    /// a blocked backend that is not the owner of the consumed record; the
+    /// targets therefore come from the recorded backends themselves. Stale
+    /// markers are cleared without being returned, so a stopped or replaced
+    /// generation is never woken.
+    fn take_retained_tx_retry_vms(&self) -> Vec<VMId> {
+        let _output_guard = self.lock_output();
+        let mut state = self.lock_state();
+        let mut retry = Vec::new();
+        for (vm_id, guest) in state.guests.iter_mut() {
+            if let Some(generation) = guest.retained_tx.take()
+                && guest.backend_generation == Some(generation)
+            {
+                retry.push(*vm_id);
+            }
+        }
+        retry
     }
 
     fn replay_guest_output(
@@ -646,6 +742,16 @@ impl ConsoleCore {
         generation: BackendGeneration,
         bytes: &[u8],
     ) -> bool {
+        self.replay_guest_output_with_origin(vm_id, generation, bytes, false)
+    }
+
+    fn replay_guest_output_with_origin(
+        &self,
+        vm_id: VMId,
+        generation: BackendGeneration,
+        bytes: &[u8],
+        from_ordered_queue: bool,
+    ) -> bool {
         if bytes.is_empty() {
             return false;
         }
@@ -653,11 +759,21 @@ impl ConsoleCore {
         let _output_guard = self.lock_output();
         {
             let mut state = self.lock_state();
-            let Some(guest) = state.guests.get(&vm_id) else {
+            let Some(guest) = state.guests.get_mut(&vm_id) else {
                 return false;
             };
-            if guest.backend_generation != Some(generation) {
+            // Admission is checked against the active generation before the
+            // tagged record enters the ordered host-console queue. Preserve
+            // that accepted record across a later stop transition, while the
+            // stable identity still rejects replaced or removed incarnations.
+            if guest.backend_identity != Some(generation) {
                 return false;
+            }
+            if from_ordered_queue {
+                guest.queued_output_bytes = guest
+                    .queued_output_bytes
+                    .checked_sub(bytes.len())
+                    .expect("an ordered record cannot exceed the accepted output");
             }
             // Reconciliation may discard formatting state while a live
             // backend still has queued output. Register in task context before
@@ -694,16 +810,18 @@ impl ConsoleCore {
 
 impl SerialBackend for GuestSerialBackend {
     fn write(&self, bytes: &[u8]) {
-        if !self
+        let _ = self.try_write(bytes);
+    }
+
+    fn try_write(&self, bytes: &[u8]) -> usize {
+        let accepted = self
             .core
-            .write_guest_output(self.vm_id, self.generation, bytes)
-        {
-            return;
-        }
+            .write_guest_output(self.vm_id, self.generation, bytes);
         #[cfg(any(feature = "browser-console", all(test, axtest)))]
-        if crate::network_console::guest_output_connected(self.vm_id) {
-            crate::network_console::submit_guest_output(self.vm_id, bytes);
+        if accepted != 0 && crate::network_console::guest_output_connected(self.vm_id) {
+            crate::network_console::submit_guest_output(self.vm_id, &bytes[..accepted]);
         }
+        accepted
     }
 
     fn read(&self, buffer: &mut [u8]) -> usize {
@@ -717,7 +835,33 @@ pub(crate) fn replay_guest_output(tag: u128, bytes: &[u8]) {
     let generation = BackendGeneration(tag as u64);
     GUEST_CONSOLE_MUX
         .core
-        .replay_guest_output(vm_id, generation, bytes);
+        .replay_guest_output_with_origin(vm_id, generation, bytes, true);
+    notify_retained_tx_retries();
+}
+
+/// Drains the retry targets collected by the two pop entry points.
+///
+/// Kept separate from those entry points so both of them release every mux lock
+/// before the device-poll requests are published.
+fn take_retained_tx_retry_vms() -> Vec<VMId> {
+    GUEST_CONSOLE_MUX.take_retained_tx_retry_vms()
+}
+
+/// Asks every backend whose ordered-queue submission hit `WouldBlock` to poll
+/// its devices again.
+///
+/// Consuming one ordered record releases capacity that any blocked producer can
+/// use, so the request is published to the blocked VMs themselves instead of the
+/// consumed record's tag. The mux drains the pending set under `output_lock` and
+/// `state` and drops both before the manager call, and a retry request published
+/// before the vCPU parks keeps a guest from sleeping with bytes still retained
+/// in its TX FIFO.
+fn notify_retained_tx_retries() {
+    for vm_id in take_retained_tx_retry_vms() {
+        if let Err(error) = crate::manager::AxvmManager::notify_vm(vm_id) {
+            warn!("failed to wake VM[{vm_id}] for retained console output: {error:#}");
+        }
+    }
 }
 
 impl SerialBackendFactory for GuestSerialBackendFactory {
@@ -784,7 +928,9 @@ pub fn route_host_log(
     dropped_records: usize,
     dropped_bytes: usize,
 ) -> Option<Vec<u8>> {
-    GUEST_CONSOLE_MUX.route_host_log(record, dropped_records, dropped_bytes)
+    let output = GUEST_CONSOLE_MUX.route_host_log(record, dropped_records, dropped_bytes);
+    notify_retained_tx_retries();
+    output
 }
 
 /// Opens a running VM interactively or replays a stopped VM's buffered output.

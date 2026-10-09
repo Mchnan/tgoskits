@@ -215,6 +215,8 @@ pub mod fs {
         /// Sets the cursor of the file to the specified offset. Returns the new
         /// position after the seek.
         pub fn ax_seek_file(file: &mut AxFileHandle, pos: AxSeekFrom) -> ApiResult<u64>;
+        /// Returns attributes of a file or directory, following symbolic links.
+        pub fn ax_metadata(path: &str) -> ApiResult<AxFileAttr>;
         /// Returns attributes of the file.
         pub fn ax_file_attr(file: &AxFileHandle) -> ApiResult<AxFileAttr>;
 
@@ -340,14 +342,25 @@ pub mod display {
     define_api_type! {
         @cfg "display";
         pub type AxDisplayInfo;
+        pub type AxDisplayError;
     }
 
     define_api! {
         @cfg "display";
         /// Gets the framebuffer information.
-        pub fn ax_framebuffer_info() -> AxDisplayInfo;
+        pub fn ax_framebuffer_info() -> Result<AxDisplayInfo, AxDisplayError>;
         /// Flushes the framebuffer, i.e. show on the screen.
-        pub fn ax_framebuffer_flush() -> bool;
+        pub fn ax_framebuffer_flush() -> Result<(), AxDisplayError>;
+    }
+
+    define_api! {
+        @cfg "display";
+        /// Accesses framebuffer bytes during the callback only.
+        ///
+        /// # Safety
+        ///
+        /// Exclude concurrent CPU and userspace mmap access and wait for GPU writes.
+        pub unsafe fn ax_with_framebuffer(access: &mut dyn FnMut(&mut [u8], AxDisplayInfo)) -> Result<(), AxDisplayError>;
     }
 }
 

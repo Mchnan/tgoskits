@@ -100,6 +100,148 @@ mod directory_functional_tests {
     use super::*;
 
     #[test]
+    fn directory_rename_traverses_indexed_parent_dotdot() {
+        let device = MockBlockDevice::new(64 * 1024 * 1024);
+        let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, true);
+        mkfs(&mut jbd2_dev).expect("mkfs failed");
+        let mut fs = Ext4FileSystem::mount(&mut jbd2_dev).expect("mount failed");
+        mkdir(&mut jbd2_dev, &mut fs, "/parent").unwrap();
+        for index in 0..30 {
+            let name = format!("/parent/{index:03}{}", "a".repeat(252));
+            mkfile(&mut jbd2_dev, &mut fs, &name, None, None).unwrap();
+        }
+        let (parent_ino, parent) = get_inode_with_num(&mut fs, &mut jbd2_dev, "/parent")
+            .unwrap()
+            .unwrap();
+        assert_ne!(parent.i_flags & Ext4Inode::EXT4_INDEX_FL, 0);
+        mkdir(&mut jbd2_dev, &mut fs, "/parent/staged").unwrap();
+        let outcome = rename(
+            &mut jbd2_dev,
+            &mut fs,
+            "/parent/staged",
+            "/parent/installed",
+            RenameOptions::REPLACE,
+        )
+        .expect("directory rename must find dotdot in the indexed parent root");
+        assert!(outcome.replaced.is_none());
+        assert!(
+            get_inode_with_num(&mut fs, &mut jbd2_dev, "/parent/staged")
+                .unwrap()
+                .is_none()
+        );
+        let (installed_ino, installed) =
+            get_inode_with_num(&mut fs, &mut jbd2_dev, "/parent/installed")
+                .unwrap()
+                .unwrap();
+        assert!(installed.is_dir());
+
+        mkdir(&mut jbd2_dev, &mut fs, "/destination").unwrap();
+        let (destination_ino, _) = get_inode_with_num(&mut fs, &mut jbd2_dev, "/destination")
+            .unwrap()
+            .unwrap();
+        umount(fs, &mut jbd2_dev).unwrap();
+        let services = MountServices::new(MockBlockDevice::new(0), (), NoopObserver);
+        let mut owned =
+            Ext4::mount(jbd2_dev.into_inner(), services, MountOptions::read_write()).unwrap();
+        let root = owned.root_inode();
+        for (name, expected) in [(b".".as_slice(), parent_ino), (b"..", root)] {
+            let entry = owned
+                .lookup_child(parent_ino, FileName::new(name).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.number, expected);
+        }
+        let error = owned
+            .rename(
+                root,
+                FileName::new(b"parent").unwrap(),
+                installed_ino,
+                FileName::new(b"cycle").unwrap(),
+                RenameOptions::REPLACE,
+            )
+            .expect_err("moving a directory into its descendant must reject the cycle");
+        assert_eq!(error.kind(), Ext4ErrorKind::InvalidInput);
+        let outcome = owned
+            .rename(
+                root,
+                FileName::new(b"parent").unwrap(),
+                destination_ino,
+                FileName::new(b"moved").unwrap(),
+                RenameOptions::REPLACE,
+            )
+            .expect("moving an indexed directory must rewrite its root parent entry");
+        assert!(outcome.replaced.is_none());
+        assert!(
+            owned
+                .lookup_child(root, FileName::new(b"parent").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let parent_entry = owned
+            .lookup_child(parent_ino, FileName::new(b"..").unwrap())
+            .expect("moved indexed directory must retain a valid root checksum")
+            .unwrap();
+        assert_eq!(parent_entry.number, destination_ino);
+    }
+
+    #[test]
+    fn indexed_directory_growth_accounts_for_extent_tree_blocks() {
+        use rsext4::extents_tree::{ExtentNode, ExtentTree};
+
+        let device = MockBlockDevice::new(64 * 1024 * 1024);
+        let mut journal = Jbd2Dev::initial_jbd2dev(0, device, true);
+        mkfs(&mut journal).expect("format directory accounting fixture");
+        let mut fs = Ext4FileSystem::mount(&mut journal).expect("mount accounting fixture");
+        let root = fs.root_inode;
+        let block_size = fs.superblock.block_size();
+        let huge_file = fs.superblock.has_feature_ro_compat(
+            rsext4::superblock::Ext4Superblock::EXT4_FEATURE_RO_COMPAT_HUGE_FILE,
+        );
+        let mut expected_sectors = None;
+        let payload = vec![0x5a; block_size as usize];
+
+        for index in 0..128 {
+            // Each real file allocates its payload before adding its directory
+            // entry. These owned blocks separate directory growth allocations,
+            // forcing extent fragmentation without orphaning allocated blocks.
+            let name = format!("/{index:03}{}", "a".repeat(252));
+            mkfile(&mut journal, &mut fs, &name, Some(&payload), None)
+                .expect("grow indexed directory through the public create path");
+            let mut inode = fs.get_inode_by_num(&mut journal, root).unwrap();
+            let tree = ExtentTree::with_filesystem(&mut inode, &fs, root)
+                .load_root_from_inode()
+                .unwrap();
+            let ExtentNode::Index { header, entries } = tree else {
+                continue;
+            };
+            assert_ne!(inode.i_flags & Ext4Inode::EXT4_INDEX_FL, 0);
+            assert_eq!(header.eh_depth, 1, "fixture stops at the first root split");
+            assert_eq!(entries.len(), 2, "the split must allocate both leaf blocks");
+            let sectors =
+                (inode.size().div_ceil(block_size) + entries.len() as u64) * (block_size / 512);
+            assert_eq!(
+                inode.blocks_count(block_size as u32, huge_file),
+                sectors,
+                "directory data accounting must retain extent-tree allocation increments"
+            );
+            expected_sectors = Some(sectors);
+            break;
+        }
+        let expected_sectors = expected_sectors.expect("fixture must split the inline extent root");
+
+        fs.umount(&mut journal)
+            .expect("persist directory accounting");
+        let mut journal = Jbd2Dev::initial_jbd2dev(0, journal.into_inner(), false);
+        let mut fs = Ext4FileSystem::mount(&mut journal).expect("remount directory accounting");
+        let inode = fs.get_inode_by_num(&mut journal, root).unwrap();
+        assert_eq!(
+            inode.blocks_count(block_size as u32, huge_file),
+            expected_sectors,
+            "the persisted inode must include both external extent blocks"
+        );
+    }
+
+    #[test]
     fn indexed_directory_link_count_uses_dir_nlink_sentinel_at_linux_limit() {
         let device = MockBlockDevice::new(100 * 1024 * 1024);
         let mut jbd2_dev = Jbd2Dev::initial_jbd2dev(0, device, true);
@@ -301,7 +443,17 @@ mod directory_functional_tests {
 
         // Empty directories should be removable.
         test_mkdir(&mut jbd2_dev, &mut fs, "/empty").expect("mkdir failed");
+        let (empty_ino, _) = get_inode_with_num(&mut fs, &mut jbd2_dev, "/empty")
+            .expect("lookup empty directory")
+            .expect("empty directory exists");
         delete_dir(&mut fs, &mut jbd2_dev, "/empty").expect("delete_dir failed");
+        let deleted = fs
+            .get_inode_by_num(&mut jbd2_dev, empty_ino)
+            .expect("load freed inode");
+        assert!(
+            !deleted.uses_extents() || deleted.i_block[0] & 0xffff == 0xf30a,
+            "freed directory must retain a valid mapping format for offline fsck"
+        );
 
         // `mkfile` currently recreates missing parents, so use that behavior as
         // the post-condition being documented here.

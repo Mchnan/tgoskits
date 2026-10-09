@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.5...ax-api-v0.8.6) - 2026-09-22
+
+### Other
+
+- updated the following local packages: ax-display, ax-runtime, ax-hal
+
+## [0.8.5](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.4...ax-api-v0.8.5) - 2026-09-21
+
+### Fixed
+
+- *(axvisor)* validate guest kernels and complete shell editing ([#2462](https://github.com/rcore-os/tgoskits/pull/2462))
+
+## [0.8.4](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.3...ax-api-v0.8.4) - 2026-09-18
+
+### Fixed
+
+- *(starry-kernel)* enforce executable inode write exclusion ([#2375](https://github.com/rcore-os/tgoskits/pull/2375))
+
 ## [0.8.3](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.2...ax-api-v0.8.3) - 2026-09-13
 
 ### Other

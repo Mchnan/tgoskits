@@ -31,7 +31,9 @@ use std::{
 use ax_cpumask::CpuMask;
 use ax_memory_addr::align_up_4k;
 use ax_std::os::arceos::sync::IrqSafeMutex;
-use axaddrspace::{AddrSpace, NestedPageTableOps};
+use axaddrspace::AddrSpace;
+#[cfg(not(target_arch = "aarch64"))]
+use axaddrspace::NestedPageTableOps;
 use axdevice::*;
 use axdevice_base::*;
 use axvm_types::*;
@@ -237,6 +239,7 @@ struct VcpuThreadRuntime {
 
 pub(crate) struct VcpuEventWaitSnapshot {
     notification_generation: usize,
+    target: Arc<crate::vcpu::VcpuRunState>,
 }
 
 pub(crate) fn wait_for_vcpu_event_if_idle(
@@ -263,7 +266,7 @@ pub(crate) fn wait_for_vcpu_event_if_idle_with(
     wait_until: impl FnOnce(&dyn Fn() -> bool),
 ) {
     let wake_condition =
-        || !vm_running() || wait_snapshot.has_pending_event(runtime) || additional_ready();
+        || !vm_running() || wait_snapshot.take_pending_event(runtime) || additional_ready();
     if wake_condition() {
         return;
     }
@@ -489,11 +492,7 @@ impl VmRuntimeHandle {
 
     pub(crate) fn kick_vcpu(&self, vcpu_id: usize) -> AxVmResult {
         let kick = self.vcpu_kick_handle(vcpu_id)?;
-        self.notify_all();
-        let exit_cpu = kick.kick_from_task(crate::host::task::current_cpu_id());
-        if let Some(cpu_id) = exit_cpu {
-            crate::host::task::send_ipi(cpu_id);
-        }
+        kick.kick_from_task();
         Ok(())
     }
 
@@ -501,11 +500,20 @@ impl VmRuntimeHandle {
     pub(crate) fn request_vcpu(&self, vcpu_id: usize) -> AxVmResult {
         let kick = self.vcpu_kick_handle(vcpu_id)?;
         kick.publish_entry_request();
+        kick.kick_from_task();
+        Ok(())
+    }
+
+    /// Publishes VM-wide work before waking the vCPU that owns its poll loop.
+    ///
+    /// The entry request must be visible before advancing the shared wait
+    /// generation. This closes the same predicate-to-park window as the KVM
+    /// request path while keeping ordinary target kicks isolated.
+    pub(crate) fn request_vcpu_for_vm_work(&self, vcpu_id: usize) -> AxVmResult {
+        let kick = self.vcpu_kick_handle(vcpu_id)?;
+        kick.publish_entry_request();
         self.notify_all();
-        let exit_cpu = kick.kick_from_task(crate::host::task::current_cpu_id());
-        if let Some(cpu_id) = exit_cpu {
-            crate::host::task::send_ipi(cpu_id);
-        }
+        kick.kick_from_task();
         Ok(())
     }
 
@@ -520,14 +528,8 @@ impl VmRuntimeHandle {
 
     fn deliver_kicks(&self, kicks: Vec<crate::runtime::VcpuKickHandle>) {
         self.notify_all();
-        if kicks.is_empty() {
-            return;
-        }
-        let current_cpu = crate::host::task::current_cpu_id();
         for kick in kicks {
-            if let Some(cpu_id) = kick.kick_from_task(current_cpu) {
-                crate::host::task::send_ipi(cpu_id);
-            }
+            kick.kick_from_task();
         }
     }
 
@@ -583,11 +585,30 @@ impl VmRuntimeHandle {
                 Ok(needs_kick)
             },
             || {
-                self.notify_all();
-                let exit_cpu = kick.kick_from_task(crate::host::task::current_cpu_id());
-                if let Some(cpu_id) = exit_cpu {
-                    crate::host::task::send_ipi(cpu_id);
-                }
+                kick.kick_from_task();
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn dispatch_legacy_pic_interrupt(&self, vcpu_id: usize, vector: u8) -> AxVmResult {
+        let (owner, kick) = self.vcpu_dispatch_target(vcpu_id)?;
+        dispatch_vcpu_interrupt_with(
+            || {
+                let needs_kick = self
+                    .irq_dispatcher
+                    .enqueue_legacy_pic(vcpu_id, owner, vector)
+                    .ok_or_else(|| {
+                        AxVmError::invalid_state(
+                            "dispatch legacy PIC interrupt",
+                            format_args!("vCPU {vcpu_id} task generation changed"),
+                        )
+                    })?;
+                Ok(needs_kick)
+            },
+            || {
+                kick.kick_from_task();
                 Ok(())
             },
         )
@@ -615,11 +636,34 @@ impl VmRuntimeHandle {
                 Ok(needs_kick)
             },
             || {
-                self.notify_all();
-                let exit_cpu = kick.kick_from_task(crate::host::task::current_cpu_id());
-                if let Some(cpu_id) = exit_cpu {
-                    crate::host::task::send_ipi(cpu_id);
-                }
+                kick.kick_from_task();
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub(crate) fn dispatch_external_vcpu_interrupt(
+        &self,
+        vcpu_id: usize,
+        vector: usize,
+    ) -> AxVmResult {
+        let (owner, kick) = self.vcpu_dispatch_target(vcpu_id)?;
+        dispatch_vcpu_interrupt_with(
+            || {
+                let needs_kick = self
+                    .irq_dispatcher
+                    .enqueue_external(vcpu_id, owner, vector)
+                    .ok_or_else(|| {
+                        AxVmError::invalid_state(
+                            "dispatch external vCPU interrupt",
+                            format_args!("vCPU {vcpu_id} task generation changed"),
+                        )
+                    })?;
+                Ok(needs_kick)
+            },
+            || {
+                kick.kick_from_task();
                 Ok(())
             },
         )
@@ -644,9 +688,13 @@ impl VmRuntimeHandle {
         self.notification_generation.load(Ordering::Acquire)
     }
 
-    pub(crate) fn vcpu_event_wait_snapshot(&self) -> VcpuEventWaitSnapshot {
+    pub(crate) fn vcpu_event_wait_snapshot(
+        &self,
+        target: Arc<crate::vcpu::VcpuRunState>,
+    ) -> VcpuEventWaitSnapshot {
         VcpuEventWaitSnapshot {
             notification_generation: self.notification_generation(),
+            target,
         }
     }
 
@@ -790,9 +838,10 @@ impl VmRuntimeHandle {
 }
 
 impl VcpuEventWaitSnapshot {
-    pub(crate) fn has_pending_event(&self, runtime: &VmRuntimeHandle) -> bool {
+    pub(crate) fn take_pending_event(&self, runtime: &VmRuntimeHandle) -> bool {
         runtime.device_poll_requested()
             || runtime.notification_generation() != self.notification_generation
+            || self.target.take_unblock_request()
     }
 }
 
@@ -998,13 +1047,17 @@ impl AxVMResources {
             .ok_or_else(|| ax_err_type!(BadState, "VM interrupt controller is not prepared"))
     }
 
-    fn reset_transient_resources(&mut self) -> AxVmResult {
+    /// Resets transient resources and returns the device set it detached.
+    ///
+    /// Callers run this under the IRQ-safe machine guard, so the returned
+    /// `Arc<DeviceRuntime>` must be dropped only after that guard is released:
+    /// dropping the last reference joins device worker threads (a file-backed
+    /// virtio-blk owns one), and joining blocks, which is not allowed with
+    /// interrupts disabled. On failure the device set stays attached to the
+    /// resource set so a later reset or destroy can retire it outside the
+    /// guard instead of dropping it here.
+    fn reset_transient_resources(&mut self) -> AxVmResult<Option<Arc<DeviceRuntime>>> {
         self.teardown_ivc_bindings()?;
-        if let Some(devices) = self.devices.take() {
-            devices
-                .reset_lifecycle_devices()
-                .map_err(|error| AxVmError::device("reset device lifecycle", error))?;
-        }
         let memory_regions = self.memory_regions.clone();
         self.address_space.clear();
         for region in &memory_regions {
@@ -1025,7 +1078,19 @@ impl AxVMResources {
         self.vcpu_list = None;
         self.interrupt_controller = None;
         self.address_layout = None;
-        Ok(())
+        // Detach the device set last: every step above can still fail, and an
+        // early return after the take would drop the set under the guard.
+        let devices = self.devices.take();
+        if let Some(Err(reset_error)) = devices
+            .as_ref()
+            .map(|devices| devices.reset_lifecycle_devices())
+        {
+            // Keep the set attached so it is retired by the next reset or by
+            // destroy rather than dropped here.
+            self.devices = devices;
+            return Err(AxVmError::device("reset device lifecycle", reset_error));
+        }
+        Ok(devices)
     }
 
     fn teardown_ivc_bindings(&mut self) -> AxVmResult {
@@ -1374,6 +1439,17 @@ pub struct AxVM {
     config: StdMutex<AxVMConfig>,
     /// Lifecycle and runtime state reached from both task and interrupt context.
     machine: IrqSafeMutex<Machine<AxVMResources, Arc<VmRuntimeHandle>>>,
+    /// Serializes [`AxVM::destroy`] for the whole operation.
+    ///
+    /// `destroy` commits `Destroyed` while holding the machine guard but runs
+    /// `cleanup_resource_set` after releasing it, and that cleanup mutates state
+    /// keyed by the VM id (global IVC channel teardown). Without this gate a
+    /// concurrent caller would observe `Destroyed` and return `Ok`, letting the
+    /// registry reuse the id while the first cleanup is still running, so the
+    /// old cleanup could tear down the replacement VM's bindings. Holding the
+    /// gate makes the documented synchronous completion contract true for every
+    /// caller: a successful `destroy` returns only after cleanup finished.
+    destroy_gate: StdMutex<()>,
     #[cfg(not(target_arch = "aarch64"))]
     translations: translation::TranslationGate,
     fw_cfg_payload: Arc<FwCfgPayloadSlot>,
@@ -1403,6 +1479,7 @@ impl AxVM {
             name,
             config: StdMutex::new(config),
             machine: IrqSafeMutex::new(Machine::Ready(resources)),
+            destroy_gate: StdMutex::new(()),
             #[cfg(not(target_arch = "aarch64"))]
             translations: translation::TranslationGate::new(),
             fw_cfg_payload,
@@ -1659,6 +1736,7 @@ impl AxVM {
     }
 
     /// Reads the immutable device graph resolved during architecture planning.
+    #[cfg(not(target_arch = "aarch64"))]
     pub(crate) fn with_planned_device_graph<F, R>(&self, f: F) -> AxVmResult<R>
     where
         F: FnOnce(&axdevice::ResolvedDeviceGraph) -> AxVmResult<R>,
@@ -1924,15 +2002,31 @@ impl AxVM {
 
     /// Resets the VM by discarding runtime-only state, rebuilding vCPUs/devices,
     /// and starting from a fresh `Running` state.
+    ///
+    /// A failed rebuild commits `Failed` and keeps the resource set attached to
+    /// it, so the VM is unreusable until `destroy()` retires that set outside the
+    /// machine guard.
     pub fn reset(self: &Arc<Self>) -> AxVmResult {
         info!("Resetting VM[{}]", self.id());
         self.stop_and_join_runtime(StopReason::Forced)?;
 
-        self.machine.lock().reset_with(|resources| {
-            resources
-                .reset_transient_resources()
-                .map_err(|error| AxVmError::resource_unavailable("reset resources", error))
-        })?;
+        // The closure reports the detached device set through `retired_devices`
+        // instead of a return value, which keeps `reset_with`'s released
+        // signature. On failure it returns early: the VM is left `Failed` with
+        // the resource set retained and the `?` below skips `prepare`/`start`.
+        let mut retired_devices = None;
+        {
+            let mut machine = self.machine.lock();
+            machine.reset_with(|resources| {
+                retired_devices = resources
+                    .reset_transient_resources()
+                    .map_err(|error| AxVmError::resource_unavailable("reset resources", error))?;
+                Ok(())
+            })?;
+        }
+        // The machine guard is released: retiring the detached device set can
+        // now join its worker threads.
+        drop(retired_devices);
         self.prepare()?;
         self.start()
     }
@@ -1998,6 +2092,7 @@ impl AxVM {
             .map_err(Into::into)
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     pub(crate) fn handle_nested_page_fault(
         &self,
         addr: GuestPhysAddr,
@@ -2013,6 +2108,7 @@ impl AxVM {
         .unwrap_or(false)
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     fn debug_nested_page_fault(
         vm_id: usize,
         resources: &AxVMResources,
@@ -2379,11 +2475,12 @@ impl AxVM {
         Ok(layout)
     }
 
-    /// Maps a reserved memory region for the VM.
+    /// Maps an explicitly configured identity region with the granted permissions.
     pub fn map_reserved_memory_region(
         &self,
         layout: Layout,
         gpa: Option<GuestPhysAddr>,
+        flags: MappingFlags,
     ) -> AxVmResult {
         assert!(
             layout.size() > 0,
@@ -2398,10 +2495,7 @@ impl AxVM {
                     gpa,
                     gpa.as_usize().into(),
                     layout.size(),
-                    MappingFlags::READ
-                        | MappingFlags::WRITE
-                        | MappingFlags::EXECUTE
-                        | MappingFlags::USER,
+                    flags | MappingFlags::USER,
                 )
                 .map_err(|error| AxVmError::from_addrspace("map reserved guest memory", error))?;
             let hva = gpa.as_usize().into();
@@ -2416,7 +2510,16 @@ impl AxVM {
     }
 
     /// Destroys the VM and releases all lifecycle-owned resources.
+    ///
+    /// The `Destroyed` state is committed while the machine guard is held, but
+    /// the resource cleanup below runs after it is released: a device teardown
+    /// may join a worker thread, which needs a scheduler safe point. The whole
+    /// operation holds [`Self::destroy_gate`], so a concurrent caller cannot
+    /// return before that cleanup finished.
     pub fn destroy(&self) -> AxVmResult {
+        // Hold the gate for the whole operation, including the resource cleanup
+        // below that runs after the machine guard is released.
+        let _gate = self.destroy_gate.lock_unpoisoned();
         let vm_id = self.id();
         match self.status() {
             VmStatus::Running | VmStatus::Paused | VmStatus::Stopping => {
@@ -2435,12 +2538,16 @@ impl AxVM {
                 self.stop_and_join_runtime(StopReason::Forced)?;
             }
         }
-        self.machine.lock().destroy_with(|resources| {
-            if let Some(mut resources) = resources {
-                Self::cleanup_resource_set(vm_id, &mut resources)?;
-            }
-            Ok(())
-        })
+        // Take the resources out under the machine guard, but destroy them after
+        // it is released. Device teardown can join a worker thread (a file-backed
+        // virtio-blk owns one) and joining blocks, which needs a scheduler safe
+        // point; the guard is IRQ-safe, so its whole critical section runs with
+        // interrupts disabled and the join would fail instead of waiting.
+        let mut resources = self.machine.lock().take_resources_for_destroy()?;
+        if let Some(resources) = resources.as_mut() {
+            Self::cleanup_resource_set(vm_id, resources)?;
+        }
+        Ok(())
     }
 
     fn cleanup_resource_set(vm_id: usize, resources: &mut AxVMResources) -> AxVmResult {
@@ -2828,7 +2935,7 @@ mod tests {
     #[test]
     fn vcpu_wake_before_park_is_observed_by_the_wait_generation() {
         let runtime = VmRuntimeHandle::new();
-        let snapshot = runtime.vcpu_event_wait_snapshot();
+        let snapshot = runtime.vcpu_event_wait_snapshot(Arc::new(crate::vcpu::VcpuRunState::new()));
         let entered_wait = AtomicBool::new(false);
 
         runtime.notify_all();
@@ -2846,9 +2953,32 @@ mod tests {
     }
 
     #[test]
+    fn targeted_notification_preserves_unrelated_wait_and_broadcast_releases_both() {
+        let runtime = VmRuntimeHandle::new();
+        let target = Arc::new(crate::vcpu::VcpuRunState::new());
+        let other = Arc::new(crate::vcpu::VcpuRunState::new());
+        let target_wait = runtime.vcpu_event_wait_snapshot(target.clone());
+        let other_wait = runtime.vcpu_event_wait_snapshot(other.clone());
+
+        target.request_unblock();
+        assert!(target_wait.take_pending_event(&runtime));
+        assert!(!other_wait.take_pending_event(&runtime));
+
+        let target_wait = runtime.vcpu_event_wait_snapshot(target.clone());
+        assert!(!target_wait.take_pending_event(&runtime));
+        target.request_unblock();
+        let target_wait = runtime.vcpu_event_wait_snapshot(target);
+        assert!(target_wait.take_pending_event(&runtime));
+        assert!(!target_wait.take_pending_event(&runtime));
+        runtime.notify_all();
+        assert!(target_wait.take_pending_event(&runtime));
+        assert!(other_wait.take_pending_event(&runtime));
+    }
+
+    #[test]
     fn timer_completion_before_park_is_observed_by_the_waiter() {
         let runtime = VmRuntimeHandle::new();
-        let snapshot = runtime.vcpu_event_wait_snapshot();
+        let snapshot = runtime.vcpu_event_wait_snapshot(Arc::new(crate::vcpu::VcpuRunState::new()));
         let completed = AtomicBool::new(true);
         let entered_wait = AtomicBool::new(false);
 
@@ -2866,7 +2996,7 @@ mod tests {
     #[test]
     fn timer_completion_at_the_park_boundary_is_rechecked() {
         let runtime = VmRuntimeHandle::new();
-        let snapshot = runtime.vcpu_event_wait_snapshot();
+        let snapshot = runtime.vcpu_event_wait_snapshot(Arc::new(crate::vcpu::VcpuRunState::new()));
         let completed = AtomicBool::new(false);
 
         wait_for_vcpu_event_if_idle_with(

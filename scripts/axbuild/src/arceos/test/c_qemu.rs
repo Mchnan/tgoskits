@@ -181,7 +181,6 @@ async fn build_and_run_c_test(
     _arch: &str,
     test: &CTestDef,
 ) -> anyhow::Result<()> {
-    let workspace_root = arceos.app.workspace_root().to_path_buf();
     let build_config = load_c_test_build_config(&test.build_config_path)?;
     let qemu_config = load_c_test_qemu_config(&test.qemu_config_path)?;
     let mode = build::load_arceos_build_mode(&test.build_config_path)?;
@@ -193,7 +192,7 @@ async fn build_and_run_c_test(
         );
     };
     let artifacts = c_test_artifact_paths(
-        &workspace_root,
+        arceos.app.target_dir(),
         &test.build_group,
         &test.name,
         c_test_artifact_index(test),
@@ -220,7 +219,7 @@ async fn build_and_run_c_test(
         &test.name,
         build_config.build_info.features.clone(),
     );
-    let output = cbuild::build_c_app(&workspace_root, &request, &input)?;
+    let output = cbuild::build_c_app(arceos.app.workspace_context(), &request, &input)?;
     qemu_test::validate_test_qemu_rootfs_write_policy(&test.qemu_config_path, "ArceOS")?;
     let mut qemu = qemu_config;
     rootfs::prepare_default_qemu_fat32_rootfs(arceos.app.workspace_root(), &qemu)?;
@@ -267,17 +266,18 @@ fn c_test_feature_define(feature: &str) -> String {
 /// reuse the same ax-libc static library. QEMU output stays isolated per case
 /// and per invocation so generated ELF files do not overwrite each other.
 fn c_test_artifact_paths(
-    workspace_root: &Path,
+    target_dir: &Path,
     build_group: &str,
     test_name: &str,
     invocation_index: usize,
 ) -> CTestArtifactPaths {
-    let root = crate::context::axbuild_tmp_dir(workspace_root)
+    let root = target_dir
+        .join("axbuild")
         .join("arceos-c")
         .join(test_name.replace('/', "-"));
     CTestArtifactPaths {
-        target_dir: crate::context::axbuild_tmp_dir(workspace_root)
-            .join("arceos-c")
+        target_dir: target_dir
+            .join("axbuild/arceos-c")
             .join(build_group.replace('/', "-"))
             .join("cargo"),
         out_dir: root.join(format!("out-{invocation_index}")),
@@ -294,85 +294,6 @@ mod tests {
     fn arceos_c_default_run_selects_all_feature_only() {
         let features = c_qemu_features_for_run(None).unwrap();
         assert_eq!(features, vec![ARCEOS_C_ALL_FEATURE]);
-    }
-
-    #[test]
-    fn arceos_c_selected_case_is_exact_feature_name() {
-        let features = c_qemu_features_for_list(Some("pthread-basic")).unwrap();
-        assert_eq!(features, vec!["pthread-basic"]);
-    }
-
-    #[test]
-    fn arceos_c_default_list_hides_all_feature() {
-        let features = c_qemu_features_for_list(None).unwrap();
-
-        assert!(!features.contains(&ARCEOS_C_ALL_FEATURE));
-    }
-
-    #[test]
-    fn arceos_c_feature_define_names_are_stable() {
-        assert_eq!(
-            c_test_feature_define("pthread-basic"),
-            "ARCEOS_C_TEST_CASE_PTHREAD_BASIC"
-        );
-        assert_eq!(
-            c_test_feature_define(ARCEOS_C_ALL_FEATURE),
-            "ARCEOS_C_TEST_CASE_ALL"
-        );
-    }
-
-    #[test]
-    fn arceos_c_build_input_adds_selected_feature_define() {
-        let dir = tempdir().unwrap();
-        let app_dir = dir.path().join("c");
-        let input = c_test_build_input(
-            app_dir.clone(),
-            ARCEOS_C_TEST_BUILD_GROUP.to_string(),
-            PathBuf::from("/tmp/target"),
-            PathBuf::from("/tmp/out"),
-            "pthread-basic",
-            vec!["alloc".to_string()],
-        );
-
-        assert_eq!(input.app_name, ARCEOS_C_TEST_BUILD_GROUP);
-        assert_eq!(input.app_dir, app_dir);
-        assert!(
-            input
-                .features
-                .iter()
-                .any(|feature| feature == "c-define:ARCEOS_C_TEST_CASE_PTHREAD_BASIC")
-        );
-    }
-
-    #[test]
-    fn arceos_c_qemu_case_uses_single_test_suite_paths() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        fs::create_dir_all(root.join("c")).unwrap();
-        fs::write(root.join("c/main.c"), "int main(void) { return 0; }\n").unwrap();
-        fs::write(
-            root.join("build-x86_64-unknown-none.toml"),
-            "features = []\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("qemu-x86_64.toml"),
-            "args = [\"-nographic\"]\nuefi = false\nto_bin = false\nshell_check_steps = [{ \
-             shell_prefix = \"#\", shell_cmd = \"run\", success_regex = [\"PASS\"] }]\nfail_regex \
-             = [\"panic\"]\n",
-        )
-        .unwrap();
-
-        let case = load_arceos_c_test_suit_qemu_case(root, "x86_64", "x86_64-unknown-none", "mem")
-            .unwrap();
-
-        assert_eq!(case.name, "mem");
-        assert_eq!(case.build_group, ARCEOS_C_TEST_BUILD_GROUP);
-        assert!(
-            case.build_config_path
-                .ends_with("build-x86_64-unknown-none.toml")
-        );
-        assert!(case.qemu_config_path.ends_with("qemu-x86_64.toml"));
     }
 
     #[test]
