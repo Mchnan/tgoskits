@@ -424,3 +424,60 @@ fence 所属 queue 与当时在途工作；对照宿主 MoltenVK 直测复现脚
   `/proc/1/comm` 直读可用；`/proc/<pid>` 需已知 pid。
 - debugfs 注入后必须回读校验 MD5；`inject-denial-full.py` 的 stdout
   摘要不是命令清单（清单固定写在 `/tmp/debugfs-denial-full.txt`）。
+
+## 黑屏归因与 MoltenVK 内部卡点（2026-10-10，第八轮，Cocoa 现场呈现轮）
+
+第八轮按用户现场提示（Cocoa 窗口黑屏 + llvmpipe 对照组窗口 1280x800、图标不同）
+用 Cocoa 直显复现并逐层归因。环境事实先记：对照组是 brew QEMU（图标不同源）
++ 2D virtio-gpu EDID 的 1280x800 模式；venus 栈是自建 QEMU（`~/venus-stack/src/
+qemu/build`），venus 模式 640x480——窗口尺寸与图标差异只是二进制与模式集不同。
+
+### 黑屏逐层归因（全部实证）
+
+1. **monitor `screendump` 像素分析**：修复前 100% 纯黑；各修复轮后稳定为
+   684 个纯灰 rgb(170,170,170) 像素（固定位置、跨配置不变）——QEMU 的
+   blob scanout 零拷贝直读资源内存（`virtio-gpu-virgl.c` 非 GL console 路径），
+   所以这就是 scanout 资源的真实内容。
+2. **MVK shader 编译失败实锤**：`MVK_CONFIG_LOG_LEVEL=3 +
+   MVK_CONFIG_REDIRECT_LOGGING_TO_STDERR=1` 后当场抓获——
+   `[mvk-error] VK_ERROR_INITIALIZATION_FAILED: Shader library compile failed`，
+   Metal 报 `texture2d<float> sampler [[id(0)]]` 遮蔽 MSL `sampler` 类型，
+   下一行 `sampler samplerSmplr [[id(1)]]` 编译失败。skia 的 GLSL uniform
+   就叫 "sampler"，旧 SPIRV-Cross 未把 "sampler" 列入 MSL 保留字。
+3. **名字来源排除**：vkr 侧对 `vkCreateShaderModule` 做 SPIR-V 调试名剥离
+   （OpName/OpMemberName/OpLine 原地压缩，18 个 module 生效）与首字母改写
+   （136 处生效）、落盘 SPIR-V 用 python 解析确认失败 module 内 **零处
+   "sampler"**、`MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0` 关参数缓冲——
+   错误原样。结论：1.4.2 捆绑的 SPIRV-Cross 对 combined image sampler
+   **内部生成** "sampler"/"samplerSmplr" 名字，与 OpName 无关；上游 main
+   的 `CompilerMSL::get_reserved_keyword_set()` 已把 "sampler" 与全部
+   texture 类型名列入保留字（注释与本轮错误一字不差），**1.4.2 未包含**。
+4. **撤掉去 cache 重试**：第二次 `vkCreatePipelineCache` 会把 ring 线程
+   卡死在驱动调用内部（失败日志后零解析行、零 retry 日志），比 stub 更
+   危险，已回退为直接 null stub 并留注释。
+5. **更深的冻结点**：每轮 ~6 秒合成器 phase=1000（dispatch 内）冻结、
+   内核 stall 告警 `syncobj 11 等待 queue=[122,124] 永不 retire`，而宿主
+   vkr sync 线程**零 3s 超时日志**（dylib 已含日志）→ ring 解析行在冻结
+   时刻停止 → **ring 线程卡死在某个 ring 分发的 MoltenVK 调用内部、持有
+   queue vk_mutex**，堵死 sync 线程与 fence retire。已排除：跨队列信号量
+   风格（`MVK_CONFIG_VK_SEMAPHORE_SUPPORT_STYLE=0` SINGLE_QUEUE 无效）、
+   参数缓冲模式。lldb 附加被 macOS 安全策略拒绝，调用级卡点待下轮。
+
+### 本轮落地的 vkr 改动（darwin-venus 本地栈，未提交前状态）
+
+- SPIR-V 调试名剥离 + 首字母改写（保留两种模式待上 with-Xcode 机器复验）
+- 小 module SPIR-V 落盘探针（/tmp/spv/）+ OpName 字符串日志
+- `vkCreatePipelineCache`/`vkCreateGraphicsPipelines` 失败 null stub 与
+  「禁止 retry」注释；`vkCmdBindPipeline` null 跳过；无 pipeline draw/
+  dispatch 跳过转发；vkr-queue sync 线程 3s 超时停滞日志
+- 结论性修复路径：**在带完整 Xcode 的机器上用上游 main 的 SPIRV-Cross
+  构建 MoltenVK**（fetchDependencies 拉取含修复的版本），预期同时消除
+  shader 编译失败与（若卡点在被拒 shader 的下游）ring 内部阻塞。
+
+### 现场状态（第八轮收官）
+
+Cocoa 窗口呈现：denial 桌面初始帧（684 灰像素的 shell 起步帧），ring
+存活、pipeline 全真（stub=0 的轮次）、初始帧 deadline 17.4ms；内容帧被
+MoltenVK 内部卡点挡住。全部仪表（monitor screendump / MVK 日志 / 内核
+TEMP-PROBE / vkr-instr / SPIR-V 落盘）就位，第八轮已把黑屏从「不明」
+收敛为「上游 SPIRV-Cross 保留字缺失 + MoltenVK 内部阻塞」两件事。
