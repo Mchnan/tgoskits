@@ -339,15 +339,23 @@ pub trait VirtioGpu3D: Send + Sync {
     /// `SUBMIT_3D`. With `fence` the command carries the fence flag and the
     /// call returns as soon as the command is queued — the host retires a
     /// fenced response on its own schedule, so waiting for it would stall the
-    /// control queue. Without a fence the host answers immediately and the call
-    /// waits for that answer.
+    /// control queue. The returned id names the submission and is reported by
+    /// [`VirtioGpu3D::take_retired_fences`] once the host's retire response
+    /// has been consumed. Without a fence the host answers immediately and the
+    /// call waits for that answer; the returned id is `0` (unfenced).
     fn submit_3d(
         &self,
         ctx_id: u32,
         cmd: &[u8],
         ring_idx: Option<u8>,
         fence: bool,
-    ) -> Result<(), Error>;
+    ) -> Result<u64, Error>;
+
+    /// Drains completed control responses and returns the ids of the fenced
+    /// `SUBMIT_3D` submissions the host has retired since the last call, in
+    /// retire order. A response nobody drains would otherwise stall the
+    /// pending FIFO, so callers relying on fence retirement must poll this.
+    fn take_retired_fences(&self) -> alloc::vec::Vec<u64>;
 
     /// `SET_SCANOUT_BLOB` — display a blob resource on a scanout. The host
     /// references the blob's backing memory in place (zero copy). `res_id == 0`
@@ -438,12 +446,16 @@ impl<H: Hal + 'static, T: Transport + 'static> VirtioGpu3D for VirtIoGpu<H, T> {
         cmd: &[u8],
         ring_idx: Option<u8>,
         fence: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         if fence {
-            VirtIoGpu::submit_3d_deferred(self, ctx_id, cmd, ring_idx).map(|_| ())
+            VirtIoGpu::submit_3d_deferred(self, ctx_id, cmd, ring_idx)
         } else {
-            VirtIoGpu::submit_3d_unfenced(self, ctx_id, cmd)
+            VirtIoGpu::submit_3d_unfenced(self, ctx_id, cmd).map(|_| 0)
         }
+    }
+
+    fn take_retired_fences(&self) -> alloc::vec::Vec<u64> {
+        VirtIoGpu::take_retired_fences(self)
     }
 
     fn set_scanout_blob(&self, params: ScanoutBlobParams) -> Result<(), Error> {

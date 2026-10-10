@@ -27,7 +27,11 @@
 //!   `VIRTGPU_EXECBUF_FENCE_FD_IN/OUT` stay `ENOSYS`; venus uses the timeline
 //!   path exclusively.
 
-use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+    vec, vec::Vec,
+};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr, PhysAddrRange};
@@ -176,10 +180,35 @@ pub(crate) struct Vgpu {
     /// path can resolve an fb's backing after the creating ioctl returned;
     /// lookups still check `owner`.
     resources: Mutex<BTreeMap<u32, VgpuResource>>,
+    /// Out-syncobjs of fenced submissions awaiting their host retire
+    /// response, keyed by the device fence id. Linux signals a venus
+    /// out-syncobj only when the fenced `SUBMIT_3D` response lands (the host
+    /// has consumed the submission); signalling at submit time instead lets
+    /// the guest lap the venus ring, which corrupts the host command stream.
+    pending_retires: Mutex<PendingRetires>,
     /// Lazily enumerated `(capset_id, max_version, max_size)` list.
     capsets: Mutex<Option<Vec<(u32, u32, u32)>>>,
     /// Cached GET_CAPSET payloads keyed by `(id, version)`.
     capset_cache: Mutex<CapsetCache>,
+}
+
+/// Out-syncobjs registered against one fenced `SUBMIT_3D`.
+#[derive(Debug)]
+struct PendingRetire {
+    fence_id: u64,
+    owner: u64,
+    syncobjs: Vec<(u32, u64)>,
+}
+
+/// Retire bookkeeping. `orphan_ids` holds fence ids whose host response
+/// landed before the submitting thread could register its out-syncobjs: a
+/// concurrent pump consumed the response while `handle_execbuffer` sat
+/// between `submit_3d` returning the id and the registry push. Dropping
+/// those ids would leave their waiters spinning forever.
+#[derive(Debug, Default)]
+struct PendingRetires {
+    queue: VecDeque<PendingRetire>,
+    orphan_ids: Vec<u64>,
 }
 
 impl Vgpu {
@@ -191,6 +220,10 @@ impl Vgpu {
             fds: Mutex::new(BTreeMap::new()),
             syncobjs: Mutex::new(BTreeMap::new()),
             resources: Mutex::new(BTreeMap::new()),
+            pending_retires: Mutex::new(PendingRetires {
+                queue: VecDeque::new(),
+                orphan_ids: Vec::new(),
+            }),
             capsets: Mutex::new(None),
             capset_cache: Mutex::new(BTreeMap::new()),
         }
@@ -691,27 +724,149 @@ impl Vgpu {
             }
         }
 
+        // Validate the out-syncobj handles before submitting (Linux checks
+        // them up front): a queued submit with a dangling handle would never
+        // signal anything once its retire response lands.
+        if !out_syncobjs.is_empty() {
+            let syncobjs = self.syncobjs.lock();
+            for (handle, _) in &out_syncobjs {
+                if !syncobjs.contains_key(&(owner, *handle)) {
+                    return Err(VfsError::NotFound);
+                }
+            }
+        }
+
         // Linux fences EVERY execbuffer (virtio_gpu_execbuffer_ioctl always
         // allocates an out-fence, and the ring idx rides on it). For a venus
         // context the host defers the SUBMIT_3D response to fence retire
         // regardless, so an unfenced submit would block forever on the
         // synchronous round-trip.
         let fence = true;
-        if let Err(err) = self.dev()?.submit_3d(ctx_id, cmd, ring_idx, fence) {
-            warn!(
-                "vgpu: submit_3d failed: {err:?} (ctx={ctx_id} size={} ring={ring_idx:?} out={})",
-                args.size,
-                out_syncobjs.len()
-            );
-            return Err(vfs_err(err));
-        }
+        let fence_id = match self.dev()?.submit_3d(ctx_id, cmd, ring_idx, fence) {
+            Ok(fence_id) => fence_id,
+            Err(err) => {
+                warn!(
+                    "vgpu: submit_3d failed: {err:?} (ctx={ctx_id} size={} ring={ring_idx:?} out={})",
+                    args.size,
+                    out_syncobjs.len()
+                );
+                return Err(vfs_err(err));
+            }
+        };
 
+        // The out-syncobjs signal when the HOST's retire response for this
+        // fence lands (`pump_retired_fences`), not at submit time: the guest
+        // reads a retired fence as "the host consumed my submission", so an
+        // early signal lets it lap the venus ring and corrupt the host
+        // command stream. Collect first, then drain anything already
+        // completed (this fence included if the host answered inline).
+        if !out_syncobjs.is_empty() {
+            let mut pending = self.pending_retires.lock();
+            if let Some(pos) = pending
+                .orphan_ids
+                .iter()
+                .position(|&id| id == fence_id)
+            {
+                // The host retired this fence while this thread was between
+                // submit and registration; signal immediately.
+                pending.orphan_ids.remove(pos);
+                drop(pending);
+                self.signal_out_syncobjs(owner, out_syncobjs);
+            } else {
+                pending.queue.push_back(PendingRetire {
+                    fence_id,
+                    owner,
+                    syncobjs: out_syncobjs,
+                });
+                drop(pending);
+            }
+        }
+        self.pump_retired_fences();
+        Ok(0)
+    }
+
+    /// Drains host retire responses and signals the out-syncobjs whose
+    /// submissions they complete.
+    ///
+    /// Every fenced `SUBMIT_3D` carries the fence flag, so its response is
+    /// what the virtio-gpu spec defines as fence retirement: the host has
+    /// consumed the submission. Anyone observing venus progress — syncobj
+    /// waits, sync-file exports, later submits — must pump here routinely;
+    /// a response nobody drains would stall the device pending FIFO.
+    fn pump_retired_fences(&self) {
+        let retired = match self.dev() {
+            Ok(dev) => dev.take_retired_fences(),
+            Err(_) => return,
+        };
+        if retired.is_empty() {
+            return;
+        }
+        let mut pending = self.pending_retires.lock();
+        info!(
+            "vgpu: pump retired {:?} (queue={:?} orphans={:?})",
+            retired, pending.queue, pending.orphan_ids
+        );
         let syncobjs = self.syncobjs.lock();
         let mut woken: Vec<Arc<crate::file::event::EventFd>> = Vec::new();
         let mut woken_files: Vec<Arc<SyncFile>> = Vec::new();
-        for (handle, point) in out_syncobjs {
+        let mut orphan_ids: Vec<u64> = Vec::new();
+        for fence_id in retired {
+            let Some(index) = pending
+                .queue
+                .iter()
+                .position(|entry| entry.fence_id == fence_id)
+            else {
+                // The submitter has not registered its out-syncobjs yet (see
+                // `PendingRetires::orphan_ids`); retain the id for it.
+                orphan_ids.push(fence_id);
+                continue;
+            };
+            let entry = pending
+                .queue
+                .remove(index)
+                .expect("position just matched");
+            for (handle, point) in entry.syncobjs {
+                let Some(state) = syncobjs.get(&(entry.owner, handle)).cloned() else {
+                    continue;
+                };
+                let mut state = state.lock();
+                state.signaled_point = state.signaled_point.max(point);
+                let mut i = 0;
+                while i < state.eventfds.len() {
+                    if state.signaled_point >= state.eventfds[i].0 {
+                        woken.push(state.eventfds.swap_remove(i).1);
+                    } else {
+                        i += 1;
+                    }
+                }
+                let mut j = 0;
+                while j < state.sync_files.len() {
+                    if state.signaled_point >= state.sync_files[j].0 {
+                        woken_files.push(state.sync_files.swap_remove(j).1);
+                    } else {
+                        j += 1;
+                    }
+                }
+            }
+        }
+        pending.orphan_ids.extend(orphan_ids);
+        drop(syncobjs);
+        drop(pending);
+        // Signal outside the syncobj table lock.
+        self.signal_eventfds(&woken);
+        for file in woken_files {
+            file.mark_signaled();
+        }
+    }
+
+    /// Advances the out-syncobjs of one submission and wakes its sleepers.
+    fn signal_out_syncobjs(&self, owner: u64, syncobjs_list: Vec<(u32, u64)>) {
+        let syncobjs = self.syncobjs.lock();
+        let mut woken: Vec<Arc<crate::file::event::EventFd>> = Vec::new();
+        let mut woken_files: Vec<Arc<SyncFile>> = Vec::new();
+        for (handle, point) in syncobjs_list {
             let Some(state) = syncobjs.get(&(owner, handle)).cloned() else {
-                return Err(VfsError::NotFound);
+                continue;
             };
             let mut state = state.lock();
             state.signaled_point = state.signaled_point.max(point);
@@ -733,12 +888,10 @@ impl Vgpu {
             }
         }
         drop(syncobjs);
-        // Signal outside the syncobj table lock.
         self.signal_eventfds(&woken);
         for file in woken_files {
             file.mark_signaled();
         }
-        Ok(0)
     }
 
     /// Signals a batch of eventfds collected under a syncobj lock.
@@ -940,6 +1093,9 @@ impl Vgpu {
             args.count_handles as usize,
         )
         .map_err(|_| VfsError::BadAddress)?;
+        // Retire responses may have landed since the last submit; drain them
+        // so a query observes the current watermark.
+        self.pump_retired_fences();
         let states = self.lookup_syncobjs(owner, &handles)?;
         for (i, state) in states.iter().enumerate() {
             let point = state.lock().signaled_point;
@@ -1117,6 +1273,9 @@ impl Vgpu {
         if args.flags & !EXPORT_SYNC_FILE != 0 {
             return Some(Err(VfsError::InvalidInput));
         }
+        // Drain retire responses first: exporting a point the host already
+        // retired must produce a signaled file, not a pending registration.
+        self.pump_retired_fences();
         let state = self
             .syncobjs
             .lock()
@@ -1211,17 +1370,34 @@ impl Vgpu {
         // the flag Linux rejects unknown-future waits with EINVAL.
         let allow_block = args.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0;
         let start = ax_runtime::hal::time::monotonic_time_nanos();
+        let mut stall_warned = false;
         loop {
+            // Drain host retire responses so a parked wait can observe
+            // progress made while this thread slept between checks.
+            self.pump_retired_fences();
             if check()? {
                 return Ok(0);
             }
             if !allow_block {
                 return Err(VfsError::InvalidInput);
             }
-            if ax_runtime::hal::time::monotonic_time_nanos().saturating_sub(start)
-                >= args.timeout_nsec
-            {
+            let now = ax_runtime::hal::time::monotonic_time_nanos();
+            if now.saturating_sub(start) >= args.timeout_nsec {
                 return Err(VfsError::TimedOut);
+            }
+            // TEMP-PROBE: see the timeline-wait stall warning.
+            if !stall_warned && now.saturating_sub(start) > 1_000_000_000 {
+                stall_warned = true;
+                let pts: Vec<u64> = states
+                    .iter()
+                    .map(|state| state.lock().signaled_point)
+                    .collect();
+                let pending = self.pending_retires.lock();
+                let fence_ids: Vec<u64> = pending.queue.iter().map(|e| e.fence_id).collect();
+                warn!(
+                    "vgpu: binary syncobj wait spinning >1s (wait={:?} timeout={}ns queue={:?} orphans={:?})",
+                    pts, args.timeout_nsec, fence_ids, pending.orphan_ids
+                );
             }
             yield_now();
         }
@@ -1263,17 +1439,30 @@ impl Vgpu {
 
         let allow_block = args.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0;
         let start = ax_runtime::hal::time::monotonic_time_nanos();
+        let mut stall_warned = false;
         loop {
+            // Drain host retire responses so a parked wait can observe
+            // progress made while this thread slept between checks.
+            self.pump_retired_fences();
             if check()? {
                 return Ok(0);
             }
             if !allow_block {
                 return Err(VfsError::InvalidInput);
             }
-            if ax_runtime::hal::time::monotonic_time_nanos().saturating_sub(start)
-                >= args.timeout_nsec.unsigned_abs()
-            {
+            let now = ax_runtime::hal::time::monotonic_time_nanos();
+            if now.saturating_sub(start) >= args.timeout_nsec.unsigned_abs() {
                 return Err(VfsError::TimedOut);
+            }
+            // TEMP-PROBE: a wait spinning past one second means the host retire
+            // responses for its fence are not arriving (or nobody pumps them);
+            // this is the signature of a venus-side fence stall.
+            if !stall_warned && now.saturating_sub(start) > 1_000_000_000 {
+                stall_warned = true;
+                warn!(
+                    "vgpu: syncobj wait spinning >1s (handles={:?} timeout={}ns)",
+                    handles, args.timeout_nsec
+                );
             }
             yield_now();
         }

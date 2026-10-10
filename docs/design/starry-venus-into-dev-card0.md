@@ -258,3 +258,169 @@ AGENTS.md §3 含 9-24 时代的完整调试记忆。基于源码把黑屏根因
 5. **60Hz 结论**：llvmpipe 4 线程 raster 实测 20–32ms/帧超 16.6ms 预算
    （上限 <40fps），60Hz 必须 zink；调度节拍 60Hz、管线与内核链路均就绪，
    引擎 present 链修复后立即可测。
+
+## 端到端复测：present 链复活与 Rendering 卡槽复发（2026-10-08，第六轮）
+
+第六轮在 StarryOS dev card0 + venus + zink + skia 全栈上端到端复测了
+Phase 42 的 `--denial-gl-fbo-zero-is-no-target` 无条件传递修复。结论：
+**修复生效，引擎 present 链五轮以来首次复活；但出帧 3 秒共 3 次后，
+(output, buffer 1) 卡 `(Rendering,0)` 复发，授权断供停摆**。
+
+### 复测证据（全部来自 deniald 自身 render_audit）
+
+- **present 回调复活**：`present_callback_avg_us=1271.5`
+  （第一轮 audit 16455.8 是首个首帧冷启动值；第五轮记录的基线是 0.0——
+  引擎从不调用 root present）。presented_outputs=2。
+- **输出管线全链路活跃**：`ready_published=3 ready_with_fence=3
+  fence_signals=3 real_submissions=3 volition_scheduled_submissions=3
+  presentations=3`；`missed_vblanks=0`。
+- **zink GPU raster 真实出力**：`gpu_render_samples=1
+  gpu_flutter_render_avg_us=7.4 gpu_scanout_blit_avg_us=4.3
+  gpu_frame_avg_us=11.7 gpu_timer_disjoint=1`。
+- **活动窗口内帧率**：`presentation_interval_p50=79188µs`（≈12.6fps），
+  `deadline_to_presentation_p50=28–37ms`，`target_late_p99=282ms`
+  ——离 16.6ms 预算还有约 5 倍差距，且是事件驱动的稀疏帧。
+
+### 停摆形态（00:22:23–25 活动约 3 秒后）
+
+- 00:22:23.358 起 pools 稳态 `[(Free,1),(Rendering,0),(Free,0)]`
+  （第 2 个 buffer 借出后永不归还）；`target unavailable` 共 40 次；
+  `backing store acquire failed reason="no authorization"`
+  （`target_blocked_exhausted`）；`stale_ready: 2`；
+  dd.log 在 00:22:25.813 后零增长（六分钟观察）。
+- 附带：Xwayland SIGABRT（llvmpipe 时期同形态，非本轮引入）；
+  compositor 线程超实时预算被降级一次。
+
+### 根因收敛
+
+第四轮「deniald 状态机与内核 UAPI 全部正常」的结论要加边界：**在
+present 从不发生的前提下**成立。present 复活后暴露出新的断点：
+**present 后的 buffer release/fence 归还路径**——第 2 个 buffer 在
+raster 提交后永卡 Rendering，`target_available()` 的「全部 Free」
+条件永久失效。头号嫌疑是内核 syncobj fence 完成语义（submit 即置位
+out-syncobj、不等宿主 Metal 完成，§9.11 旧账）与 vkr release fence
+未回流 deniald 的组合：deniald 等的 buffer-fence 信号要么永不来、
+要么来得太早使回收判据失真。下一手：在 deniald 侧 dump 每个池
+buffer 的 fence fd 与 poll 结果时间线，对照内核 vgpu syncobj 的
+水位推进记录。
+
+### 栈环境考古（本轮新增，给下一轮）
+
+- **denial-full rootfs 镜像注入的 journal 回滚坑**：镜像带未回放
+  ext4 journal 时，debugfs `rm`+`write` 的写入会在下次挂载时被日志
+  回放吞掉（表现为「注入成功、引导后回旧」）。先 `e2fsck -fy` 清日志；
+  彻底方案 `tune2fs -O ^has_journal` 移除 journal 后注入即稳定。
+- **denial-full 镜像缺 mesa vulkan 栈**：zink 需要
+  `libvulkan.so.1`（vulkan-loader 1.4.360）+ `libvulkan_virtio.so`
+  + `virtio_icd.aarch64.json`（mesa-vulkan-virtio）+ `libgallium`
+  26.2.3 + `libLLVM.so.23.1` + libdrm 2.4.134 + `libdisplay-info.so.3`
+  ——全部可从 `~/venus-stack/mirror/aarch64/*.apk` 解包注入
+  （`tar -xzf` apk 即可）。libdrm 覆盖时注意镜像内文件名是
+  `.so.1.131.0` 而 symlink 指向它：把 134 内容写到 131 文件名上，
+  别新增 134 文件名。
+- **e2e 直启形态**：`init=/root/e2e-run.sh`（镜像内脚本：设
+  HOME/zink 环境变量、写 /root/.drirc、后台起 deniald skia、
+  watcher 每 30s 把 dd.log 快照 POST 到 10.0.2.2:8000）——绕开
+  串口丢字，取证全走 HTTP。
+- **arm64 构建 VM（SSH 隧道 :2222）重启命令**（无现成启动脚本，本轮逆向还原）：
+  `cd ~/arm64-buildVM && qemu-system-aarch64 -machine virt,highmem=on -cpu host
+  -accel hvf -smp 8 -m 12G -drive file=vm.qcow2,if=virtio,format=qcow2
+  -drive if=virtio,format=raw,file=seed.iso
+  -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd
+  -device virtio-net-pci,netdev=net0
+  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22
+  -display none -serial file:serial-relaunch.log -pidfile vm.pid`，
+  SSH 用 `ssh -i ~/.ssh/arm64build -p 2222 build@127.0.0.1`。修复版
+  deniald 在 `~/denial/compositor/target/release/deniald`（构建机内），
+  拉回后经 staging/guest 树 + `inject-denial-full.py` + debugfs 注入镜像。
+
+## 端到端闭环推进：ring 死亡根因闭合与持续存活（2026-10-10，第七轮）
+
+第六轮的「present 后 Rendering 卡槽」在本轮收敛为**下游症状**；真正的断点是
+**宿主 vkr ring 线程在 ~3 秒处死亡**（`vkCreateGraphicsPipelines CS error →
+vn_dispatch_command failed → ring exiting ret=-22`），GPU 通道死后 deniald
+全线静默。本轮把这一链路修到**桌面持续存活 5 分钟以上**（此前 3–10 秒必停）。
+
+### 根因链（逐环实证）
+
+1. **MoltenVK 偶发拒绝对象创建**：`vkCreatePipelineCache`/
+   `vkCreateGraphicsPipelines` 在运行 ~4 秒处以 `VK_ERROR_INITIALIZATION_
+   FAILED`（-3）失败（vkr 侧加日志实锤：`id=311 NOT added (ret=-3)`）。
+   同型失败的 cache 与引用它的 pipeline 总在同批出现——怀疑 cache 的
+   initialData 毒化两者（去 cache 重试路径已备，但失败本身是时序相关的
+   偶发，非每轮复现）。
+2. **mesa venus 异步创建不读响应**：guest 对 cache 走
+   `vn_async_vkCreatePipelineCache`（pipeline 在 target_ring==primary_ring
+   时同样 async）——宿主失败对 guest 完全不可见，guest 继续引用幽灵句柄。
+3. **宿主查表失败即 fatal**：`vkr_cs_decoder_lookup_object` 落空 →
+   `vkr_cs_decoder_set_fatal` → ring 线程退出 → GPU 通道死亡。
+4. **deniald 全线静默**：GPU 等待永不完成 → raster 卡死（内核侧
+   `syncobj wait spinning timeout=i64::MAX` 实锤）→ 合成器在 phase 51
+   （runtime 调用，等引擎锁）停住 → 主循环冻结。心跳线程（独立
+   sleep+文件追加）活到进程被人为停止——「日志全停」≠「进程死亡」。
+
+### 修复（两层）
+
+**vkr 兼容层**（`~/venus-stack/src/virglrenderer`，darwin 本地栈）：
+- 对象创建失败不再静默：cache 失败绑 `VK_NULL_HANDLE` stub（null cache
+  传给 pipeline 创建合法）；graphics/compute pipeline 失败先**去 cache
+  重试一次**（疑似 initialData 毒化的针对性处置），仍失败则按捕获的
+  guest id 绑 null stub（必须**先捕获 id**——生成的失败路径会把
+  `args->pPipelines` 槽位清零，用 0 注册会触发对象表 fatal）。
+- `vkCmdBindPipeline` 遇 null 跳过驱动调用并记录绑定状态；
+  `vkCmdDraw*`/`vkCmdDispatch*` 在对应 bind point 无 pipeline 时跳过
+  转发（防止无效 draw 毒化 command buffer）。
+- TEMP-INSTR 日志保留（`vkr-instr:` 前缀）。
+
+**内核 fence 语义**（`local/venus-into-dev-0924` 新增，9 文件之外）：
+- §9.11 旧账的正确闭合：`handle_execbuffer` 不再 submit 即置位
+  out-syncobj——登记到 `pending_retires`（按设备 fence_id 键控），
+  设备层新增 `take_retired_fences()`（drain_completed 弹出 fenced 项时
+  收集 retire 的 fence_id），pump 在 execbuffer/wait/query/export 各入口
+  统一推进水位并唤醒 eventfds/sync_files。
+- **orphan retire 竞态修复**：submit 返回 fence_id 与注册表 push 之间，
+  并发 pump 可能先消费该 fence 的 retire 响应——pump 不丢弃未匹配 id，
+  暂存 `orphan_ids`，注册时命中立即置位（实测 orphans 里全是 ring kick
+  的 fence，属正常无主 retirement）。
+- WAIT 循环加 >1s 停滞告警（TEMP-PROBE，含队列/orphan/水位快照）。
+
+### 验证
+
+- ring 存活：`exiting ret=-22` 从每轮必现 → 0；vkr-instr 显示 stub 生效。
+- 持续性：心跳从 10 秒级 → **5 分钟+** 连续；dd.log 持续增长；初始帧
+  present、flip/release 循环健康；`missed_vblanks=0`。
+- 活动窗口帧测量（修复后首轮审计）：`deadline_to_presentation_p50=
+  22.2ms`（≈1.3×16.6ms 预算）、`presentation_interval_p50=648ms`——
+  事件驱动稀疏帧（无输入无动画的静态桌面），与 llvmpipe 基线同形态。
+
+### 剩余前沿（下一手）
+
+MoltenVK 队列在 ~4 秒后**停止完成 GPU 工作**：vkr-queue sync 线程
+`WaitForFences(3s)` 无限重试、fence 131/109/111/113 一代永不 retire
+（宿主侧 20/20 seqno wait done 正常、os_log 无 MVK 痕迹）→ guest raster
+在 `SYNCOBJ_WAIT(timeout=i64::MAX)` 永旋（内核 TEMP-PROBE 实锤）→
+引擎锁被持有 → 合成器 phase=51 冻结。嫌疑集中在该时刻提交的 GPU 工作
+引用了失败/替换的对象（stub 前后行为一致，draw 守卫未解开），或
+vkr-queue sync 线程与 ring 线程并发进 MoltenVK 的线程安全问题。
+下一手：在 vkr-queue sync 线程的 WaitForFences 重试处加日志定位卡住的
+fence 所属 queue 与当时在途工作；对照宿主 MoltenVK 直测复现脚本。
+
+### 工程备忘（本轮新增）
+
+- **构建机 lwprintf 环境缺口消失条件**：内核 aarch64 构建需
+  `BINDGEN_EXTRA_CLANG_ARGS=--sysroot=<musl sysroot>`（Homebrew musl
+  工具链的 sysroot 头文件在 `usr/include`，lwprintf build.rs 传的
+  `-I{sysroot}/include/` 落空）；starry-kernel clippy 仍在 loongarch64
+  的 lwprintf 处 fail-fast（已知基线缺口，aarch64 由 axbuild 全量编译
+  deny-warnings 覆盖）。
+- **内核日志级别是编译期参数**：cmdline `log=` 不生效（banner 原样打印
+  但无效），由 board toml `log` 字段经 AX_LOG 编译进去；log=Info 会用
+  `Enter user space`/task-exit 洪泛串口，取证后记得回 Warn。
+- **e2e 取证形态升级**：`init=/root/e2e-run.sh` + 20s watcher HTTP POST
+  （dd.log 快照 + 心跳行数 + 审计尾部 + e2e.log/exit.txt）；deniald
+  心跳双通道（tracing + `/tmp/deniald-alive.log` 独立文件）+ 主循环
+  phase 相位码（10/11/12/13/20/21/22/30/31/40/41/42/51/1000，phase=51
+  即 runtime 段互斥等待）。StarryOS procfs 不枚举 `/proc` 根，但
+  `/proc/1/comm` 直读可用；`/proc/<pid>` 需已知 pid。
+- debugfs 注入后必须回读校验 MD5；`inject-denial-full.py` 的 stdout
+  摘要不是命令清单（清单固定写在 `/tmp/debugfs-denial-full.txt`）。

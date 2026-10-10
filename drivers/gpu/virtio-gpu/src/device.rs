@@ -185,6 +185,9 @@ struct Pending<H: Hal> {
     /// land at any time, so it must not share the scratch page a synchronous
     /// waiter is about to read.
     recv: Option<Dma<H>>,
+    /// Fence id of a deferred `SUBMIT_3D`, correlated when the host retires
+    /// it. `None` for synchronous commands.
+    fence_id: Option<u64>,
 }
 
 /// Queue state behind the device's mutex.
@@ -197,6 +200,9 @@ struct Inner<H: Hal, T: Transport> {
     pending: VecDeque<Pending<H>>,
     /// `(token, used length)` of the most recently consumed response.
     last_completed: Option<(u16, u32)>,
+    /// Fence ids of retired deferred `SUBMIT_3D` submissions, in retire
+    /// order, waiting for [`VirtIoGpu::take_retired_fences`].
+    retired_fences: Vec<u64>,
     /// Set when the device stops responding: every later op fails fast
     /// instead of racing a dead queue.
     broken: bool,
@@ -293,6 +299,9 @@ impl<H: Hal, T: Transport> Inner<H, T> {
             match popped {
                 Ok(used_len) => {
                     self.last_completed = Some((front.token, used_len));
+                    if let Some(fence_id) = front.fence_id {
+                        self.retired_fences.push(fence_id);
+                    }
                     // The entry's buffers drop here, after the device is done
                     // with them.
                     return;
@@ -351,6 +360,7 @@ impl<H: Hal, T: Transport> Inner<H, T> {
             payload_len: 0,
             payload_borrow: payload_ptr,
             recv: None,
+            fence_id: None,
         });
 
         let mut budget = SPIN_BUDGET;
@@ -444,8 +454,10 @@ impl<H: Hal, T: Transport> Inner<H, T> {
 
     /// Fire-and-forget fenced submit: takes ownership of the header and
     /// payload so they outlive this call, and returns without waiting. An
-    /// empty payload (ring kick) contributes no descriptor at all.
-    fn submit_fenced(&mut self, header: &[u8], payload: &[u8]) -> Result<(), Error> {
+    /// empty payload (ring kick) contributes no descriptor at all. The
+    /// submission's `fence_id` is reported through [`Inner::retired_fences`]
+    /// once the host's retire response has been consumed.
+    fn submit_fenced(&mut self, header: &[u8], payload: &[u8], fence_id: u64) -> Result<(), Error> {
         if self.broken {
             log::warn!("virtio-gpu: submit_fenced on broken device");
             return Err(Error::DeviceFault);
@@ -491,6 +503,7 @@ impl<H: Hal, T: Transport> Inner<H, T> {
             payload_len: payload.len(),
             payload_borrow: None,
             recv: Some(recv_dma),
+            fence_id: Some(fence_id),
         });
         Ok(())
     }
@@ -595,6 +608,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
                 queue_buf_recv,
                 pending: VecDeque::new(),
                 last_completed: None,
+                retired_fences: Vec::new(),
                 broken: false,
                 framebuffer_dma: None,
                 framebuffer_size: 0,
@@ -1174,8 +1188,33 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
             })
             .as_bytes(),
             cmds,
+            fence_id,
         )?;
         Ok(fence_id)
+    }
+
+    /// Drains completed control responses and returns the fence ids of the
+    /// deferred `SUBMIT_3D` submissions the host has retired since the last
+    /// call, in retire order.
+    ///
+    /// The host defers a fenced response until the fence retires; consuming
+    /// the response is what tells the driver the host has accepted (parsed)
+    /// that submission. Callers that gate further work on host progress —
+    /// such as the venus syncobj watermark — must poll this routinely: a
+    /// response nobody drains would otherwise stall the pending FIFO until
+    /// `CONTROL_QUEUE_SIZE` fills up.
+    pub fn take_retired_fences(&self) -> alloc::vec::Vec<u64> {
+        let mut inner = self.inner.lock();
+        // Drain everything the used ring already holds, not just one chain:
+        // fenced responses can land in bursts while the driver was busy.
+        let pending_count = inner.pending.len();
+        for _ in 0..pending_count {
+            if !inner.control_queue.can_pop() {
+                break;
+            }
+            inner.drain_completed();
+        }
+        core::mem::take(&mut inner.retired_fences)
     }
 
     /// Creates a blob resource such as host-visible memory or a dma-buf.
