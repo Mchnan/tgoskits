@@ -1051,19 +1051,28 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         Ok(resp.map_info & MAP_CACHE_MASK)
     }
 
-    /// Unmaps a blob resource from the shared-memory window (blocking, Linux
-    /// `virtio_gpu_cmd_resource_unmap_blob`).
+    /// Unmaps a blob resource from the shared-memory window. Fire-and-forget
+    /// (Linux `virtio_gpu_cmd_resource_unmap_blob` waits, but the host may
+    /// suspend the unmap until its renderer releases the resource — a
+    /// teardown race that is normal at client exit — so waiting would stall
+    /// teardown behind the renderer for up to the bounded-wait timeout).
+    /// The completion pump logs device rejections.
     pub fn unmap_blob(&mut self, resource_id: u32) -> Result<(), Error> {
         if !self.has_resource_blob || self.hostmem.is_none() {
             return Err(Error::Unsupported);
         }
-        let resp: CtrlHeader = self.request(CmdResourceUnmapBlob {
-            header: CtrlHeader::with_type(Command::RESOURCE_UNMAP_BLOB),
-            resource_id,
-            _padding: 0,
-        })?;
-        resp.check_type(Command::OK_NODATA)
-            .map_err(|_| Error::InvalidResponse)
+        self.ctrl
+            .enqueue(
+                &mut self.transport,
+                &CmdResourceUnmapBlob {
+                    header: CtrlHeader::with_type(Command::RESOURCE_UNMAP_BLOB),
+                    resource_id,
+                    _padding: 0,
+                },
+                None,
+                0,
+            )
+            .map(|_| ())
     }
 
     /// Creates a blob resource such as host-visible memory or a dma-buf.

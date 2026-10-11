@@ -663,10 +663,12 @@ impl Drop for GpuResource {
         // resource is gone the host no longer accepts an UNMAP_BLOB for it.
         if self.mapped_blob.lock().take().is_some() {
             let result = ax_gpu::with_gpu_for_cleanup(|device| {
-                device
-                    .virgl()
-                    .ok_or(GpuError::Unsupported)?
-                    .unmap_blob(self.device_handle)
+                let virgl = device.virgl().ok_or(GpuError::Unsupported)?;
+                let result = virgl.unmap_blob(self.device_handle);
+                // The unmap is fire-and-forget; one boundary notify delivers
+                // it ahead of the fenced UNREF below (strict ctrl FIFO).
+                virgl.ctrl_notify();
+                result
             })
             .and_then(core::convert::identity);
             if let Err(error) = result {
