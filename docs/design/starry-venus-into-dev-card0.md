@@ -809,3 +809,34 @@ ax-driver 宿主 clippy 的 `link_section` Mach-O 报错是上游基线缺口（
   venus-only 下 default_mapping 为 None，fb0 不注册）。
 - 本轮重新落地：syncobj 全族 + timeline cap、hostmem BAR、MAP/UNMAP_BLOB、
   推迟 retire、blob_hints 尾部、venus capset 放行、legacy ADDFB 合成。
+
+## 全量闭环：vkprobe 通过与桌面剩余停摆（2026-10-11 第十二轮闭环补记）
+
+**vkprobe 21 步在新内核全绿**（`=== VKPROBE PASS ===`，readback 4/4
+MATCH、BAR 往返 MATCH、正常 init-exit 退出），闭环过程抓出并修复两个
+移植缺陷（提交 `3c62ce4d4`）：
+
+1. **乱序 fence 完成模型**：fence trace 实证响应乱序完成（0x97/96/95/94
+   倒序、0x9a 先于 0x99）——venus ring 批次的响应被宿主推迟到渲染器
+   retire，后发空 kick 立即完成。上游 ctrl 的「最大已弹 fence」水位被
+   后发 id 吞掉未完成批次，vkWaitForFences 提前返回、读回发生在 Metal
+   执行之前（全零）。修复为连续前缀水位 + 乱序完成集，virgl 顺序路径
+   语义不变。旧分支的「按 token 匹配响应」设计注记（"容纳不了失序
+   完成"）正是同一问题的旧解。
+2. **teardown UNMAP 挂起**：宿主对仍在渲染器引用下的资源挂起 unmap，
+   request_sync 同步等待 5s 超时后队列标 broken，客户端退出被拖死。
+   改 fire-and-forget + UNREF 前边界 notify。
+
+**桌面 e2e 阶段结论**（同 rootfs/同 R11 deniald/engine 差分）：
+- 旧内核：桌面 0% 黑（R11 上屏结论复现）。
+- 新内核：blob 创建链经两个修复推进到与旧内核完全一致（14 blob：
+  ring/resp/3×池/8M/3×atlas/32K/2M/16K 全部建出并映射；修复 `94884d25e`
+  的 sync-file 设备 fence 绑定解开了第 2 个池后的冻结），但 compositor
+  仍停在 **phase=1000、in_flight=true**（92s 心跳），屏幕 100% 黑。
+  旧内核同栈同 deniald 的 `windows=0`/`output target unavailable`
+  日志签名与 NEW 相同——这些是稳态噪音，非断点。
+- **剩余缺陷定位**：compositor 主循环存活（dispatch_seq 增长）但卡在
+  引擎调用内；41 线程全 S。vkprobe 已证 UAPI 各步正确，剩余差异在更
+  深的 fence 语义组合路径。**下一轮主攻：tidsig 线程级取证**（R8 方法
+  论：区分 futex 正常停等与真死锁，ptrace 后必须确认进程活性），锁定
+  phase=1000 卡点线程的阻塞 ioctl。
