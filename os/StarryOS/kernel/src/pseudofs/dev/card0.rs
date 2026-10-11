@@ -743,12 +743,31 @@ impl FileLike for HostResourceDmaBuf {
         "anon_inode:dmabuf".into()
     }
 
-    fn device_mmap(&self, _offset: u64, _length: u64) -> StarryResult<DeviceMmap> {
-        // The host resource is not guest-mappable without RESOURCE_MAP_BLOB
-        // (not needed by the present path — virgl reuses the host texture
-        // zero-copy). Rejecting mmap is safer than mapping the guest shadow
-        // pages, which do not hold the rendered content.
-        Err(StarryError::Unsupported)
+    fn device_mmap(&self, _offset: u64, length: u64) -> StarryResult<DeviceMmap> {
+        // A host-visible venus blob exports its hostmem BAR window: the
+        // exported fd mmap resolves to the same physical range the creator
+        // mapped (gbm's CPU path and deniald's background writes go through
+        // it). A virgl host resource without a BAR mapping stays
+        // unmappable — its rendered content lives in the host texture, not
+        // in any guest-visible memory.
+        let map = (*self.resource.mapped_blob.lock()).ok_or(StarryError::Unsupported)?;
+        let end = map
+            .size
+            .checked_add(0)
+            .ok_or(StarryError::InvalidInput)?;
+        if length > end {
+            return Err(StarryError::InvalidInput);
+        }
+        let range = PhysAddrRange::from_start_size(PhysAddr::from(map.phys as usize), map.size as usize);
+        let cached = map.map_info & VIRTGPU_MAP_CACHE_MASK == VIRTGPU_MAP_CACHE_CACHED;
+        // Pin the host resource for the VMA's lifetime; the exported fd
+        // already holds one Arc, so borrow it as the retainer.
+        let retain: Arc<dyn Any + Send + Sync> = Arc::new(self.resource.clone());
+        Ok(if cached {
+            DeviceMmap::PhysicalCachedResolved(range, Some(retain))
+        } else {
+            DeviceMmap::PhysicalResolved(range, Some(retain))
+        })
     }
 }
 
