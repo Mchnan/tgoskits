@@ -31,7 +31,12 @@
 //!   so a host that drains slower than the guest produces cannot grow
 //!   guest-side buffering without bound.
 
-use alloc::{boxed::Box, collections::VecDeque, vec, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeSet, VecDeque},
+    vec,
+    vec::Vec,
+};
 use core::{hint::spin_loop, mem::size_of};
 
 use virtio_drivers::{queue::VirtQueue, transport::Transport};
@@ -133,11 +138,25 @@ pub(crate) struct ControlQueue<H: virtio_drivers::Hal> {
     /// fence N done ⇒ all ≤ N done).
     ///
     /// INVARIANT: only [`ControlQueue::pump_completions`] advances this
-    /// counter, when it pops a used entry that carries a fence id. Submits
-    /// are fire-and-forget (`enqueue` with a fence id); there is no blocking
-    /// fenced submission path, so a fence id the host never completes keeps
+    /// counter. It is the *contiguous* completion watermark: every fence id
+    /// `<= completed_fence_id` has popped. Submits are fire-and-forget
+    /// (`enqueue` with a fence id); there is no blocking fenced submission
+    /// path, so a fence id the host never completes keeps
     /// [`ControlQueue::wait_fence`] waiting until its timeout.
+    ///
+    /// Ring-based contexts (venus) complete their fenced batches
+    /// *out of submission order*: the host defers a render batch's response
+    /// until the renderer retires it, while later empty ring kicks complete
+    /// immediately. A single max-popped watermark would let a later id
+    /// subsume an earlier, still-running batch, so out-of-order pops are
+    /// recorded in [`ControlQueue::completed_fences`] instead and only fold
+    /// into the watermark once the hole ahead of them fills.
     completed_fence_id: u64,
+    /// Fence ids above [`ControlQueue::completed_fence_id`] whose used
+    /// entries already popped (out-of-order ring completions). Bounded in
+    /// practice by the deferred batches' lag; pruned from the low end with
+    /// the same bound as the wait timeout.
+    completed_fences: BTreeSet<u64>,
     /// Monotonic nanosecond clock injected at construction; bounds the
     /// blocking waits. See [`WAIT_TIMEOUT_NS`].
     clock: fn() -> u64,
@@ -179,6 +198,7 @@ impl<H: virtio_drivers::Hal> ControlQueue<H> {
             pending_commands: VecDeque::new(),
             ctrl_pending: 0,
             completed_fence_id: 0,
+            completed_fences: BTreeSet::new(),
             clock,
             sync_token: None,
             broken: false,
@@ -551,8 +571,19 @@ impl<H: virtio_drivers::Hal> ControlQueue<H> {
                     return Err(self.mark_broken(err));
                 }
             }
-            if entry.fence_id > self.completed_fence_id {
-                self.completed_fence_id = entry.fence_id;
+            if entry.fence_id != 0 {
+                // Fold the popped fence into the contiguous watermark; an
+                // out-of-order completion (a ring batch whose response the
+                // host deferred past later kicks) parks in the set until the
+                // hole ahead of it fills.
+                if entry.fence_id == self.completed_fence_id + 1 {
+                    self.completed_fence_id += 1;
+                    while self.completed_fences.remove(&(self.completed_fence_id + 1)) {
+                        self.completed_fence_id += 1;
+                    }
+                } else {
+                    self.completed_fences.insert(entry.fence_id);
+                }
             }
             // Fire-and-forget: the response is dropped here (no waiter), but
             // surface device-side errors on the log.
@@ -678,13 +709,13 @@ impl<H: virtio_drivers::Hal> ControlQueue<H> {
         fence_id: u64,
     ) -> Result<(), Error> {
         let deadline = (self.clock)().saturating_add(WAIT_TIMEOUT_NS);
-        while self.completed_fence_id < fence_id {
+        while !self.fence_completed(fence_id) {
             // Force a kick decision: the fenced entry may not have been
             // delivered to the host yet (the consumer's boundary notify may
             // from a full ring, `enqueue` performs no kick on its own).
             self.notify(transport);
             self.pump_completions(transport)?;
-            if self.completed_fence_id >= fence_id {
+            if self.fence_completed(fence_id) {
                 break;
             }
             if (self.clock)() >= deadline {
@@ -740,7 +771,7 @@ impl<H: virtio_drivers::Hal> ControlQueue<H> {
     /// The counterpart of Linux `dma_resv_test_signaled` in the NOWAIT probe
     /// of `virtio_gpu_wait_ioctl` (virtgpu_ioctl.c).
     pub(crate) fn fence_completed(&self, fence_id: u64) -> bool {
-        self.completed_fence_id >= fence_id
+        fence_id <= self.completed_fence_id || self.completed_fences.contains(&fence_id)
     }
 }
 

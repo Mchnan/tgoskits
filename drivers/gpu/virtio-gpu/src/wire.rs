@@ -104,9 +104,6 @@ impl Command {
     pub(crate) const OK_DISPLAY_INFO: Command = Command(0x1101);
     pub(crate) const OK_CAPSET_INFO: Command = Command(0x1102);
     pub(crate) const OK_CAPSET: Command = Command(0x1103);
-    /// `VIRTIO_GPU_RESP_OK_NODATA`: success response for commands with no
-    /// payload (e.g. `RESOURCE_UNMAP_BLOB`).
-    pub(crate) const OK_NODATA: Command = Command(0x1100);
 
     /// `VIRTIO_GPU_RESP_OK_MAP_INFO`, the success response for
     /// `RESOURCE_MAP_BLOB`; the payload carries the mapping offset inside
