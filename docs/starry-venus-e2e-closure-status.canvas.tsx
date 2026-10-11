@@ -1,5 +1,6 @@
-// venus/zink 加速桌面端到端闭环 — 现状与计划（第八轮收官，2026-10-11）
-// 黑屏归因（Cocoa 现场呈现轮）+ 下一轮重建 MoltenVK 的计划任务。
+// venus/zink 加速桌面端到端闭环 — 现状与计划（第九轮收官，2026-10-11）
+// MoltenVK 重建（main@67b2682 + SPIRV-Cross aa217aeb）+ ICD 部署劫持修复 +
+// 复测判定：shader 失败归零、ring 卡点闭合、deadline 首次进预算。
 import {
   Stack, Row, Grid, H1, H2, H3, Text, Card, CardHeader, CardBody,
   Table, Pill, Stat, Callout, Code, Divider, ArchGraph, TodoListCard,
@@ -99,32 +100,37 @@ const planItems = [
   },
   {
     id: "r9-rebuild",
-    content: "带 Xcode 机器重建 MoltenVK：fetchDependencies 拉上游 main 的 SPIRV-Cross，构建 macOS Release dylib",
-    status: "pending" as const,
+    content: "MoltenVK main@67b2682 重建完成（Xcode 26.3，SPIRV-Cross aa217aeb 含 sampler 保留字修复）",
+    status: "completed" as const,
   },
   {
     id: "r9-swap",
-    content: "换装新 dylib + 独立 ICD json（VK_DRIVER_FILES 指向），回归 vkprobe 21 步与 DRM 四用例",
-    status: "pending" as const,
+    content: "ICD 换装 + 揪出部署劫持（DYLD_LIBRARY_PATH 下 @rpath 标识符落到 brew 1.4.2）；唯一 install name 修复后 vkprobe 真 1.4.3 PASS",
+    status: "completed" as const,
   },
   {
     id: "r9-e2e",
-    content: "Cocoa e2e 复测：预期 shader 全过、ring 解锁、桌面内容上屏（screendump 非黑占比回升）",
-    status: "pending" as const,
+    content: "e2e 复测：shader 失败归零、~6s 冻结未复现（卡点同源成立）、心跳 11 分钟+；scanout 纯黑归因到 pre-existing shell SIGSEGV@0x15c",
+    status: "completed" as const,
   },
   {
     id: "r9-60hz",
-    content: "持续帧率 60Hz 测量（presentations / missed_vblanks / deadline_to_presentation）",
+    content: "deadline_to_presentation_p50=14.96ms 首次进 16.6ms 预算；稀疏帧 2.0s（无输入事件驱动形态），持续 60Hz 待内容帧后测量",
     status: "pending" as const,
   },
   {
     id: "r9-stall",
-    content: "若 ring 卡点独立于 shader 修复仍存在：在 Xcode 机器 lldb 附加 + Metal GPU capture 定位调用级卡点",
-    status: "pending" as const,
+    content: "ring 卡点无需 lldb——重建后未复现，第八轮「同源」假设成立",
+    status: "completed" as const,
   },
   {
     id: "r9-docs",
     content: "结果回写文档 / AGENTS.md 记忆 / 本 canvas",
+    status: "completed" as const,
+  },
+  {
+    id: "r10-shell",
+    content: "下一手：shell SIGSEGV@VA:0x15c 取栈（mini-strace/audit，第三轮遗留 next-step）——桌面内容上屏的唯一剩余阻塞",
     status: "pending" as const,
   },
 ];
@@ -169,16 +175,16 @@ const memoRows = [
     "第二次 vkCreatePipelineCache 会把 ring 线程卡死在驱动调用内部——失败后只能 null stub 直接过",
   ],
   [
+    "换装验证纪律（第九轮教训）",
+    "dyld 会把 ICD 的 @rpath 标识符经 DYLD_LIBRARY_PATH 解析到 brew 同名库——换装验证必须核对日志里的 MoltenVK version 行",
+  ],
+  [
     "MVK 调试开关",
-    "MVK_CONFIG_LOG_LEVEL=3 + MVK_CONFIG_REDIRECT_LOGGING_TO_STDERR=1 可在 QEMU stderr 抓 MVK 错误与 program_source",
+    "MVK_CONFIG_LOG_LEVEL=3 + MVK_CONFIG_REDIRECT_LOGGING_TO_STDERR=1 可在 QEMU stderr 抓 MVK 错误与 program_source；VK_LOADER_DEBUG=all 抓 ICD 选择",
   ],
   [
     "已排除项",
-    "SINGLE_QUEUE 信号量风格（=0 无效）、参数缓冲模式（=0 无效）、OpName 来源（改写后错误原样）",
-  ],
-  [
-    "本机构建限制",
-    "仅 Command Line Tools，无 xcodebuild——MoltenVK 源构建需完整 Xcode，本机不可行",
+    "SINGLE_QUEUE 信号量风格（=0 无效）、参数缓冲模式（=0 无效）、OpName 来源（改写后错误原样）、guest mesa 磁盘缓存（条目零 sampler 零 MSL）",
   ],
 ];
 
@@ -186,46 +192,63 @@ export default function VenusClosureStatus(): JSX.Element {
   const theme = useHostTheme();
   return (
     <Stack gap={16} style={{ padding: 28 }}>
-      <H1>venus/zink 加速桌面 — 黑屏归因与重建计划</H1>
+      <H1>venus/zink 加速桌面 — MoltenVK 重建收官与 ring 卡点闭合</H1>
       <Text>
-        第八轮收官（2026-10-11，Cocoa 现场呈现轮）。用户现场提示（窗口黑屏 +
-        llvmpipe 对照组窗口/图标差异）触发逐层归因：黑屏从「不明」收敛为
-        「MoltenVK 1.4.2 捆绑 SPIRV-Cross 的 sampler 保留字缺失 + ring 线程
-        内部卡点」两件事，修复路径定案为在带 Xcode 的机器重建 MoltenVK。
+        第九轮收官（2026-10-11，Xcode 重建轮）。用户装好完整 Xcode 后按第八轮
+        修复路径重建 MoltenVK：main@67b2682 + SPIRV-Cross aa217aeb（sampler
+        保留字修复确认在内）。首轮复测错误逐字节复现，追查出比 shader 更深的
+        ICD 部署劫持（DYLD_LIBRARY_PATH 下 @rpath 标识符被解析到 brew 1.4.2），
+        修复后真 1.4.3 复测：shader 失败归零、~6s 冻结未复现（第八轮「同源」
+        假设成立）、deadline 首次进入 16.6ms 预算。黑屏的剩余阻塞重新归因到
+        pre-existing 的 shell SIGSEGV@0x15c。
       </Text>
 
       <Grid columns={4} gap={12}>
         <Card>
           <CardBody>
-            <Stat value="2 件" label="黑屏根因收敛：名字冲突 + ring 内部卡点" tone="success" />
+            <Stat value="0 个" label="Shader library compile failed（第八轮每轮必现）" tone="success" />
           </CardBody>
         </Card>
         <Card>
           <CardBody>
-            <Stat value="684 px" label="scanout 实测内容（shell 起步帧，跨配置不变）" tone="warning" />
+            <Stat value="11 分钟+" label="compositor 心跳存活（第八轮 ~6 秒冻结）" tone="success" />
           </CardBody>
         </Card>
         <Card>
           <CardBody>
-            <Stat value="18+136" label="SPIR-V 剥名 / 改写处（名字来源排除）" tone="info" />
+            <Stat value="14.96ms" label="deadline_to_presentation_p50（首次进 16.6ms 预算）" tone="success" />
           </CardBody>
         </Card>
         <Card>
           <CardBody>
-            <Stat value="8 项" label="第九轮计划任务（2 完成 / 6 待办）" tone="info" />
+            <Stat value="100% 黑" label="scanout 现状：shell SIGSEGV@0x15c（pre-existing）" tone="warning" />
           </CardBody>
         </Card>
       </Grid>
 
-      <Callout tone="danger" title="核心结论：黑屏 = 上游 SPIRV-Cross 保留字缺失 + MoltenVK 内部阻塞">
+      <Callout tone="danger" title="本轮最重要的新发现：ICD 部署劫持">
         <Text>
-          skia 的 GLSL uniform 名为 "sampler"，MoltenVK 1.4.2 捆绑的 SPIRV-Cross
-          在生成的 MSL 中让该名字遮蔽 Metal 的 sampler 类型——shader 库编译失败
-          （VK_ERROR_INITIALIZATION_FAILED）。该名字与 SPIR-V 调试名无关
-          （剥离/改写后错误原样），是旧版对 combined image sampler 的内部生成名。
-          上游 main 的保留字集已修（注释与本轮错误一字不差），但 1.4.2 未包含，
-          本机无 Xcode 不能重建。另有一条独立的 ring 线程内部卡点（~6 秒冻结），
-          调用级定位同样需要 Xcode 机器。
+          独立 ICD json（VK_DRIVER_FILES 指向）写好后，render server 仍加载
+          brew 1.4.2（日志 MoltenVK version 1.4.2 实锤，同环境宿主探针是
+          1.4.3）。VK_LOADER_DEBUG=all 抓到 dyld 把 @rpath/libMoltenVK.dylib
+          标识符解析落到 /opt/homebrew/lib/libMoltenVK.dylib——触发条件是
+          DYLD_LIBRARY_PATH 含 /opt/homebrew/lib（vkr dlopen("libvulkan.dylib")
+          找 loader 需要）。修复：dylib 复制到 prefix/lib 用 install_name_tool
+          -id 改唯一 install name + ad-hoc codesign。教训：换装验证必须核对
+          日志里的 MoltenVK version 行——此前的「vkprobe 全绿」全部跑在被
+          劫持的 1.4.2 上。
+        </Text>
+      </Callout>
+
+      <Callout tone="success" title="第八轮两大断点在真 1.4.3 上的复测判定">
+        <Text>
+          （1）Shader library compile failed：每轮必现 → 0，pipeline 全真
+          （stub=0）。（2）ring ~6 秒内部冻结（phase=1000 停摆 + 内核
+          syncobj stall + vkr sync 3s 超时）：未复现——「卡点是被拒 shader
+          下游」的同源假设成立，无需 lldb 定位。vkWaitVirtqueueSeqnoMESA
+          waiting→done 正常 retire，flip 循环健康，dispatch_seq 780 万持续
+          增长（stale_ms=1 非冻结）。vkprobe 21 步在真 1.4.3 重跑 PASS
+          （BAR 往返 + compute 读回 4/4，hostmem 路径无回归）。
         </Text>
       </Callout>
 
@@ -277,18 +300,22 @@ export default function VenusClosureStatus(): JSX.Element {
 
       <Card>
         <CardHeader>
-          <H2>第九轮计划任务</H2>
+          <H2>第九轮任务清单（收官）与下一手</H2>
         </CardHeader>
         <CardBody>
           <TodoListCard todos={planItems} />
           <Divider />
-          <Callout tone="info" title="重建操作要点">
+          <Callout tone="info" title="换装产物与脚本（第九轮落地）">
             <Text>
-              带完整 Xcode 的机器：clone MoltenVK → fetchDependencies（拉取含
-              修复的 SPIRV-Cross main）→ 构建 macOS Release → 产物
-              libMoltenVK.dylib 换装 + 独立 ICD json（VK_DRIVER_FILES 指向）→
-              先回归 vkprobe/DRM 四用例再上 e2e。本机仅有 CLT，
-              xcodebuild 不可用。
+              产物：~/venus-stack/prefix/lib/libMoltenVK-main.dylib（唯一
+              install name）+ prefix/share/vulkan/icd.d/MoltenVK-main_icd.json；
+              源树 ~/venus-stack/src/MoltenVK（main@67b2682，含 R9-PROBE
+              仪表：fresh-spv/cache-msl 构造器与 readData initialData/UUID/
+              条目数日志）。启动脚本 qstart-alpine-mvkmain.sh（vkprobe）与
+              qstart-denial-e2e.sh（Cocoa e2e）均指向新 ICD；后者已修
+              「脚本内 rm 重定向目标 → MVK 日志变已删除 inode」坑。busybox
+              wget --post-file 会把 URL 基名当响应体落盘，/tmp/snap 残留后
+              后续 POST 全失败——每轮只有前 1-2 个快照送达。
             </Text>
           </Callout>
         </CardBody>
@@ -364,16 +391,18 @@ export default function VenusClosureStatus(): JSX.Element {
       </Card>
 
       <Row gap={8}>
-        <Pill active>第八轮收官</Pill>
-        <Pill>黑屏归因完成</Pill>
-        <Pill>下一手：重建 MoltenVK</Pill>
-        <Pill>仪表全部就位</Pill>
+        <Pill active>第九轮收官</Pill>
+        <Pill>MoltenVK 1.4.3 上栈</Pill>
+        <Pill>shader 失败归零</Pill>
+        <Pill>ring 卡点闭合</Pill>
+        <Pill>deadline 进预算</Pill>
       </Row>
       <Text>
-        状态基调：黑屏已从「不明」收敛为两件可执行的事——上游 SPIRV-Cross
-        保留字缺失（重建即愈）与 MoltenVK 内部 ring 卡点（大概率同源，重建后
-        复测即可判定）。第九轮的全部前置仪表（screendump / MVK 日志 / 内核
-        TEMP-PROBE / vkr-instr / SPIR-V 落盘）已就位。
+        状态基调：第八轮收敛的两件事均已按预期路径修复——上游 SPIRV-Cross
+        保留字缺失（重建即愈，实测归零）与 MoltenVK 内部 ring 卡点（确认为
+        被拒 shader 的下游，重建后未复现）。桌面内容上屏的唯一剩余阻塞是
+        pre-existing 的 shell SIGSEGV@VA:0x15c（第三轮遗留，与 MoltenVK
+        无关）；60Hz 持续帧率测量等内容帧恢复后进行。
       </Text>
     </Stack>
   );

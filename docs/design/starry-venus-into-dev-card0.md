@@ -481,3 +481,67 @@ Cocoa 窗口呈现：denial 桌面初始帧（684 灰像素的 shell 起步帧�
 MoltenVK 内部卡点挡住。全部仪表（monitor screendump / MVK 日志 / 内核
 TEMP-PROBE / vkr-instr / SPIR-V 落盘）就位，第八轮已把黑屏从「不明」
 收敛为「上游 SPIRV-Cross 保留字缺失 + MoltenVK 内部阻塞」两件事。
+
+## MoltenVK 重建与 ring 卡点闭合（2026-10-11，第九轮，Xcode 重建轮）
+
+用户装好完整 Xcode 26.3 后按第八轮修复路径执行：clone MoltenVK main
+（`67b2682`）→ `fetchDependencies --macos`（SPIRV-Cross pin `aa217aeb`，
+L16923 确认 `"sampler"` 在 `get_reserved_keyword_set()`，注释与本轮错误
+一字不差）→ 构建 universal dylib。**首轮 e2e 报错与第八轮逐字节相同，
+追查出一个比 shader 更深的部署 bug**：
+
+### ICD 部署劫持（本轮最重要的新发现）
+
+独立 ICD json（`VK_DRIVER_FILES` 指向）写出后，render server 仍加载
+brew 1.4.2（日志 `MoltenVK version 1.4.2` 实锤，同环境宿主探针却是
+1.4.3）。`VK_LOADER_DEBUG=all` 抓到 loader 的 WARNING：**dlopen 绝对
+路径时 dyld 把 `@rpath/libMoltenVK.dylib` 标识符解析落到
+`/opt/homebrew/lib/libMoltenVK.dylib`（brew 1.4.2）**——触发条件是
+DYLD_LIBRARY_PATH 含 `/opt/homebrew/lib`（vkr `dlopen("libvulkan.dylib")`
+找 loader 需要它）。A/B 对照：去掉该变量连 loader 都打不开；保留变量则
+ICD 绝对路径被劫持。**修复：dylib 复制到 prefix/lib 并
+`install_name_tool -id` 改唯一 install name + ad-hoc codesign，json 指向
+它**，与 brew 完全脱钩后 1.4.3 正常装载。**教训：本轮之前的「vkprobe
+全绿」全部跑在被劫持的 1.4.2 上，不构成 1.4.3 的证据**；换装验证必须
+核对日志里的版本行。
+
+### 复测判定（真 1.4.3，uptime 11:18 收官）
+
+- **shader 编译失败归零**：`Shader library compile failed` 第八轮每轮
+  必现 → 0；pipeline 全真（`vkCreateGraphicsPipelines` 全部 `added`，
+  stub=0）。
+- **ring 内部卡点未复现**：第八轮「大概率同源」假设成立——卡点是被拒
+  shader 的下游。~6 秒冻结（phase=1000 停摆 + 内核 syncobj stall 告警 +
+  vkr sync 线程 3s 超时）全部消失；`vkWaitVirtqueueSeqnoMESA waiting→
+  done` 正常 retire，flip 循环（set_scanout_blob res 3↔4）健康。
+- **存活**：心跳持续 11 分钟+（第八轮 5 分钟+），`exiting ret=-22` = 0，
+  dispatch_seq 780 万持续增长（stale_ms=1，非冻结）。
+- **帧预算**：`deadline_to_presentation_p50=14.96ms` **首次进入 16.6ms
+  预算**（第七轮 22.2ms）；`presentation_interval_p50≈2.0s`、
+  `missed_vblanks=0`——事件驱动稀疏帧形态（无输入静态桌面，与 llvmpipe
+  基线同形态），`engine_over_budget=0`。
+- **vkprobe 21 步 PASS**（真 1.4.3 重跑）：BAR pattern 往返 MATCH、
+  compute 读回 4/4——hostmem blob 路径无回归。
+
+### 黑屏的下一手（重新归因）
+
+scanout 在 1.4.3 上读出 100% 纯黑（第八轮是 684 灰像素的 shell 起步
+帧）：**shell 进程本轮 3.5s 处 `SIGSEGV memory fault at VA:0x15c`**
+（pid 17，与第三轮记录同址同形态），死在首个 present 之前——空桌面
+背景即纯黑，compositor 自身 alive 且在出帧。0x15c 是 pre-existing
+guest 侧问题（第三轮 next-step：deniald 侧 mini-strace 取崩溃栈），
+与 MoltenVK 无关，成为桌面内容上屏的新阻塞。Flutter 引擎线程
+（io.flutter.rast 等）存活，rasterizer 在跑。
+
+### 换装与工具链备忘
+
+- 产物：`~/venus-stack/prefix/lib/libMoltenVK-main.dylib`（unique
+  install name）+ `prefix/share/vulkan/icd.d/MoltenVK-main_icd.json`；
+  源树 `~/venus-stack/src/MoltenVK`（main@67b2682，含 R9-PROBE 仪表：
+  fresh-spv/cache-msl 构造器与 readData initialData/UUID/条目数日志）。
+- `qstart-alpine-mvkmain.sh`（vkprobe 用）与 `qstart-denial-e2e.sh`
+  （Cocoa e2e 用）均指向新 ICD；后者已修「预删重定向目标」坑（脚本内
+  `rm` 会把 launch shell 已打开的 MVK 日志文件变成已删除 inode）。
+- e2e watcher 的 POST：busybox `wget --post-file` 会把 URL 基名当响应
+  体落盘，`/tmp/snap` 残留后后续 POST 全部 `File exists` 失败——每轮
+  实际只有前 1-2 个快照送达，取证读 `/tmp/pulled/snap.*` 即可。
