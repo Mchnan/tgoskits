@@ -180,6 +180,19 @@ impl Card0 {
         }
     }
 
+    /// The device fence id of the outstanding submission that will advance
+    /// `handle` to `point` on `owner`'s fd, if one is still pending.
+    fn pending_fence_for(&self, owner: u64, handle: u32, point: u64) -> Option<u64> {
+        let pending = self.pending_retires.lock();
+        pending
+            .iter()
+            .find(|entry| {
+                entry.owner == owner
+                    && entry.syncobjs.iter().any(|&(h, p)| h == handle && p == point)
+            })
+            .map(|entry| entry.fence_id)
+    }
+
     /// Advances one syncobj's watermark on behalf of an explicit
     /// `TIMELINE_SIGNAL` (or binary SIGNAL) and wakes its waiters.
     fn signal_syncobj_point(
@@ -423,6 +436,19 @@ impl Card0 {
             if state.signaled_point >= args.point {
                 // Fence id 0 completes on the first refresh, so a registered
                 // file over a reached point signals right away.
+                file.register();
+            } else if let Some(fence_id) =
+                self.pending_fence_for(owner, args.handle, args.point)
+            {
+                // The point belongs to an outstanding submission: bind the
+                // export to that submission's device fence and hand it to
+                // the completion refresher. The file then signals exactly
+                // when the host retires the batch — without this, signaling
+                // depends on somebody else issuing another syncobj ioctl to
+                // run the retire pump, and a client parked on the exported
+                // fd would stall forever.
+                drop(state);
+                file.bind_fence_id(fence_id);
                 file.register();
             } else {
                 state.sync_files.push((args.point, file.clone()));
