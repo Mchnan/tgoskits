@@ -369,6 +369,12 @@ pub trait VirtioGpu3D: Send + Sync {
 
     /// Stops displaying whatever resource is bound to `scanout_id`.
     fn disable_scanout(&self, scanout_id: u32) -> Result<(), Error>;
+
+    /// The host device's current scanout resolution (`GET_DISPLAY_INFO`'s
+    /// pmode, i.e. QEMU's `xres`/`yres`). The KMS face synthesizes its
+    /// connector mode from this; on a venus-only stack no 2D display
+    /// device is probed, so this is the only host-side mode source.
+    fn resolution(&self) -> Result<(u32, u32), Error>;
 }
 
 impl<H: Hal + 'static, T: Transport + 'static> VirtioGpu3D for VirtIoGpu<H, T> {
@@ -468,6 +474,10 @@ impl<H: Hal + 'static, T: Transport + 'static> VirtioGpu3D for VirtIoGpu<H, T> {
 
     fn disable_scanout(&self, scanout_id: u32) -> Result<(), Error> {
         VirtIoGpu::disable_scanout(self, scanout_id)
+    }
+
+    fn resolution(&self) -> Result<(u32, u32), Error> {
+        VirtIoGpu::resolution(self)
     }
 }
 

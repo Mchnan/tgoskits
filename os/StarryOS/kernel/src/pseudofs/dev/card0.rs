@@ -907,10 +907,20 @@ fn report_user_array<T: bytemuck::NoUninit>(
     Ok(src.len() as u32)
 }
 
-/// Fetch a (width, height) pair from `axdisplay`. If no display device
-/// was probed, returns a tiny default so `MODE_GETRESOURCES`/
-/// `GETCONNECTOR` still have something coherent to report.
+/// Fetch a (width, height) pair for the connector mode. The venus 3D face
+/// mirrors the host device's configured scanout mode (`GET_DISPLAY_INFO`'s
+/// pmode, i.e. QEMU's `xres`/`yres`) — on a venus-only stack no 2D display
+/// device is probed, so without it this fell back to 640x480 and pinned the
+/// accelerated desktop there. Falls back to `axdisplay` (2D face, same host
+/// mode via `setup_framebuffer`) and finally to a tiny default so
+/// `MODE_GETRESOURCES`/`GETCONNECTOR` still have something coherent.
 fn display_resolution() -> (u32, u32) {
+    if let Some(dev) = virtio_gpu::global_3d() {
+        match dev.resolution() {
+            Ok((w, h)) if w > 0 && h > 0 => return (w, h),
+            _ => {}
+        }
+    }
     if ax_display::has_display() {
         let info = ax_display::framebuffer_info();
         (info.width, info.height)
