@@ -545,3 +545,119 @@ guest 侧问题（第三轮 next-step：deniald 侧 mini-strace 取崩溃栈）�
 - e2e watcher 的 POST：busybox `wget --post-file` 会把 URL 基名当响应
   体落盘，`/tmp/snap` 残留后后续 POST 全部 `File exists` 失败——每轮
   实际只有前 1-2 个快照送达，取证读 `/tmp/pulled/snap.*` 即可。
+
+## Xwayland SIGSEGV 根因闭合：mesa 栈版本分裂与虚表错位（2026-10-11，第十轮，内核取证轮）
+
+第九轮把黑屏归因为 shell（pid 17）`SIGSEGV at VA:0x15c`。本轮用内核侧
+崩溃取证（不再依赖 guest ptrace）把根因钉死为 **guest rootfs 内 mesa
+栈混装**，并通过差分 A/B 复测证实修复。
+
+### 内核崩溃取证增强（os/StarryOS/kernel）
+
+- `handle_user_page_fault` 在 force-deliver 之前调用新增
+  `dump_sync_fault_if_terminating`（task/signal.rs）：每个进程代仅一次
+  （`ProcessData::sync_fault_dumped` AtomicBool），无视 signal
+  disposition——Xwayland 安装了 SIGSEGV handler，原有「投递终止才
+  dump」的路径被 handler 吞掉，这正是第九轮拿不到寄存器的原因。
+- aarch64 崩溃现场四件套：全量 x0–x30 寄存器、`insn@pc`（4 字节指令字）、
+  crash mappings（含 PC 的映射 + 全部可执行映射，文件路径 + 文件内偏移）、
+  栈顶 8 个字（`[sp+8]` = 调用者返回地址，aarch64 `stp x29,x30,[sp,#-N]!`
+  序言下 fp 链断裂也能拿到调用点）。
+- aarch64 FP 链回溯补齐（原 riscv64-only；注意 aarch64 序言 x29 指向
+  保存对本身，帧读取不需要 `-16` 偏移）。
+- 产物示例（修复前最后一轮）：
+  `exe=/usr/bin/Xwayland pc=0xe56dcc x20=0x15c insn@pc=0xad40669a
+  （ldp q26,q25,[x20]）`，映射表 + 栈字直接给出库与调用者。
+
+### 根因链（逐环实证）
+
+1. PC 0xe56dcc 落在 `libgallium-25.2.7.so` 映射（0x71c000 + 0x73adcc，
+   页内偏移 0xdcc 与文件字节唯一匹配）。
+2. 函数边界（.eh_frame FDE 0x73ada0..0x73aed0）+ 反汇编形状 + 寄存器
+   上下文（fp==sp、calloc(1,0x218) 返回后 `ldp q26,q25,[x20]`）锁定为
+   **`llvmpipe_resource_from_memobj(pscreen, templat, memobj, offset)`**
+   （mesa-25.2.7 lp_texture.c:496）；对照源码逐字段吻合（screen 双写、
+   `lpmo->size` 校验、`mem_alloc->cpu_addr`、`id_counter++`、
+   `pipe_reference(NULL,&lpmo->reference)`）。
+3. 现场参数 `(screen, 0x15c, 2)`：`templat=0x15c` 是 **PIPE_FORMAT 枚举
+   被当指针解引用**（`lpr->base = *templat` 的 0x80 字节 SIMD 拷贝，故障
+   VA == 模板指针 == 0x15c）。
+4. 栈字 `[sp+8] = 0xd1cc664` → 调用者在 **libEGL.so.1.0.0**（26.2.3）内
+   `+0x19664`：`mov w1,#0x15c; ldr x6,[x20,#0x6c0]; blr x6; tbz w0,#0`
+   ——按 26.2.3 的 `pipe_screen` 布局在 +0x6c0 调
+   **`is_format_supported(pscreen, format, PIPE_TEXTURE_2D, 0, 0,
+   PIPE_BIND_RENDER_TARGET)`**（构建 FBConfig 的常规检查）。
+5. **虚表错位**：26.2.3 的 `pipe_screen` 在方法区前插入了 caps/
+   shader_caps/nir_options 等数据成员，方法区整体后移；`+0x6c0` 在
+   26.2.3 是 `is_format_supported`，在 25.2.7 的同一偏移是
+   `resource_from_memobj`。screen 对象由 25.2.7 创建（libGL-25.2.7 →
+   libgallium-25.2.7 的 GLX/AIGLX 侧），调用方是 libEGL-26.2.3——
+   两个 mesa 代在 Xwayland 进程内共存。
+6. **版本分裂的来源**：rootfs 基底是 v3.23（mesa 25.2.7：libGL、
+   libGLESv1/v2、libgallium-25.2.7），第三轮起手动注入了 26.2.x 的
+   libEGL/libgbm/dri_gbm/zink_dri（deniald 的 EGL 需要 26.2.3 的
+   zink-venus），libGL/libGLES/libgallium-25.2.7 留在原位。桥接实体：
+   `/usr/lib/dri/libdril_dri.so`（25.2.7 实文件）与
+   `/usr/lib/zink_dri.so`（26.2.3 shim）SONAME 同为 `libdril_dri.so`，
+   musl dlopen 先到先得，跨代 screen 经 shim/EGL 共享流到对方；
+   `dri_get_pipe_screen@plt` 拿到的 pipe_screen 与调用方的结构体布局
+   分属两代。
+7. 时间线吻合：0x15c 崩溃首次出现 == 第三轮首次注入 26.2.x == 首次
+   出现两代共存。
+
+### 修复：统一 mesa 栈到 26.2.4 齐套
+
+CDN 上 26.2.3 的 mesa-gl/mesa-gles 已被 edge 滚走（edge 现行
+26.2.4-r1），故取 edge 26.2.4 全家桶：mesa（libgallium-26.2.4 +
+gbm/dri_gbm）、mesa-gl（libGL-26.2.4，NEEDED libgallium-26.2.4）、
+mesa-gles、mesa-egl、mesa-gbm、mesa-dri-gallium（dri/*.so →
+libdril_dri.so 26.2.4）、mesa-vulkan-virtio（libvulkan_virtio + ICD
+json，json 与旧版逐字节相同）；`/usr/share/drirc.d/` 26.2.4 默认配置
+一并注入。删除 `libgallium-25.2.7.so`、`libgallium-26.2.3.so`、
+`/usr/lib/zink_dri.so`（ SONAME 冲突的第二份），dri 符号链接统一指
+向 26.2.4 的 `libdril_dri.so`。全部文件 debugfs 注入后 MD5 回读校验。
+
+### 差分 A/B 复测（同一内核、同一 rootfs、仅换 mesa 栈）
+
+| 栈 | Xwayland @2.8s | 启动帧 |
+| --- | --- | --- |
+| 第九轮混装（25.2.7 GL + 26.2.3 EGL） | `SIGSEGV at VA:0x15c`（与三~九轮同址同形态） | 黑 |
+| 统一 26.2.4 | **零 SIGSEGV，`Xwayland is ready display=:0`**（历史首次） | 黑 |
+
+修复判定成立：0x15c 崩溃根因 = mesa 栈版本分裂，与 MoltenVK、内核
+UAPI、venus 协议无关。
+
+### 收官状态与新前沿
+
+- 收官：Xwayland 存活跨全程（数分钟级），XEmbed tray host window 映
+  射，deniald 心跳/present 链健康（`deadline_to_presentation_p50≈15ms`
+  在 16.6ms 预算内，missed_vblanks=0），shell Dart 侧仅剩非致命
+  `/run/user/0/bus`（无 D-Bus session bus）SocketException。
+- **新前沿（下一轮主攻）**：scanout 仍 100% 纯黑，但证据链显示内容存
+  在于合成器侧——hostmem BAR dump 中 atlas blob（2MB）有完整壁纸
+  （暗红 (41,8,19)，stride≠2560 有剪切），Flutter 引擎 GPU 光栅在跑
+  （`gpu_render_samples=28/43`、damage rect `336,0-640,45` 顶栏区域、
+  present_callback ~1ms），而被 flip 的池缓冲（res 29/30，1.3MB）
+  在 BAR 中无映射（`info mtree` 仅剩 144KB blob），scanout 读宿主侧
+  资源内存为黑。26.2.4 的 GPU 时间戳值异常（`gpu_flutter_render` 达
+  4.8e12 µs 量级，疑似 timestamp 频率/单位失配），只能用于判定
+  「有 GPU 活动」，不能用于耗时。下一手：沿 pool buffer 的导入/呈现
+  路径取实（dmabuf 导入是否落 shadow、fence 归还、blob 映射策略），
+  以及 26.2.4 zink-venus 的 GPU timestamp 语义核对。
+
+### 工程备忘（本轮新增）
+
+- **内核崩溃取证是 guest 侧 ptrace 的替代品**：`warn` 级一次性输出
+  （comm/exe/PC/LR/全寄存器/指令字/映射表/栈字），本例从零到锁定
+  「库内偏移+调用者」只用了一轮重启。aarch64 FP 链在 `stp x29,x30,
+  [sp,#-N]!` 序言下从 `[sp]`/`[sp+8]` 读，不要减 16（riscv64 语义）。
+- **mesa 栈注入的版本一致性纪律**：libgallium 是 VERSIONED SONAME
+  （`libgallium-<ver>.so`），多代可以同时加载；pipe_screen 无版本化
+  ABI，跨代共享即虚表错位。换 mesa 必须整套换（libGL/libGLES/libEGL/
+  libgbm/gbm 后端/dri shims/libvulkan_virtio + drirc.d），并清掉旧代
+  文件（含 `/usr/lib` 根下的散落 shim）。
+- busybox `wget --post-file` 响应体落盘修复：POST 前同时清理
+  `/tmp/snap` 与 `/root/snap`（CWD 在 /root），本轮 watcher 全量
+  dd.log 上传（`/tmp/pulled/ddfull.*`）打通。
+- `libgallium-26.2.4.so` 依赖 `libLLVM.so.23.1`/`libSPIRV-Tools.so`/
+  `libzstd` 与 26.2.3 相同，无需连带升级。

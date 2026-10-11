@@ -1,6 +1,8 @@
 use alloc::sync::Arc;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 use core::mem::{MaybeUninit, align_of, size_of};
+#[cfg(target_arch = "loongarch64")]
+use core::mem::MaybeUninit;
 
 use ax_runtime::hal::cpu::user::UserContext;
 use linux_raw_sys::general::{CLD_CONTINUED, CLD_STOPPED, CLD_TRAPPED, RLIMIT_RTTIME};
@@ -12,7 +14,11 @@ use super::{
     get_process_data_by_number, get_process_group_by_number, get_task_by_number,
     signal_publication::publish_before_fatal_stop_release,
 };
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 use crate::mm::vm_read_slice;
 use crate::{
     StarryError, StarryResult,
@@ -53,14 +59,17 @@ impl SyscallRestartInfo {
     }
 }
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 #[derive(Clone, Copy)]
 struct UserStackFrame {
     fp: usize,
     ra: usize,
 }
 
-#[cfg(target_arch = "riscv64")]
+/// Reads one frame-pointer chain frame: the caller's saved fp at `[fp]` and
+/// the return address at `[fp + 8]`. Both riscv64 (`s0` prologue store) and
+/// aarch64 (`stp x29, x30` prologue store) place the pair in this order.
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 fn read_user_stack_frame(current: &UserTaskRef, fp: usize) -> Option<UserStackFrame> {
     let frame_addr = fp.checked_sub(size_of::<UserStackFrame>())?;
     if frame_addr == 0 || !frame_addr.is_multiple_of(align_of::<usize>()) {
@@ -113,11 +122,139 @@ fn dump_user_backtrace(current: &UserTaskRef, uctx: &UserContext) {
     }
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(target_arch = "aarch64")]
+fn dump_user_backtrace(current: &UserTaskRef, uctx: &UserContext) {
+    const MAX_USER_FRAMES: usize = 32;
+
+    let mut fp = uctx.x[29] as usize;
+    warn!(
+        "user backtrace:\n  #00 pc={:#018x} lr={:#018x} sp={:#018x} fp={:#018x}",
+        uctx.elr, uctx.x[30], uctx.sp, fp
+    );
+
+    for depth in 1..MAX_USER_FRAMES {
+        let Some(frame) = read_user_stack_frame(current, fp) else {
+            warn!("  <unwind stopped: unreadable frame at fp={:#018x}>", fp);
+            break;
+        };
+
+        if frame.fp == 0 || frame.ra == 0 {
+            break;
+        }
+        if frame.fp <= fp {
+            warn!(
+                "  <unwind stopped: non-growing fp {:#018x} after {:#018x}>",
+                frame.fp, fp
+            );
+            break;
+        }
+
+        let frame_sp = frame.fp - size_of::<UserStackFrame>();
+        warn!(
+            "  #{:02} pc={:#018x} sp={:#018x} fp={:#018x}",
+            depth, frame.ra, frame_sp, frame.fp
+        );
+        fp = frame.fp;
+    }
+}
+
+/// Prints the faulting instruction words when the architecture has a fixed
+/// 4-byte instruction encoding, so the faulting load/store can be decoded
+/// offline without a guest debugger.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "loongarch64"
+))]
+fn dump_user_instructions(current: &UserTaskRef, pc: usize) {
+    if !pc.is_multiple_of(4) {
+        return;
+    }
+    let mut words = [MaybeUninit::<u32>::uninit(); 2];
+    match vm_read_slice(current, pc as *const u32, &mut words) {
+        Ok(()) => warn!(
+            "  insn@pc: {:#010x} {:#010x}",
+            unsafe { words[0].assume_init() },
+            unsafe { words[1].assume_init() }
+        ),
+        Err(err) => warn!("  insn@pc unreadable at {pc:#x}: {err:?}"),
+    }
+}
+
+/// x86 has variable-length instructions; faulting bytes are not dumped here.
+#[cfg(target_arch = "x86_64")]
+fn dump_user_instructions(_current: &UserTaskRef, _pc: usize) {}
+
+/// Prints the executable mappings plus the mapping containing `pc`, so a
+/// stripped-guest PC can be attributed to its load module (main binary vs.
+/// one of its shared libraries) and file offset offline.
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+fn dump_user_mappings(current: &UserTaskRef, pc: usize) {
+    use ax_runtime::hal::paging::MappingFlags;
+
+    let Ok(aspace) = current.as_thread().proc_data.pin_aspace() else {
+        warn!("  <crash maps unavailable: aspace not pinned>");
+        return;
+    };
+    let mm = aspace.lock();
+    let Ok(records) = mm.vma_inspection_records() else {
+        warn!("  <crash maps unavailable: vma inspection failed>");
+        return;
+    };
+    warn!("crash mappings (pc={pc:#x}):");
+    let mut printed = 0usize;
+    for area in &records {
+        let (start, end) = (area.start().as_usize(), area.end().as_usize());
+        let flags = area.reported_flags();
+        let is_exec = flags.contains(MappingFlags::EXECUTE);
+        if !is_exec && !(pc >= start && pc < end) {
+            continue;
+        }
+        let info = area.file_info();
+        warn!(
+            "  {:#018x}-{:#018x} {}{}{}{} file={} offset={:#x}",
+            start,
+            end,
+            if flags.contains(MappingFlags::READ) {
+                'r'
+            } else {
+                '-'
+            },
+            if flags.contains(MappingFlags::WRITE) {
+                'w'
+            } else {
+                '-'
+            },
+            if is_exec { 'x' } else { '-' },
+            if info.shared { 's' } else { 'p' },
+            info.path,
+            info.offset.unwrap_or(0),
+        );
+        printed += 1;
+        if printed >= 48 {
+            warn!("  <crash mappings truncated>");
+            break;
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+fn dump_user_mappings(_current: &UserTaskRef, _pc: usize) {}
+
+#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
 fn dump_user_backtrace(_current: &UserTaskRef, _uctx: &UserContext) {}
 
 /// Dump user-mode register state once the signal disposition really terminates.
 fn dump_user_crash_context(current: &UserTaskRef, uctx: &UserContext) {
+    let thread = current.as_thread();
+    warn!(
+        "crash task: proc={:?} tid={} exe={} task={}",
+        thread.proc_data.proc,
+        thread.tid(),
+        thread.proc_data.exe_path(),
+        current.id_name(),
+    );
+
     #[cfg(target_arch = "riscv64")]
     {
         let r = &uctx.regs;
@@ -162,9 +299,49 @@ fn dump_user_crash_context(current: &UserTaskRef, uctx: &UserContext) {
     #[cfg(target_arch = "aarch64")]
     {
         warn!(
-            "user register dump:\n  pc(elr)={:#018x} spsr={:#018x}\n  x0={:#018x} x1={:#018x} \
-             x2={:#018x} x3={:#018x}\n  x29(fp)={:#018x} x30(lr)={:#018x}",
-            uctx.elr, uctx.spsr, uctx.x[0], uctx.x[1], uctx.x[2], uctx.x[3], uctx.x[29], uctx.x[30],
+            "user register dump:\n  pc(elr)={:#018x} spsr={:#018x} sp={:#018x}\n  \
+             x0={:#018x} x1={:#018x} x2={:#018x} x3={:#018x}\n  \
+             x4={:#018x} x5={:#018x} x6={:#018x} x7={:#018x}\n  \
+             x8={:#018x} x9={:#018x} x10={:#018x} x11={:#018x}\n  \
+             x12={:#018x} x13={:#018x} x14={:#018x} x15={:#018x}\n  \
+             x16={:#018x} x17={:#018x} x18={:#018x} x19={:#018x}\n  \
+             x20={:#018x} x21={:#018x} x22={:#018x} x23={:#018x}\n  \
+             x24={:#018x} x25={:#018x} x26={:#018x} x27={:#018x}\n  \
+             x28={:#018x} x29(fp)={:#018x} x30(lr)={:#018x}",
+            uctx.elr,
+            uctx.spsr,
+            uctx.sp,
+            uctx.x[0],
+            uctx.x[1],
+            uctx.x[2],
+            uctx.x[3],
+            uctx.x[4],
+            uctx.x[5],
+            uctx.x[6],
+            uctx.x[7],
+            uctx.x[8],
+            uctx.x[9],
+            uctx.x[10],
+            uctx.x[11],
+            uctx.x[12],
+            uctx.x[13],
+            uctx.x[14],
+            uctx.x[15],
+            uctx.x[16],
+            uctx.x[17],
+            uctx.x[18],
+            uctx.x[19],
+            uctx.x[20],
+            uctx.x[21],
+            uctx.x[22],
+            uctx.x[23],
+            uctx.x[24],
+            uctx.x[25],
+            uctx.x[26],
+            uctx.x[27],
+            uctx.x[28],
+            uctx.x[29],
+            uctx.x[30],
         );
     }
     #[cfg(target_arch = "x86_64")]
@@ -194,7 +371,57 @@ fn dump_user_crash_context(current: &UserTaskRef, uctx: &UserContext) {
         warn!("user register dump: not implemented for this arch");
     }
 
+    dump_user_instructions(current, uctx.ip());
+    dump_user_mappings(current, uctx.ip());
+    dump_user_stack(current, uctx);
     dump_user_backtrace(current, uctx);
+}
+
+/// Prints the first words of the faulting thread's stack. A frame whose
+/// prologue stored the caller's fp/lr pair (aarch64 `stp x29, x30, [sp,
+/// #-N]!`) has the caller's return address at `[sp + 8]`, which recovers the
+/// call site even when the fp chain itself is broken.
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+fn dump_user_stack(current: &UserTaskRef, uctx: &UserContext) {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct StackWord(usize);
+
+    let sp = uctx.sp();
+    if sp == 0 || !sp.is_multiple_of(8) {
+        return;
+    }
+    let mut words = [MaybeUninit::<StackWord>::uninit(); 8];
+    match vm_read_slice(current, sp as *const StackWord, &mut words) {
+        Ok(()) => {
+            for (i, word) in words.iter().enumerate() {
+                warn!(
+                    "  stack[sp+{:#x}] = {:#018x}",
+                    i * 8,
+                    unsafe { word.assume_init() }.0
+                );
+            }
+        }
+        Err(err) => warn!("  stack@sp unreadable: {err:?}"),
+    }
+}
+
+#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+fn dump_user_stack(_current: &UserTaskRef, _uctx: &UserContext) {}
+
+/// Prints the register image of a synchronous fault that `raise_signal_fatal`
+/// is about to force-deliver. Fires once per process generation regardless of
+/// the disposition: a user handler (e.g. an X server crash handler) runs
+/// instead of the terminating dump, and a racing parent exit can bypass both,
+/// so the fault site is captured here before delivery changes the picture.
+pub(crate) fn dump_sync_fault_if_terminating(signo: Signo, uctx: &UserContext) {
+    let curr = current_user_task();
+    let thread = curr.as_thread();
+    if !thread.proc_data.claim_sync_fault_dump() {
+        return;
+    }
+    warn!("first sync {signo:?} fault of this process; dumping faulting context");
+    dump_user_crash_context(&curr, uctx);
 }
 
 /// Block the current thread in a ptrace stop.

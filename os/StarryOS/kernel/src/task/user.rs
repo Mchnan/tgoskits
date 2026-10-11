@@ -56,6 +56,10 @@ fn handle_user_page_fault(
             "{:?}: synchronous {signo:?} memory fault at {:#x} {:?}",
             thread.proc_data.proc, address, flags
         );
+        // Capture the register image before delivery: the terminating dump
+        // downstream only fires when this signal really terminates the
+        // process, which a handler-installed or racing exit can bypass.
+        super::dump_sync_fault_if_terminating(signo, context);
         raise_signal_fatal(
             SignalInfo::new_fault(signo, si_code, address.as_usize()),
             context,

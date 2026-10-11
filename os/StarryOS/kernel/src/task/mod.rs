@@ -38,6 +38,7 @@ mod user_memory_access;
 mod user_wait;
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) use process_ptrace::{PtraceAttachMode, PtraceWaitAction, PtraceWaitStop};
 pub use process_ptrace::{PtraceStopFpData, SyscallTraceState};
@@ -106,6 +107,10 @@ pub struct ProcessData {
     ptrace: ProcessPtraceState,
     /// Job-control stop state and parent-report delivery.
     job_control: ProcessJobControl,
+    /// Guards the one-shot synchronous-fault register dump: set once a sync
+    /// fault of this process generation has been dumped, so a handler-driven
+    /// re-fault loop cannot flood the console.
+    sync_fault_dumped: AtomicBool,
 }
 
 /// Fallible resources prepared before publishing one process generation.
@@ -202,6 +207,7 @@ impl ProcessData {
             cgroup: ProcessCgroupState::new(&identity, cgroup),
             ptrace: ProcessPtraceState::new(),
             job_control: ProcessJobControl::new(),
+            sync_fault_dumped: AtomicBool::new(false),
         });
         identity.bind_process(proc, exit_event, Arc::downgrade(&this));
         this
@@ -223,6 +229,14 @@ impl ProcessData {
     /// Returns the current or final cgroup membership snapshot.
     pub(crate) fn cgroup_node(&self) -> Arc<ax_cgroup::CgroupNode> {
         self.cgroup.current()
+    }
+
+    /// Claims the process's single synchronous-fault register dump. The fault
+    /// is dumped once per process generation regardless of the signal
+    /// disposition: a handler may swallow or re-raise the fault, and the
+    /// terminating dump can be bypassed by either.
+    pub(crate) fn claim_sync_fault_dump(&self) -> bool {
+        !self.sync_fault_dumped.swap(true, Ordering::AcqRel)
     }
 
     /// Moves this live process under its per-generation transaction.
