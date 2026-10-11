@@ -661,3 +661,101 @@ UAPI、venus 协议无关。
   dd.log 上传（`/tmp/pulled/ddfull.*`）打通。
 - `libgallium-26.2.4.so` 依赖 `libLLVM.so.23.1`/`libSPIRV-Tools.so`/
   `libzstd` 与 26.2.3 相同，无需连带升级。
+
+## scanout 黑屏根因闭合：linear tiling 直通（2026-10-11，第十一轮，上屏轮）
+
+第十轮遗留的 scanout 100% 纯黑在本轮闭合：**venus 加速桌面历史首次
+真实上屏**（壁纸、时钟、顶栏组件全部正确渲染，时钟跨分钟走字）。
+修复只在宿主侧 vkr（virglrenderer `darwin-venus` 本地提交
+`0b8b4914`），guest 内核与 rootfs 零改动。
+
+### 排除过程（先证伪「scanout 没建立」）
+
+- QEMU 侧 `virgl_cmd_set_scanout_blob` 的非 GL console 路径要求 blob
+  已映射（`res->map_fixed` 或 `res->mr`），否则报
+  `no mapped memory for blob scanout` 拒绝。上一轮 668 次
+  `TEMP set_scanout_blob` 中该错误为 **0 次**——scanout 绑定层工作
+  正常，DisplaySurface 每次都引用到了池缓冲的映射内存。
+- 因此黑屏不在绑定层而在**内容层**：被 flip 的池缓冲的映射内存里
+  没有线性可见的渲染结果。
+
+### 根因链（逐环实证）
+
+1. **vkr darwin shim 的 tiling 改写**：`vkr_image.c` 在 vkCreateImage
+   把 guest 请求的 `VK_IMAGE_TILING_LINEAR/DRM_FORMAT_MODIFIER_EXT`
+   一律改写成 `OPTIMAL`（注释理由：MoltenVK 两者都不支持）。改写后
+   MoltenVK 把渲染输出写进 **Metal 私有 MTLTexture 存储**。
+2. **shm 背书内存恒零**：darwin 路径所有 HOST_VISIBLE
+   VkDeviceMemory 都是 `vkr_mtl_shm_alloc`（匿名 shm +
+   `newBufferWithBytesNoCopy` 包成 Shared MTLBuffer）；blob 资源导出
+   的就是这个 shm fd，guest 经 hostmem BAR 映射它，QEMU pixman
+   scanout 读它——OPTIMAL 纹理的渲染结果永远不落到这些字节上，
+   读出来全零 → 黑屏。BAR 里「有壁纸的 atlas blob」是 deniald
+   CPU 写入的 background blob，与 GPU 渲染无关，两相对照正是本根因。
+3. **guest 侧本来就请求 LINEAR**：deniald 经 smithay
+   GbmAllocator 请求 `[Modifier::Linear]`；zink 因 vkr 注入了
+   `VK_EXT_image_drm_format_modifier`（假支持）+ modifier props
+   实际为空，走「非 modifier LINEAR 回退」以
+   `VK_IMAGE_TILING_LINEAR` 调 vkCreateImage——唯一把它变成
+   OPTIMAL 的就是 vkr 的改写。Flutter 的 EGL dmabuf 导入路径
+   （`ZINK_BIND_DMABUF`）同样请求 LINEAR。
+4. **MoltenVK 实际支持 linear 渲染**：`validateLinear` 接受 2D/单
+   mip/单 layer/非深度压缩 BGRA8；`renderLinearTextures =
+   supportsApple1` 在 M4 上为 true；`bindDeviceMemory` 对 linear 图像
+   走 texel buffer 路径——`_mtlTexelBuffer = _deviceMemory->_mtlBuffer`
+   即 shm 包装的 MTLBuffer，**渲染像素直接写 shm 字节**。
+5. 导入侧同样闭合：Flutter 导入 R2 的内存是
+   `vkr_mtl_shm_import`（对同一 shm fd 的 mmap 再包 MTLBuffer，
+   `newBufferWithBytesNoCopy` 无拷贝），两个 MTLBuffer 共享同一
+   物理页，Shared 模式下 CPU/GPU 一致。
+
+### 修复（vkr 三处，guest 零改动）
+
+- `vkr_image.c` vkCreateImage：仅把 `DRM_FORMAT_MODIFIER_EXT`
+  翻译为 `LINEAR`（guest 唯一 modifier 就是 LINEAR），**停止把
+  LINEAR 改写成 OPTIMAL**；继续剥离 modifier/external-memory 结构；
+  创建后记录 `img->linear`。
+- `vkr_image.c` vkGetImageSubresourceLayout：linear 图像**直通
+  MoltenVK**（texel buffer 的真实 pitch 含行对齐，是 guest 构造
+  gbm stride 与 ADDFB2 pitch 的事实来源）；256 对齐合成仅保留为
+  OPTIMAL 图像的回退。
+- `vkr_physical_device.c` 图像格式查询回退：LINEAR/DRM_MODIFIER
+  查询失败时先按 **LINEAR** 配置重答（与创建行为一致），再退
+  OPTIMAL 派生答案。
+
+### 验证（端到端）
+
+- screendump 640x480 **distinct=45,498 色**（第十轮恒 1）——壁纸
+  渐变、时钟 `07:03→07:06` 跨分钟走字、顶栏 CPU/日期组件正确，
+  无剪切无花屏。
+- present 链健康：`deadline_to_presentation_p50≈14.9–16.4ms` 在
+  16.6ms 预算内、`missed_vblanks=0`、`present_callback≈424–760µs`
+  （第十轮 ~1ms）、`presented_outputs=1`、`target_blocked_*=0`。
+- 稳定性：心跳 4 分钟+ 持续（dispatch_seq 每秒 ~90 增长）、
+  261+ 次 flip 零 `vkr fatal`/ring 退出、内核零新告警、
+  `Xwayland is ready display=:0`。
+- 桌面空闲时呈事件驱动稀疏帧（~2s 一帧，与 llvmpipe 时期同形态）；
+  光栅耗时 `raster_avg≈1.5–2.4ms`（CPU 侧），60Hz 负载下的实测
+  帧率是下一轮的测量项。
+
+### 工程备忘（本轮新增）
+
+- **blob scanout 的可见性判据**：非 GL console 的零拷贝 scanout
+  读的是 shm 字节，所以扫描出的图像必须是「渲染写内存」的形态——
+  MoltenVK 上即 `VK_IMAGE_TILING_LINEAR`（texel buffer 背书）；
+  OPTIMAL 渲染只存在于 Metal 私有存储，对 BAR/scanout 永远不可见。
+  「合成器侧有内容 + 屏幕黑」的组合首先怀疑 tiling 改写。
+- **pitch 一致性**：linear 直通后 layout 查询返回 MoltenVK 真实
+  pitch（`minimumLinearTextureAlignmentForPixelFormat` 行对齐），
+  guest 全链（gbm stride/ADDFB2/scanout）单一事实来源；合成
+  256 对齐答案只给 OPTIMAL 遗留路径。当前几何（640/848 宽）两种
+  口径一致，非 4 倍数宽度下必须用直通答案。
+- QEMU 日志判读：`TEMP set_scanout_blob` 次数高且无
+  `no mapped memory` ⇒ scanout 绑定层健康，黑屏去内容层找。
+- GPU timestamp 语义：本轮 `gpu_render_samples=0`（第十轮 28/43，
+  4.8e12 µs 异常值），linear 下 zink 查询池路径的采样行为变化
+  待核对；仅影响度量，不影响出帧。
+- 宿主侧重建口径：改 vkr 只需 `ninja -C build-darwin &&
+  ninja install`（QEMU 动态链接 `prefix/lib/libvirglrenderer.1.dylib`，
+  render server 是 `prefix/libexec/virgl_render_server` 静态链接，
+  两者同树重建即一致），无需重编 QEMU/MoltenVK/guest。

@@ -1,6 +1,6 @@
-// venus/zink 加速桌面端到端闭环 — 现状与计划（第十轮收官，2026-10-11）
-// 内核取证轮：Xwayland SIGSEGV@0x15c 根因闭合（mesa 栈版本分裂 + 虚表错位），
-// 统一 mesa 栈到 26.2.4 齐套，A/B 差分证实修复，Xwayland 历史首次 ready。
+// venus/zink 加速桌面端到端闭环 — 现状与计划（第十一轮收官，2026-10-11）
+// 上屏轮：scanout 黑屏根因闭合（vkr 把 LINEAR 改写 OPTIMAL → 渲染落 Metal
+// 私有存储 → shm 恒零），linear tiling 直通后 venus 加速桌面历史首次上屏。
 import {
   Stack, Row, Grid, H1, H2, H3, Text, Card, CardHeader, CardBody,
   Table, Pill, Stat, Callout, Code, Divider, ArchGraph, TodoListCard,
@@ -13,66 +13,78 @@ function FL({ path, label }: { path: string; label: string }) {
   return <FileLink path={path} label={label} dispatch={dispatch} />;
 }
 
-const crashChain = {
+const blackChain = {
   nodes: [
-    { id: "split", label: "mesa两代共存" },
-    { id: "soname", label: "SONAME撞名shim" },
-    { id: "share", label: "screen跨代共享" },
-    { id: "vtable", label: "虚表槽位错位" },
-    { id: "deref", label: "格式当指针" },
-    { id: "crash", label: "SIGSEGV@0x15c" },
+    { id: "request", label: "guest 请求 LINEAR tiling" },
+    { id: "rewrite", label: "vkr 改写为 OPTIMAL" },
+    { id: "private", label: "渲染落 Metal 私有存储" },
+    { id: "shmzero", label: "shm 背书内存恒零" },
+    { id: "scanout", label: "scanout 读 shm 全黑" },
   ],
   edges: [
-    { from: "split", to: "soname", label: "libdril_dri.so双份" },
-    { from: "soname", to: "share", label: "dlopen先到先得" },
-    { from: "share", to: "vtable", label: "25.2.7建/26.2.3调" },
-    { from: "vtable", to: "deref", label: "+0x6c0槽位移位" },
-    { from: "deref", to: "crash", label: "0x80B拷贝构造" },
+    { from: "request", to: "rewrite", label: "darwn shim 旧假设：MVK 无 linear" },
+    { from: "rewrite", to: "private", label: "OPTIMAL = MTLTexture 私有存储" },
+    { from: "private", to: "shmzero", label: "私有存储 ≠ 设备内存字节" },
+    { from: "shmzero", to: "scanout", label: "BAR 映射与 pixman scanout 同源" },
+  ],
+};
+
+const fixChain = {
+  nodes: [
+    { id: "keep", label: "vkr 停改写：DRM_MODIFIER→LINEAR" },
+    { id: "texel", label: "MoltenVK texel buffer 路径" },
+    { id: "write", label: "渲染像素写入 shm 字节" },
+    { id: "visible", label: "BAR/scanout 直读可见" },
+  ],
+  edges: [
+    { from: "keep", to: "texel", label: "renderLinearTextures=Apple GPU" },
+    { from: "texel", to: "write", label: "_mtlTexelBuffer=shm 包装" },
+    { from: "write", to: "visible", label: "Shared 存储零拷贝一致" },
   ],
 };
 
 const evidenceHeaders = ["证据", "取证方法", "结论"];
 const evidenceAlign: Array<TableColumnAlign | undefined> = ["left", "left", "left"];
 const evidenceRowTones: Array<TableRowTone | undefined> = [
-  "success", "success", "success", "success", "info", "warning",
+  "success", "success", "success", "success", "success", "success",
 ];
 const evidenceRows = [
   [
-    "pc=0xe56dcc x20=0x15c insn@pc=0xad40669a（ldp q26,q25,[x20]）",
-    "内核同步 fault 一次性 dump：全量寄存器 + 指令字 + 映射表 + 栈字",
-    "0x80 字节 SIMD 拷贝构造从 x20=0x15c 解引用——PIPE_FORMAT 枚举被当模板指针",
+    "668 次 TEMP set_scanout_blob，`no mapped memory` 0 次",
+    "上一轮 QEMU 日志全量复查",
+    "scanout 绑定层完全正常（每次都引用到已映射内存）——黑屏在内容层",
   ],
   [
-    "PC 0xe56dcc ∈ libgallium-25.2.7.so（0x71c000+0x73adcc）",
-    "crash mappings + .eh_frame FDE（0x73ada0..0x73aed0）+ 源码逐字段对照",
-    "锁定 llvmpipe_resource_from_memobj（25.2.7 lp_texture.c:496）",
+    "vkr_image.c 把 guest LINEAR/DRM_MODIFIER 一律改写 OPTIMAL",
+    "源码审读 + 注释考古（旧假设：MoltenVK 无 linear）",
+    "OPTIMAL 渲染落 Metal 私有 MTLTexture 存储，与 shm 字节无关",
   ],
   [
-    "栈字 [sp+8]=0xd1cc664 ∈ libEGL-26.2.3 +0x19664",
-    "aarch64 序言 stp x29,x30,[sp,#-N]! 下调用者返回地址在 [sp+8]",
-    "调用点 ldr x6,[x20,#0x6c0]; blr x6 = 26.2.3 布局的 is_format_supported",
+    "darwin 路径 HOST_VISIBLE 内存 = 匿名 shm + newBufferWithBytesNoCopy",
+    "vkr_metal_helpers.m / vkr_device_memory.c 审读",
+    "blob 导出 shm fd = guest BAR 映射 = pixman scanout 读取——恒零即黑",
   ],
   [
-    "26.2.3 的 pipe_screen 在方法区前插入 caps/shader_caps/nir_options",
-    "两代 p_screen.h 逐槽对照（is_format_supported：25.2.7 #12 / 26.2.3 #14，字节偏移后移至 +0x6c0）",
-    "同偏移在 25.2.7 虚表上是 resource_from_memobj——虚表错位实锤",
+    "guest 本来就请求 LINEAR（smithay gbm [Linear] → zink 非 modifier 回退）",
+    "deniald kms_state.rs + zink_resource.c + vkr 假扩展注入链审读",
+    "把它变 OPTIMAL 的只有 vkr 改写，guest 零改动即可修复",
   ],
   [
-    "A/B 差分（同内核同 rootfs，仅换 mesa 栈）",
-    "第九轮混装栈 vs 统一 26.2.4 齐套，各跑一轮 e2e",
-    "混装栈 @2.8s 崩溃复现；统一栈零 SIGSEGV，Xwayland 历史首次 ready",
+    "MoltenVK 支持 linear 渲染：renderLinearTextures=supportsApple1（M4=true）",
+    "MVKImage.mm validateLinear/bindDeviceMemory texel buffer 路径审读",
+    "linear 图像渲染像素直接写入 shm 包装的 MTLBuffer",
   ],
   [
-    "scanout 仍 100% 黑，但 atlas blob 有完整壁纸（暗红 41,8,19）",
-    "QEMU pmemsave 读 hostmem BAR + 逐像素统计",
-    "内容在合成器侧存在；池缓冲→scanout 可见性是下一前沿（与 mesa 代际无关）",
+    "screendump distinct=45,498（第十轮恒 1）+ 时钟跨分钟走字",
+    "QEMU monitor screendump + 逐像素统计 + 70s 间隔复测",
+    "端到端上屏实锤：壁纸/时钟/顶栏组件全部正确，无剪切无花屏",
   ],
 ];
 
 const closedHeaders = ["链条", "轮次", "处置", "状态"];
 const closedAlign: Array<TableColumnAlign | undefined> = ["left", "left", "left", "left"];
 const closedRowTones: Array<TableRowTone | undefined> = [
-  "success", "success", "success", "success", "success", "warning",
+  "success", "success", "success", "success", "success", "success", "success",
 ];
 const closedRows = [
   [
@@ -107,61 +119,57 @@ const closedRows = [
   ],
   [
     "scanout 100% 黑（内容在合成器侧，池缓冲不可见）",
-    "第十轮定性",
-    "pool buffer 导入/呈现路径与 blob 映射策略待查",
-    "活跃前沿",
+    "第十一轮",
+    "vkr 停改写 LINEAR tiling（0b8b4914）：渲染写 shm 字节，scanout 直读",
+    "已闭合",
+  ],
+  [
+    "GPU timestamp 语义（4.8e12 µs 异常值；本轮 samples=0）",
+    "第十一轮记录",
+    "仅影响度量不影响出帧，zink 查询池采样行为待核对",
+    "非阻塞待办",
   ],
 ];
 
 const planItems = [
   {
-    id: "r10-forensics",
-    content: "内核崩溃取证四件套落地：全量寄存器 / insn@pc / crash mappings / 栈顶 8 字，per-process 一次性 dump（handle_user_page_fault 在 force-deliver 前调用，无视 disposition）",
+    id: "r11-exclude",
+    content: "排除「scanout 没建立」：上一轮 668 次 set_scanout_blob 零拒绝，绑定层正常——黑屏收敛到内容层",
     status: "completed" as const,
   },
   {
-    id: "r10-func",
-    content: "崩溃函数锁定：libgallium-25.2.7 的 llvmpipe_resource_from_memobj（FDE 边界 + 反汇编形状 + 源码逐字段吻合）",
+    id: "r11-root",
+    content: "根因定性：vkr darwin shim 把 guest LINEAR/DRM_MODIFIER tiling 改写 OPTIMAL，渲染落 Metal 私有存储，shm 背书内存（BAR/scanout 同源）恒零",
     status: "completed" as const,
   },
   {
-    id: "r10-caller",
-    content: "调用者锁定：libEGL-26.2.3 +0x19664 的 is_format_supported 调用点（栈字 [sp+8] 直接给出）",
+    id: "r11-fix",
+    content: "修复（vkr 三处，guest 零改动）：vkCreateImage 停改写（仅 DRM_MODIFIER→LINEAR）；layout 查询对 linear 图像直通 MoltenVK；图像格式查询失败先按 LINEAR 重答",
     status: "completed" as const,
   },
   {
-    id: "r10-root",
-    content: "根因定性：mesa 栈版本分裂（25.2.7 GL 侧 / 26.2.3 EGL 侧）+ pipe_screen 无版本化 ABI 的虚表错位；桥接实体 = SONAME 撞名的双份 dril shim",
+    id: "r11-verify",
+    content: "端到端验证：screendump distinct=45,498、时钟 07:03→07:06 走字、deadline p50≈14.9–16.4ms 在预算内、missed_vblanks=0、心跳 4 分钟+、261+ flip 零 vkr fatal",
     status: "completed" as const,
   },
   {
-    id: "r10-fix",
-    content: "修复：统一 mesa 栈到 edge 26.2.4 齐套（libgallium/libGL/libGLESx2/libEGL/libgbm/gbm 后端/dri shims/libvulkan_virtio/drirc.d），删除 25.2.7 与 26.2.3 旧代文件；全部 debugfs 注入 + MD5 回读校验",
+    id: "r11-land",
+    content: "落地：vkr 提交 0b8b4914（darwin-venus）；设计文档第十一轮补记 + AGENTS.md 记忆 + 本画布",
     status: "completed" as const,
   },
   {
-    id: "r10-ab",
-    content: "A/B 差分复测：混装栈崩溃复现、统一栈零 SIGSEGV 且 Xwayland is ready display=:0（历史首次）+ XEmbed tray 映射、数分钟级存活",
-    status: "completed" as const,
-  },
-  {
-    id: "r10-land",
-    content: "提交 20be680bd（内核取证 + 设计文档第十轮补记 + AGENTS.md 记忆）；aarch64 clippy 全量过、fmt 干净",
-    status: "completed" as const,
-  },
-  {
-    id: "r10-pool",
-    content: "下一手（主攻）：池缓冲→scanout 可见性——Flutter 池缓冲（res 29/30，1.3MB）在 BAR 无映射、scanout 读宿主侧资源内存为黑；沿 dmabuf 导入是否落 shadow、fence 归还、blob 映射策略取实",
+    id: "r11-60hz",
+    content: "60Hz 持续帧率实测（负载下）：桌面空闲为事件驱动稀疏帧 ~2s 一帧；raster_avg≈1.5–2.4ms（CPU 侧），linear 渲染的 GPU 侧成本待负载测量",
     status: "pending" as const,
   },
   {
-    id: "r10-ts",
-    content: "26.2.4 zink-venus GPU timestamp 语义核对（gpu_flutter_render 达 4.8e12 µs 量级，疑似频率/单位失配；当前只能判定有 GPU 活动）",
+    id: "r11-ts",
+    content: "GPU timestamp 语义核对：本轮 gpu_render_samples=0（第十轮 28/43、4.8e12 µs 异常值），linear 下 zink 查询池采样行为待核对",
     status: "pending" as const,
   },
   {
-    id: "r10-60hz",
-    content: "内容帧恢复后测量 60Hz 持续帧率与 deadline 预算稳定性（present 链已健康：present_callback ~1ms、deadline p50≈15ms 在 16.6ms 预算内、missed_vblanks=0）",
+    id: "r11-xway",
+    content: "Xwayland 应用窗口渲染验证（X11 客户端经 GLX 走 libgallium-26.2.4 的路径上屏）",
     status: "pending" as const,
   },
 ];
@@ -173,24 +181,24 @@ const commitRowTones: Array<TableRowTone | undefined> = [
 ];
 const commitRows = [
   [
-    "tgoskits 内核（local/venus-into-dev-0924）",
-    <Code>20be680bd</Code>,
-    "第十轮：内核崩溃取证四件套 + 同步 fault 一次性 dump + aarch64 FP 回溯（signal.rs / user.rs / mod.rs，+253/−8）",
+    "venus-stack virglrenderer（darwin-venus）",
+    <Code>0b8b4914</Code>,
+    "第十一轮：vkr 停改写 LINEAR tiling——vkCreateImage 仅 DRM_MODIFIER→LINEAR；layout 对 linear 直通；格式查询回退链 LINEAR 优先",
   ],
   [
-    "tgoskits 文档",
-    <Code>20be680bd</Code>,
-    "设计文档 §Xwayland SIGSEGV 根因闭合 + AGENTS.md 第十轮记忆",
+    "tgoskits 文档（local/venus-into-dev-0924）",
+    <Code>本轮</Code>,
+    "设计文档 §scanout 黑屏根因闭合 + AGENTS.md 第十一轮记忆 + 本画布",
   ],
   [
-    "tgoskits 文档（第九轮）",
-    <Code>f559dd4ae</Code>,
-    "MoltenVK 重建与 ring 卡点闭合补记",
+    "tgoskits 文档（第十轮）",
+    <Code>231ff5bd6</Code>,
+    "状态画布第十轮收官 + 内核取证（20be680bd：signal.rs / user.rs / mod.rs，+253/−8）",
   ],
   [
     "guest rootfs（denial-full 镜像，debugfs 注入）",
     <Code>—</Code>,
-    "mesa 26.2.4 齐套 9 文件替换 + 3 个旧代文件删除 + drirc.d + dri 符号链接统一；MD5 回读全过",
+    "mesa 26.2.4 齐套（第十轮，本轮零改动）",
   ],
   [
     "denial 工作树",
@@ -203,24 +211,28 @@ const memoHeaders = ["备忘", "内容"];
 const memoAlign: Array<TableColumnAlign | undefined> = ["left", "left"];
 const memoRows = [
   [
-    "内核崩溃取证 = guest ptrace 替代品",
-    "warn 级一次性输出（comm/exe/PC/LR/全寄存器/指令字/映射表/栈字），本例从零到锁定「库内偏移+调用者」只用一轮重启；Xwayland 装了 SIGSEGV handler，投递终止路径的 dump 被 handler 吞掉——必须在 force-deliver 前 dump",
+    "blob scanout 可见性判据（本轮核心教训）",
+    "非 GL console 的零拷贝 scanout 读 shm 字节，被扫描图像必须「渲染写内存」——MoltenVK 上即 VK_IMAGE_TILING_LINEAR（texel buffer 背书，_mtlTexelBuffer=shm 包装的 MTLBuffer）；OPTIMAL 渲染只存在于 Metal 私有存储，对 BAR/scanout 永远不可见。「合成器侧有内容+屏幕黑」的组合首先怀疑宿主 tiling 改写",
   ],
   [
-    "aarch64 FP 链语义",
-    "序言 stp x29,x30,[sp,#-N]! 下 fp 指向保存对本身：读 [fp]/[fp+8]，不要按 riscv64 减 16；fp 链断裂时 [sp+8] 仍是调用者返回地址",
+    "pitch 一致性",
+    "linear 直通后 layout 查询返回 MoltenVK 真实 pitch（minimumLinearTextureAlignmentForPixelFormat 行对齐），guest 全链（gbm stride/ADDFB2/scanout）单一事实来源；256 对齐合成答案只给 OPTIMAL 遗留路径。当前几何（640/848 宽）两种口径一致，非 4 倍数宽度必须用直通答案",
   ],
   [
-    "mesa 换代纪律（本轮核心教训）",
-    "libgallium 是版本化 SONAME（libgallium-<ver>.so）可多代共存；pipe_screen 无版本化 ABI，跨代共享即虚表错位。换 mesa 必须整套换（libGL/libGLES/libEGL/libgbm/gbm 后端/dri shims/libvulkan_virtio/drirc.d）并清掉旧代散落文件（含 /usr/lib 根下的散落 shim）",
+    "QEMU 日志判读口径",
+    "TEMP set_scanout_blob 次数高且无 `no mapped memory` ⇒ scanout 绑定层健康，黑屏去内容层找（tiling/内存背书），不要先怀疑绑定",
   ],
   [
-    "watcher 取证修复",
-    "busybox wget --post-file 把响应体落盘为 URL 基名（CWD 在 /root）——POST 前同时清 /tmp/snap 与 /root/snap；全量 dd.log 上传 /tmp/pulled/ddfull.* 已打通",
+    "宿主重建口径",
+    "改 vkr 只需 `ninja -C build-darwin && ninja install`：QEMU 动态链 prefix/lib/libvirglrenderer.1.dylib，render server=prefix/libexec/virgl_render_server 静态链，同树重建即一致，无需重编 QEMU/MoltenVK/guest",
   ],
   [
-    "26.2.4 依赖面",
-    "libgallium-26.2.4 依赖 libLLVM.so.23.1 / libSPIRV-Tools.so / libzstd 与 26.2.3 相同，无需连带升级；ICD json 与旧版逐字节相同",
+    "mesa 换代纪律（第十轮）",
+    "libgallium 是版本化 SONAME 可多代共存；pipe_screen 无版本化 ABI，跨代共享即虚表错位。换 mesa 必须整套换（libGL/libGLES/libEGL/libgbm/gbm 后端/dri shims/libvulkan_virtio/drirc.d）并清掉旧代散落文件",
+  ],
+  [
+    "内核崩溃取证 = guest ptrace 替代品（第十轮）",
+    "warn 级一次性输出（comm/exe/PC/LR/全寄存器/指令字/映射表/栈字），一轮重启锁定「库内偏移+调用者」；aarch64 FP 链读 [fp]/[fp+8]，不要减 16",
   ],
   [
     "hostmem 取证手法",
@@ -232,27 +244,27 @@ export default function VenusClosureStatus(): JSX.Element {
   const theme = useHostTheme();
   return (
     <Stack gap={16} style={{ padding: 28 }}>
-      <H1>venus/zink 加速桌面 — Xwayland SIGSEGV 根因闭合（内核取证轮）</H1>
+      <H1>venus/zink 加速桌面 — scanout 黑屏根因闭合（上屏轮）</H1>
       <Text>
-        第十轮收官（2026-10-11，内核取证轮）。第九轮把黑屏归因为 shell（pid 17）
-        Xwayland 的 SIGSEGV@VA:0x15c。本轮不再依赖 guest 侧 ptrace，改为给内核加
-        同步 fault 的一次性崩溃现场 dump，一轮重启直接拿到「库内偏移 + 调用者」：
-        根因是 guest rootfs 内 mesa 栈混装——libGL-25.2.7（GLX/AIGLX 侧）与
-        libEGL-26.2.3（注入的 EGL 侧）两代共存，pipe_screen 无版本化 ABI，
-        26.2.3 的 is_format_supported 槽位（+0x6c0）在 25.2.7 虚表上落在
-        resource_from_memobj，PIPE_FORMAT 枚举被当模板指针解引用。修复 = 统一
-        mesa 栈到 26.2.4 齐套并清除旧代文件，差分 A/B 复测证实。
+        第十一轮收官（2026-10-11，上屏轮）。第十轮闭合 Xwayland SIGSEGV 后，
+        scanout 仍 100% 纯黑但内容在合成器侧存在。本轮先证伪「scanout 没建立」
+        （668 次 set_scanout_blob 零拒绝，绑定层正常），再把黑屏收敛到内容层：
+        vkr darwin shim 把 guest 请求的 LINEAR tiling 改写成 OPTIMAL，MoltenVK
+        把渲染写进 Metal 私有 MTLTexture 存储，而 scanout 零拷贝直读的 shm
+        背书内存恒零。修复只在宿主 vkr（提交 0b8b4914）——停改写 + layout
+        直通 + 查询回退链——guest 内核与 rootfs 零改动。venus 加速桌面
+        历史首次真实上屏。
       </Text>
 
       <Grid columns={4} gap={12}>
         <Card>
           <CardBody>
-            <Stat value="0 次" label="SIGSEGV（统一 26.2.4 后；混装栈 2.8s 必崩）" tone="success" />
+            <Stat value="45,498" label="screendump distinct 色（第十轮恒 1）" tone="success" />
           </CardBody>
         </Card>
         <Card>
           <CardBody>
-            <Stat value="历史首次" label="Xwayland is ready display=:0 + XEmbed tray 映射" tone="success" />
+            <Stat value="历史首次" label="桌面真实上屏：壁纸/时钟/顶栏全正确" tone="success" />
           </CardBody>
         </Card>
         <Card>
@@ -262,78 +274,57 @@ export default function VenusClosureStatus(): JSX.Element {
         </Card>
         <Card>
           <CardBody>
-            <Stat value="100% 黑" label="scanout 现状：池缓冲→scanout 可见性（新前沿）" tone="warning" />
+            <Stat value="0 次" label="vkr fatal / ring 退出（261+ 次 flip）" tone="success" />
           </CardBody>
         </Card>
       </Grid>
 
-      <Callout tone="danger" title="本轮根因：mesa 栈版本分裂 + pipe_screen 虚表错位">
+      <Callout tone="success" title="本轮根因：vkr 的 tiling 改写让渲染永远到不了 scanout 读的内存">
         <Text>
-          Xwayland 进程内同时存在 libGL-25.2.7（基底，NEEDED
-          libgallium-25.2.7.so，GLX/AIGLX 侧创建 screen）与 libEGL-26.2.3
-          （第三轮注入，NEEDED libgallium-26.2.3.so）。崩溃链：libEGL-26.2.3
-          按 26.2.3 布局在 pscreen+0x6c0 调 is_format_supported(pscreen,
-          format=0x15c, PIPE_TEXTURE_2D, 0, 0, PIPE_BIND_RENDER_TARGET)——
-          26.2.3 在方法区前插入了 caps/shader_caps/nir_options 数据成员把
-          方法区后移，同一偏移在 25.2.7 虚表上是
-          llvmpipe_resource_from_memobj；该函数把第二参数当
-          struct pipe_resource * 做 0x80 字节拷贝构造，格式枚举值 0x15c 被当
-          指针解引用即崩。桥接实体：/usr/lib/dri/libdril_dri.so（25.2.7 实
-          文件）与 /usr/lib/zink_dri.so（26.2.3 shim）SONAME 同为
-          libdril_dri.so，musl dlopen 先到先得，screen 跨代流到对方。崩溃
-          首现 == 第三轮首次注入 26.2.x，时间线吻合。
+          黑屏机制：deniald→smithay gbm 请求 [Modifier::Linear]，zink 因 vkr
+          注入的假 VK_EXT_image_drm_format_modifier（modifier props 实为空）
+          走「非 modifier LINEAR 回退」以 VK_IMAGE_TILING_LINEAR 调
+          vkCreateImage（Flutter 的 dmabuf 导入经 ZINK_BIND_DMABUF 同样
+          LINEAR）；vkr_image.c 的 darwin shim 把它改写成 OPTIMAL（旧假设：
+          MoltenVK 无 linear 模式）。OPTIMAL 图像在 MoltenVK 上渲染进 Metal
+          私有 MTLTexture 存储；而 darwin 路径所有 HOST_VISIBLE 内存都是
+          匿名 shm + newBufferWithBytesNoCopy 包成的 Shared MTLBuffer，
+          blob 资源导出的 shm fd = guest BAR 映射 = QEMU pixman scanout
+          读取——渲染像素与这些字节永不相交，读出全零即黑。BAR 里「有壁纸
+          的 atlas blob」是 deniald CPU 写入的 background blob，恰是对照。
         </Text>
       </Callout>
 
-      <Card>
-        <CardHeader>
-          <H2>崩溃链（本轮闭合）</H2>
-        </CardHeader>
-        <CardBody>
-          <ArchGraph nodes={crashChain.nodes} edges={crashChain.edges} direction="vertical" />
-          <Divider />
-          <Text>
-            修复把「两代共存」拆除：mesa 栈整体升到 26.2.4（26.2.3 的
-            mesa-gl/mesa-gles 已被 CDN 滚走，故取 edge 现行版本），单一
-            libgallium、单一 dril shim，screen 不再跨代。
-          </Text>
-        </CardBody>
-      </Card>
+      <Grid columns={2} gap={12}>
+        <Card>
+          <CardHeader>
+            <H2>黑屏链（本轮闭合）</H2>
+          </CardHeader>
+          <CardBody>
+            <ArchGraph nodes={blackChain.nodes} edges={blackChain.edges} direction="vertical" />
+          </CardBody>
+        </Card>
+        <Card>
+          <CardHeader>
+            <H2>修复链（linear 直通）</H2>
+          </CardHeader>
+          <CardBody>
+            <ArchGraph nodes={fixChain.nodes} edges={fixChain.edges} direction="vertical" />
+            <Divider />
+            <Text>
+              MoltenVK 的 linear 支持一直在：validateLinear 接受 2D/单 mip/单
+              layer BGRA8，renderLinearTextures = supportsApple1 在 M4 为
+              true；bindDeviceMemory 对 linear 图像走 texel buffer 路径，
+              _mtlTexelBuffer 直接取 shm 包装的 MTLBuffer——渲染像素写进
+              shm 字节，BAR 映射与 scanout 同源可见。
+            </Text>
+          </CardBody>
+        </Card>
+      </Grid>
 
       <Card>
         <CardHeader>
-          <H2>内核崩溃取证（本轮新增的可复用能力）</H2>
-        </CardHeader>
-        <CardBody>
-          <Stack gap={6}>
-            <Text>
-              handle_user_page_fault 在 force-deliver 之前调用新增的
-              dump_sync_fault_if_terminating：每进程代仅一次
-              （ProcessData.sync_fault_dumped），无视 signal disposition——
-              Xwayland 装了 SIGSEGV handler，原有「投递终止才 dump」的路径被
-              handler 吞掉，这正是第九轮拿不到寄存器的原因。
-            </Text>
-            <Text>
-              aarch64 四件套：全量 x0–x30 寄存器；insn@pc（4 字节指令字，
-              离线即可反汇编）；crash mappings（含 PC 的映射 + 全部可执行
-              映射，文件路径 + 文件内偏移）；栈顶 8 字（[sp+8] = 调用者返回
-              地址）。另补齐 aarch64 FP 链回溯（原 riscv64-only）。
-            </Text>
-            <Text>
-              实现：
-              <FL path="../os/StarryOS/kernel/src/task/signal.rs" label="task/signal.rs" />
-              {" / "}
-              <FL path="../os/StarryOS/kernel/src/task/user.rs" label="task/user.rs" />
-              {" / "}
-              <FL path="../os/StarryOS/kernel/src/task/mod.rs" label="task/mod.rs" />
-            </Text>
-          </Stack>
-        </CardBody>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <H2>取证证据（第十轮）</H2>
+          <H2>取证证据（第十一轮）</H2>
         </CardHeader>
         <CardBody>
           <Table
@@ -361,23 +352,21 @@ export default function VenusClosureStatus(): JSX.Element {
 
       <Card>
         <CardHeader>
-          <H2>第十轮任务清单与下一步计划</H2>
+          <H2>第十一轮任务清单与下一步计划</H2>
         </CardHeader>
         <CardBody>
           <TodoListCard todos={planItems} />
           <Divider />
-          <Callout tone="info" title="下一手：池缓冲 → scanout 可见性（黑屏的最后一层）">
+          <Callout tone="info" title="下一手：负载帧率与度量收尾">
             <Text>
-              现有证据：Flutter GPU 光栅在跑（gpu_render_samples=28/43、
-              damage rect 336,0-640,45 顶栏区域、present_callback ~1ms）、
-              hostmem BAR dump 的 atlas blob（2MB）有完整壁纸（暗红
-              (41,8,19)，stride≠2560 呈剪切）——内容在合成器侧存在；而被
-              flip 的池缓冲（res 29/30，1.3MB）在 BAR 无映射（info mtree
-              仅剩 144KB blob），scanout 读宿主侧资源内存为黑。该缺口与
-              mesa 代际无关（A/B 两侧起步帧均黑，第八轮的 684 灰起步帧在
-              第九轮 MoltenVK 重建后即消失）。取实方向：dmabuf 导入是否落
-              shadow、fence 归还、blob 映射策略；顺带核对 26.2.4 zink-venus
-              的 GPU timestamp 语义（4.8e12 µs 量级异常值）。
+              桌面已上屏且健康（present_callback≈424–760µs、
+              deadline_to_presentation_p50≈14.9–16.4ms 在 16.6ms 预算内、
+              missed_vblanks=0、Xwayland is ready display=:0）。空闲桌面为
+              事件驱动稀疏帧（~2s 一帧，与 llvmpipe 时期同形态）；60Hz
+              持续帧率需要负载实测（raster_avg≈1.5–2.4ms 为 CPU 侧，
+              linear 渲染的 GPU 侧成本待测）。GPU timestamp 语义
+              （gpu_render_samples 本轮 0，第十轮 28/43 与 4.8e12 µs 异常值）
+              是仅剩的度量缺口，不影响出帧。
             </Text>
           </Callout>
         </CardBody>
@@ -404,7 +393,7 @@ export default function VenusClosureStatus(): JSX.Element {
         <CardBody>
           <Stack gap={6}>
             <Text>
-              设计文档（§Xwayland SIGSEGV 根因闭合）：
+              设计文档（§scanout 黑屏根因闭合）：
               <FL path="design/starry-venus-into-dev-card0.md" label="docs/design/starry-venus-into-dev-card0.md" />
             </Text>
             <Text>
@@ -412,22 +401,23 @@ export default function VenusClosureStatus(): JSX.Element {
               <FL path="../AGENTS.md" label="AGENTS.md §3" />
             </Text>
             <Text>
-              内核取证实现：
-              <FL path="../os/StarryOS/kernel/src/task/signal.rs" label="task/signal.rs" />
+              vkr 修复（venus-stack 树）：
+              <FL
+                path="/Users/herbcheng/venus-stack/src/virglrenderer/src/venus/vkr_image.c"
+                label="venus/vkr_image.c"
+              />
               {" / "}
-              <FL path="../os/StarryOS/kernel/src/task/user.rs" label="task/user.rs" />
+              <FL
+                path="/Users/herbcheng/venus-stack/src/virglrenderer/src/venus/vkr_physical_device.c"
+                label="venus/vkr_physical_device.c"
+              />
             </Text>
             <Text>
-              内核 fence 注册表（第七轮）：
+              内核 fence 注册表（第七轮，本轮零改动）：
               <FL path="../os/StarryOS/kernel/src/pseudofs/dev/vgpu.rs" label="pseudofs/dev/vgpu.rs" />
             </Text>
             <Text>
-              e2e watcher（本轮修复 wget 落盘 + 全量 dd.log 上传）：
-              <FL
-                path="/Users/herbcheng/venus-stack/e2e-run.sh"
-                label="venus-stack/e2e-run.sh"
-              />
-              {" / 启动："}
+              e2e 启动：
               <FL
                 path="/Users/herbcheng/venus-stack/qstart-denial-e2e.sh"
                 label="qstart-denial-e2e.sh"
@@ -447,18 +437,18 @@ export default function VenusClosureStatus(): JSX.Element {
       </Card>
 
       <Row gap={8}>
-        <Pill active>第十轮收官</Pill>
-        <Pill>0x15c 根因闭合</Pill>
-        <Pill>mesa 26.2.4 统一</Pill>
-        <Pill>Xwayland 首次 ready</Pill>
-        <Pill>scanout 黑 = 新前沿</Pill>
+        <Pill active>第十一轮收官</Pill>
+        <Pill>scanout 黑屏根因闭合</Pill>
+        <Pill>linear tiling 直通</Pill>
+        <Pill>桌面首次上屏</Pill>
+        <Pill>Xwayland ready + 心跳健康</Pill>
       </Row>
       <Text>
-        状态基调：黑屏的三层结构已剥完两层——Xwayland 崩溃层（本轮闭合）与
-        GPU 通道层（第七至九轮闭合）均已修复；剩最后一层「内容在合成器侧
-        存在但 scanout 读不到」（池缓冲可见性），与 mesa 代际无关、第十轮已
-        定性取证。present 链健康（present_callback ~1ms、deadline p50≈15ms
-        在预算内、missed_vblanks=0），60Hz 持续帧率测量等内容帧上屏后进行。
+        状态基调：黑屏三层结构全部剥完——Xwayland 崩溃层（第十轮）、GPU 通道层
+        （第七至九轮）、池缓冲可见性层（本轮：vkr tiling 改写）均已闭合；端到端
+        「GPU 渲染 → zink venus → ring → MoltenVK（linear texel buffer over
+        shm）→ 内核 blob scanout → QEMU pixman → 屏幕」全链贯通。剩余为度量
+        收尾（负载帧率、GPU timestamp 语义）与 Xwayland 应用窗口渲染验证。
       </Text>
     </Stack>
   );
