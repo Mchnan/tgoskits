@@ -335,10 +335,14 @@ pub struct DrmVirtgpuGetCaps {
 }
 
 /// Creates a blob resource for coherent memory sharing.
-/// Linux: `struct drm_virtgpu_resource_create_blob` (48 bytes)
+/// Linux: `struct drm_virtgpu_resource_create_blob` (56 bytes, linux-master
+/// UAPI: the `blob_hints` tail added with the deferred-mapping hints)
 ///
 /// Mesa virgl calls this when `supports_coherent=true` (i.e. both
-/// RESOURCE_BLOB and HOST_VISIBLE are reported as supported).
+/// RESOURCE_BLOB and HOST_VISIBLE are reported as supported). The ioctl
+/// number encodes the struct size, so the 48-byte pre-hints layout makes a
+/// userspace built against the new header (Mesa 26.2+) issue a command word
+/// this driver cannot match and the whole BLOB ioctl stays unreachable.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmVirtgpuResourceCreateBlob {
@@ -359,6 +363,11 @@ pub struct DrmVirtgpuResourceCreateBlob {
     pub cmd: u64,
     /// Blob unique identifier.
     pub blob_id: u64,
+    /// `DRM_VIRTGPU_BLOB_FLAG_HINT_*`; the driver consumes the hints where
+    /// it performs eager mapping (Linux `verify_blob()` stores them in the
+    /// object params without further validation).
+    pub blob_hints: u32,
+    pub pad2: u32,
 }
 
 /// Initializes a rendering context on this file descriptor.
