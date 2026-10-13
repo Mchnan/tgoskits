@@ -71,7 +71,11 @@ impl Card0 {
     /// Mesa queries all parameters during initialization. Known parameters
     /// return their values; unknown parameters return `-EINVAL` (matching
     /// Linux kernel behavior — Mesa handles this gracefully).
-    pub(super) fn handle_virtgpu_getparam(&self, current: &UserTaskRef, arg: usize) -> VfsResult<usize> {
+    pub(super) fn handle_virtgpu_getparam(
+        &self,
+        current: &UserTaskRef,
+        arg: usize,
+    ) -> VfsResult<usize> {
         let ptr = arg as *mut DrmVirtgpuGetparam;
         let g: DrmVirtgpuGetparam = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
 
@@ -94,11 +98,7 @@ impl Card0 {
                 // device doesn't support blobs and Mesa must use the classic
                 // resource path — reporting 1 here would make Mesa create
                 // blobs that fail.
-                if capabilities.supports_blob {
-                    1
-                } else {
-                    0
-                }
+                if capabilities.supports_blob { 1 } else { 0 }
             }
             VIRTGPU_PARAM_HOST_VISIBLE => {
                 // Honest only when the bus exposed the hostmem window: mesa
@@ -115,7 +115,11 @@ impl Card0 {
                 // `has_context_init ? 1 : 0`). Must be 1 for Mesa to use the
                 // context-init protocol, but VIRGL alone does not imply it: a
                 // legacy device can support virgl without CONTEXT_INIT.
-                if capabilities.supports_context_init { 1 } else { 0 }
+                if capabilities.supports_context_init {
+                    1
+                } else {
+                    0
+                }
             }
             VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS => {
                 let mut mask = 0u64;
@@ -264,7 +268,11 @@ impl Card0 {
     /// `min(size, host_caps_size)`, and the input struct is never written
     /// back. Mesa first tries cap_set_id=2 (VIRGL2), then falls back to 1
     /// (VIRGL).
-    pub(super) fn handle_virtgpu_get_caps(&self, current: &UserTaskRef, arg: usize) -> VfsResult<usize> {
+    pub(super) fn handle_virtgpu_get_caps(
+        &self,
+        current: &UserTaskRef,
+        arg: usize,
+    ) -> VfsResult<usize> {
         let ptr = arg as *mut DrmVirtgpuGetCaps;
         let g: DrmVirtgpuGetCaps = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
         // Linux never writes the request struct back, so the caller's `size`
@@ -314,7 +322,8 @@ impl Card0 {
             // smaller `size`) so the cache entry is never truncated; only the
             // later copy is clamped. Truncating the query would hand Mesa an
             // incomplete capset and make it enable unsupported GL features.
-            let data = with_virgl(|virgl| virgl.capset(g.cap_set_id, g.cap_set_ver, matched.max_size))?;
+            let data =
+                with_virgl(|virgl| virgl.capset(g.cap_set_id, g.cap_set_ver, matched.max_size))?;
             self.capset_cache.lock().insert(cache_key, data.clone());
             data
         };
@@ -377,18 +386,23 @@ impl Card0 {
             .fetch_add(DUMB_BUFFER_OFFSET_STRIDE, Ordering::Relaxed);
         let backing = mapping.backing();
 
-        let device_handle = with_virgl(|virgl| virgl.create_resource_3d(rdif_gpu::Resource3d {
-            target: r.target,
-            format: r.format,
-            bind: r.bind,
-            width: r.width,
-            height: r.height,
-            depth: r.depth,
-            array_size: r.array_size,
-            last_level: r.last_level,
-            samples: r.nr_samples,
-            flags: r.flags,
-        }, Some(backing)))?;
+        let device_handle = with_virgl(|virgl| {
+            virgl.create_resource_3d(
+                rdif_gpu::Resource3d {
+                    target: r.target,
+                    format: r.format,
+                    bind: r.bind,
+                    width: r.width,
+                    height: r.height,
+                    depth: r.depth,
+                    array_size: r.array_size,
+                    last_level: r.last_level,
+                    samples: r.nr_samples,
+                    flags: r.flags,
+                },
+                Some(backing),
+            )
+        })?;
         let res_handle = match with_virgl(|virgl| virgl.command_resource_id(device_handle)) {
             Ok(id) => id,
             Err(error) => {
@@ -670,8 +684,7 @@ impl Card0 {
         // `fence_fd` is written back only for `FENCE_FD_OUT`; an IN-only
         // request keeps its input fd untouched (Linux only updates the field
         // when it created an out-fence).
-        eb.fence_fd =
-            writeback_fence_fd(eb.fence_fd, out_fd.as_ref().map(|(_, p)| p.fd()));
+        eb.fence_fd = writeback_fence_fd(eb.fence_fd, out_fd.as_ref().map(|(_, p)| p.fd()));
         ptr.vm_write(current, eb)
             .map_err(|_| VfsError::BadAddress)?;
         if let Some((_, prepared)) = out_fd {
@@ -728,22 +741,24 @@ impl Card0 {
         // guest data that was already in memory before the submit, so the
         // direction is fire-and-forget (Linux does not fence it either);
         // the completion token carries no release proof to observe.
-        let _ = with_virgl(|virgl| virgl.transfer_to_host(rdif_gpu::Transfer3d {
-            context: ctx_id,
-            resource: resource.device_handle,
-            box_: rdif_gpu::TransferBox {
-                x: t.box_.x,
-                y: t.box_.y,
-                z: t.box_.z,
-                width: t.box_.w,
-                height: t.box_.h,
-                depth: t.box_.d,
-            },
-            offset: t.offset as u64,
-            level: t.level,
-            stride: t.stride,
-            layer_stride: t.layer_stride,
-        }))?;
+        let _ = with_virgl(|virgl| {
+            virgl.transfer_to_host(rdif_gpu::Transfer3d {
+                context: ctx_id,
+                resource: resource.device_handle,
+                box_: rdif_gpu::TransferBox {
+                    x: t.box_.x,
+                    y: t.box_.y,
+                    z: t.box_.z,
+                    width: t.box_.w,
+                    height: t.box_.h,
+                    depth: t.box_.d,
+                },
+                offset: t.offset as u64,
+                level: t.level,
+                stride: t.stride,
+                layer_stride: t.layer_stride,
+            })
+        })?;
         // Fire-and-forget (Linux does not fence this direction): the transfer
         // is ordered behind everything already submitted and ahead of every
         // later fence; deliver it at the ioctl boundary.
@@ -792,22 +807,24 @@ impl Card0 {
         // memory safety instead; our unref/backing release has no dma_resv
         // equivalent, so the fence observation remains the proof that the
         // host no longer touches the guest memory.
-        let completion = with_virgl(|virgl| virgl.transfer_from_host(rdif_gpu::Transfer3d {
-            context: ctx_id,
-            resource: resource.device_handle,
-            box_: rdif_gpu::TransferBox {
-                x: t.box_.x,
-                y: t.box_.y,
-                z: t.box_.z,
-                width: t.box_.w,
-                height: t.box_.h,
-                depth: t.box_.d,
-            },
-            offset: t.offset as u64,
-            level: t.level,
-            stride: t.stride,
-            layer_stride: t.layer_stride,
-        }))?;
+        let completion = with_virgl(|virgl| {
+            virgl.transfer_from_host(rdif_gpu::Transfer3d {
+                context: ctx_id,
+                resource: resource.device_handle,
+                box_: rdif_gpu::TransferBox {
+                    x: t.box_.x,
+                    y: t.box_.y,
+                    z: t.box_.z,
+                    width: t.box_.w,
+                    height: t.box_.h,
+                    depth: t.box_.d,
+                },
+                offset: t.offset as u64,
+                level: t.level,
+                stride: t.stride,
+                layer_stride: t.layer_stride,
+            })
+        })?;
         wait_completion_outside_lock(completion).map_err(map_gpu_err)?;
         // Only now — after the host write completed — make the bytes
         // CPU-visible. The sync used to run inside the device layer's inline
@@ -821,7 +838,9 @@ impl Card0 {
                 .and_then(core::convert::identity)
                 .map_err(map_gpu_err)?
         {
-            backing.sync_for_cpu(0..backing.len()).map_err(map_gpu_err)?;
+            backing
+                .sync_for_cpu(0..backing.len())
+                .map_err(map_gpu_err)?;
         }
 
         Ok(0)
@@ -1019,12 +1038,19 @@ impl Card0 {
         let offset = self
             .next_offset
             .fetch_add(DUMB_BUFFER_OFFSET_STRIDE, Ordering::Relaxed);
-        let device_handle = with_virgl(|virgl| virgl.create_blob(context, rdif_gpu::BlobDescriptor {
-            memory: b.blob_mem,
-            flags: b.blob_flags,
-            size: b.size,
-            id: b.blob_id,
-        }, backing, &cmd_buf))?;
+        let device_handle = with_virgl(|virgl| {
+            virgl.create_blob(
+                context,
+                rdif_gpu::BlobDescriptor {
+                    memory: b.blob_mem,
+                    flags: b.blob_flags,
+                    size: b.size,
+                    id: b.blob_id,
+                },
+                backing,
+                &cmd_buf,
+            )
+        })?;
         let res_handle = match with_virgl(|virgl| virgl.command_resource_id(device_handle)) {
             Ok(id) => id,
             Err(error) => {
@@ -1099,8 +1125,8 @@ impl Card0 {
         if b.pad != 0 || b.blob_hints & !DRM_VIRTGPU_BLOB_FLAG_HINT_DEFER_MAPPING != 0 {
             return Err(VfsError::InvalidInput);
         }
-        let hostmem = with_virgl(|virgl| Ok(virgl.host_memory_region()))?
-            .ok_or(VfsError::InvalidInput)?;
+        let hostmem =
+            with_virgl(|virgl| Ok(virgl.host_memory_region()))?.ok_or(VfsError::InvalidInput)?;
         if b.size == 0 || b.size > hostmem.length {
             return Err(VfsError::InvalidInput);
         }
@@ -1325,11 +1351,22 @@ impl Card0 {
             self.pending_retires
                 .lock()
                 .push_back(super::syncobj::PendingRetire {
-                fence_id,
-                owner: file.file_id,
-                syncobjs: out_syncobjs,
-            });
+                    fence_id,
+                    owner: file.file_id,
+                    syncobjs: out_syncobjs,
+                });
         }
+        // EXECBUFFER is a fire-and-forget transaction: one boundary notify
+        // delivers the submission — Linux `virtio_gpu_notify()` at the ioctl
+        // end, exactly like the virgl path above. Without it, a kick that
+        // carries no out-syncobj has no other delivery path: the retire pump
+        // only notifies while a pending retire exists, so the doorbell would
+        // stay in the avail ring with the host idle and every waiter on the
+        // batch's effects would sleep forever.
+        with_virgl(|virgl| {
+            virgl.ctrl_notify();
+            Ok(())
+        })?;
         self.pump_retired_fences();
         Ok(0)
     }
