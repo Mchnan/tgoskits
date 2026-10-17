@@ -7,11 +7,13 @@
  *     按真实剩余时间等待）、已信号点先查状态再判超时、ETIME 而非 ETIMEDOUT、
  *     未知 flag EINVAL、空句柄列表成功、未知句柄 ENOENT、
  *     无 WAIT_FOR_SUBMIT 且点未提交 → EINVAL
- *   - 二进制 WAIT：WAIT_AVAILABLE 非法（EINVAL）、空列表成功、未提交 → EINVAL
+ *   - 二进制 WAIT：WAIT_AVAILABLE 非法（EINVAL）、空列表成功、未提交 → EINVAL、
+ *     非 WAIT_ALL 成功时写回 first_signaled
  *   - HANDLE_TO_FD / FD_TO_HANDLE：flag/pad/point 校验、未知句柄 ENOENT、
  *     同步文件导出导入往返（含 TIMELINE 点位导出导入）、坏 fd EINVAL
  *   - RESET / SIGNAL 水位清零与置一
- *   - EVENTFD 等待者在 TIMELINE_SIGNAL 后被唤醒
+ *   - EVENTFD：无 WAIT_AVAILABLE 且点未背书 → EINVAL；
+ *     TIMELINE_SIGNAL 与二进制 SIGNAL 两条路径都唤醒等待者
  */
 
 #define _GNU_SOURCE
@@ -25,7 +27,10 @@
 #include <time.h>
 #include <unistd.h>
 
-/* ---- drm syncobj UAPI（与内核 drm.rs 布局一致）---- */
+/* ---- drm syncobj UAPI ----
+ * 独立转写自 Linux include/uapi/drm/drm.h（linux master，v7.2 窗口），
+ * 不参照内核侧 drm.rs —— 本套件的价值在于独立性：内核侧布局漂移会
+ * 直接表现为命令字不匹配（ENOTTY）或字段错位，而不是两边一致地错。 */
 
 struct drm_syncobj_create {
     uint32_t handle;
@@ -55,11 +60,12 @@ struct drm_syncobj_timeline_array {
 };
 struct drm_syncobj_wait {
     uint64_t handles;
-    uint32_t count_handles;
-    uint32_t pad;
     int64_t timeout_nsec;
+    uint32_t count_handles;
     uint32_t flags;
-    uint32_t first_signaled;
+    uint32_t first_signaled; /* only valid on return */
+    uint32_t pad;
+    uint64_t deadline_nsec;
 };
 struct drm_syncobj_timeline_wait {
     uint64_t handles;
@@ -67,9 +73,9 @@ struct drm_syncobj_timeline_wait {
     int64_t timeout_nsec;
     uint32_t count_handles;
     uint32_t flags;
-    uint32_t first_signaled;
+    uint32_t first_signaled; /* only valid on return */
     uint32_t pad;
-    int64_t deadline_nsec; /* v6.11 WAIT_DEADLINE hint (48-byte layout) */
+    uint64_t deadline_nsec;
 };
 struct drm_syncobj_eventfd {
     uint32_t handle;
@@ -78,6 +84,13 @@ struct drm_syncobj_eventfd {
     int32_t fd;
     uint32_t pad;
 };
+
+_Static_assert(sizeof(struct drm_syncobj_wait) == 40,
+               "drm_syncobj_wait must be the 40-byte Linux layout");
+_Static_assert(sizeof(struct drm_syncobj_timeline_wait) == 48,
+               "drm_syncobj_timeline_wait must be the 48-byte Linux layout");
+_Static_assert(sizeof(struct drm_syncobj_eventfd) == 24,
+               "drm_syncobj_eventfd must be the 24-byte Linux layout");
 
 #define DRM_IOCTL_SYNCOBJ_CREATE \
     _IOWR('d', 0xBF, struct drm_syncobj_create)
@@ -98,6 +111,16 @@ struct drm_syncobj_eventfd {
     _IOWR('d', 0xCD, struct drm_syncobj_timeline_array)
 #define DRM_IOCTL_SYNCOBJ_EVENTFD \
     _IOWR('d', 0xCF, struct drm_syncobj_eventfd)
+
+/* 钉死到 libdrm 从同一头文件算出的命令字：打包尺寸是命令字的一部分，
+ * 内核侧布局回退（例如 32 字节的 drm_syncobj_wait）会让这些 ioctl 落到
+ * ENOTTY 而不是静默通过。 */
+_Static_assert(DRM_IOCTL_SYNCOBJ_WAIT == 0xc02864c3u,
+               "DRM_IOCTL_SYNCOBJ_WAIT must match libdrm (40-byte struct)");
+_Static_assert(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT == 0xc03064cau,
+               "DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT must match libdrm (48-byte struct)");
+_Static_assert(DRM_IOCTL_SYNCOBJ_EVENTFD == 0xc01864cfu,
+               "DRM_IOCTL_SYNCOBJ_EVENTFD must match libdrm (24-byte struct)");
 
 #define DRM_SYNCOBJ_CREATE_SIGNALED (1u << 0)
 #define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL (1u << 0)
@@ -240,6 +263,32 @@ int main(void) {
                   "signaled binary syncobj waits successfully");
     }
 
+    /* --- first_signaled 写回（非 WAIT_ALL 成功路径）--- */
+    {
+        uint32_t handles[2] = { pending, signaled };
+        uint64_t points[2] = { 9, 4 };
+        struct drm_syncobj_timeline_wait w = {
+            .handles = (uint64_t)(uintptr_t)handles,
+            .points = (uint64_t)(uintptr_t)points,
+            .timeout_nsec = 1, /* absolute: long since passed */
+            .count_handles = 2,
+        };
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &w), 0,
+                  "any-handle timeline wait succeeds when the second is reached");
+        CHECK(w.first_signaled == 1,
+              "timeline wait writes back the first satisfied index");
+
+        struct drm_syncobj_wait bw = {
+            .handles = (uint64_t)(uintptr_t)handles,
+            .timeout_nsec = 1,
+            .count_handles = 2,
+        };
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &bw), 0,
+                  "any-handle binary wait succeeds when the second is signaled");
+        CHECK(bw.first_signaled == 1,
+              "binary wait writes back the first satisfied index");
+    }
+
     /* --- HANDLE_TO_FD / FD_TO_HANDLE 校验与往返 --- */
     {
         struct drm_syncobj_handle h = { .handle = signaled, .flags = 1u << 2 };
@@ -338,10 +387,13 @@ int main(void) {
         CHECK(efd >= 0, "create eventfd");
         struct drm_syncobj_eventfd ev = {
             .handle = pending,
-            .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+            .flags = 0,
             .point = 100,
             .fd = efd,
         };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev), EINVAL,
+                  "eventfd on an unbacked point without WAIT_AVAILABLE is EINVAL");
+        ev.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;
         CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev), 0,
                   "register eventfd waiter");
         uint64_t point = 100;
@@ -358,6 +410,37 @@ int main(void) {
         CHECK_RET(read(efd, &val, sizeof(val)), 8, "read eventfd payload");
         CHECK(val == 1, "eventfd payload is 1");
         CHECK_RET(close(efd), 0, "close eventfd");
+    }
+
+    /* --- SYNCOBJ_SIGNAL 唤醒 EVENTFD（二进制信号路径）--- */
+    {
+        struct drm_syncobj_create c2 = {0};
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &c2), 0,
+                  "SYNCOBJ_CREATE (binary signal case)");
+        uint32_t b = c2.handle;
+        int efd2 = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        CHECK(efd2 >= 0, "create eventfd for the binary case");
+        struct drm_syncobj_eventfd ev = {
+            .handle = b,
+            .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+            .point = 0, /* binary view */
+            .fd = efd2,
+        };
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev), 0,
+                  "register eventfd on the binary view");
+        struct drm_syncobj_array arr = {
+            .handles = (uint64_t)(uintptr_t)&b,
+            .count_handles = 1,
+        };
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_SIGNAL, &arr), 0,
+                  "SIGNAL the binary syncobj");
+        struct pollfd pfd2 = { .fd = efd2, .events = POLLIN };
+        CHECK(poll(&pfd2, 1, 2000) == 1, "SYNCOBJ_SIGNAL wakes the eventfd waiter");
+        uint64_t val = 0;
+        CHECK_RET(read(efd2, &val, sizeof(val)), 8,
+                  "read the binary-signal payload");
+        CHECK(val == 1, "binary-signal eventfd payload is 1");
+        CHECK_RET(close(efd2), 0, "close the binary eventfd");
     }
 
     /* --- DESTROY --- */
