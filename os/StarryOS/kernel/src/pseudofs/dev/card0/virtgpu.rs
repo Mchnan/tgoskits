@@ -33,8 +33,11 @@ fn device_capset_mask() -> Option<u64> {
     (mask != 0).then_some(mask)
 }
 
-/// Upper bound for one venus EXECBUFFER command buffer.
-const MAX_VENUS_COMMAND_BYTES: usize = 2 * 1024 * 1024;
+/// Upper bound for one venus EXECBUFFER command buffer. This matches the
+/// per-request ceiling of the user-memory loader: a stream beyond it could
+/// never be copied in, and rejecting it here reports EINVAL instead of the
+/// loader's EFAULT.
+const MAX_VENUS_COMMAND_BYTES: usize = 128 * 1024;
 
 fn virgl_capabilities() -> VfsResult<rdif_gpu::GpuCapabilities> {
     let identity = ax_gpu::identity().ok_or(VfsError::NotFound)?;

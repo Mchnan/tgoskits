@@ -236,6 +236,26 @@ impl<H: virtio_drivers::Hal> ControlQueue<H> {
     ///
     /// Returns the queue token (`0..CTRL_QUEUE_SIZE`) for an enqueued command,
     /// or `None` if it was parked. Callers must not wait on a parked command.
+    /// Retires `fence_id` without a device round-trip: the caller allocated
+    /// the id but its command never reached the queue (an enqueue failure —
+    /// a full ring reports [`Error::Busy`] transiently). A fence the queue
+    /// never saw would otherwise pin the contiguous completion watermark at
+    /// `id - 1` forever and park every later completion in
+    /// [`ControlQueue::completed_fences`], leaking one entry per submit.
+    pub(crate) fn cancel_fence(&mut self, fence_id: u64) {
+        if fence_id == 0 || fence_id <= self.completed_fence_id {
+            return;
+        }
+        if fence_id == self.completed_fence_id + 1 {
+            self.completed_fence_id += 1;
+            while self.completed_fences.remove(&(self.completed_fence_id + 1)) {
+                self.completed_fence_id += 1;
+            }
+        } else {
+            self.completed_fences.insert(fence_id);
+        }
+    }
+
     pub(crate) fn enqueue<Req: zerocopy::IntoBytes + zerocopy::Immutable>(
         &mut self,
         transport: &mut impl Transport,

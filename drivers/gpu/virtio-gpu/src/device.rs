@@ -699,20 +699,36 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
     /// the proof drain explicitly via [`VirtIoGpu::wait_idle`].
     pub fn resource_unref(&mut self, resource_id: u32) -> Result<u64, Error> {
         let fence_id = self.alloc_fence()?;
-        self.ctrl
-            .enqueue(
-                &mut self.transport,
-                &ResourceUnref {
-                    header: CtrlHeader::with_fence(Command::RESOURCE_UNREF, 0, fence_id),
-                    resource_id,
-                    _padding: 0,
-                },
-                None,
-                fence_id,
-            )
-            .map(|_| ())?;
+        self.enqueue_fenced(
+            &ResourceUnref {
+                header: CtrlHeader::with_fence(Command::RESOURCE_UNREF, 0, fence_id),
+                resource_id,
+                _padding: 0,
+            },
+            None,
+            fence_id,
+        )?;
         self.ctrl_notify();
         Ok(fence_id)
+    }
+
+    /// Enqueues a fenced fire-and-forget command. On an enqueue failure the
+    /// pre-allocated fence id is retired immediately
+    /// ([`ControlQueue::cancel_fence`]): a fence the queue never saw would
+    /// otherwise pin the contiguous completion watermark forever.
+    fn enqueue_fenced<Req: zerocopy::IntoBytes + zerocopy::Immutable>(
+        &mut self,
+        req: &Req,
+        data: Option<&[u8]>,
+        fence_id: u64,
+    ) -> Result<(), Error> {
+        match self.ctrl.enqueue(&mut self.transport, req, data, fence_id) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.ctrl.cancel_fence(fence_id);
+                Err(error)
+            }
+        }
     }
 
     // --- 3D (virgl) commands ---
@@ -962,26 +978,23 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
     pub fn transfer_from_host_3d(&mut self, params: Transfer3d) -> Result<u64, Error> {
         self.require_virgl()?;
         let fence_id = self.alloc_fence()?;
-        self.ctrl
-            .enqueue(
-                &mut self.transport,
-                &CmdTransferHost3D {
-                    header: CtrlHeader::with_fence(
-                        Command::TRANSFER_FROM_HOST_3D,
-                        params.ctx_id,
-                        fence_id,
-                    ),
-                    box_: params.box_,
-                    offset: params.offset,
-                    resource_id: params.resource_id,
-                    level: params.level,
-                    stride: params.stride,
-                    layer_stride: params.layer_stride,
-                },
-                None,
-                fence_id,
-            )
-            .map(|_| ())?;
+        self.enqueue_fenced(
+            &CmdTransferHost3D {
+                header: CtrlHeader::with_fence(
+                    Command::TRANSFER_FROM_HOST_3D,
+                    params.ctx_id,
+                    fence_id,
+                ),
+                box_: params.box_,
+                offset: params.offset,
+                resource_id: params.resource_id,
+                level: params.level,
+                stride: params.stride,
+                layer_stride: params.layer_stride,
+            },
+            None,
+            fence_id,
+        )?;
         self.ctrl_notify();
         Ok(fence_id)
     }
@@ -1016,8 +1029,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         // Fire-and-forget: the popped response is dropped (the fence is the
         // completion signal), and the command stream is copied into a heap
         // box by the queue.
-        self.ctrl
-            .enqueue(&mut self.transport, &req, Some(cmds), fence_id)
+        self.enqueue_fenced(&req, Some(cmds), fence_id)
             .map(|_| fence_id)
     }
 
@@ -1040,8 +1052,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
             size,
             _padding: 0,
         };
-        self.ctrl
-            .enqueue(&mut self.transport, &req, Some(cmds), fence_id)
+        self.enqueue_fenced(&req, Some(cmds), fence_id)
             .map(|_| fence_id)
     }
 
