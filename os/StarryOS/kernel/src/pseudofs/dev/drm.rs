@@ -772,22 +772,29 @@ pub struct DrmSyncobjHandle {
     pub point: u64,
 }
 
-/// Waits on binary syncobjs. Linux: `struct drm_syncobj_wait` (32 bytes)
+/// Waits on binary syncobjs. Linux: `struct drm_syncobj_wait` (40 bytes:
+/// handles, timeout_nsec, count_handles, flags, first_signaled, pad,
+/// deadline_nsec).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmSyncobjWait {
     /// Pointer to a __u32 handle array.
     pub handles: u64,
-    pub count_handles: u32,
-    pub pad: u32,
     /// Absolute CLOCK_MONOTONIC deadline in nanoseconds; a value that
     /// already lapsed degenerates to a single poll (Linux
     /// `drm_timeout_abs_to_jiffies`).
     pub timeout_nsec: i64,
+    /// Number of handles in the array.
+    pub count_handles: u32,
     /// `DRM_SYNCOBJ_WAIT_FLAGS_*`.
     pub flags: u32,
-    /// Output: index of the first signaled handle.
+    /// Output: index of the first signaled handle (valid on a successful
+    /// non-WAIT_ALL return only).
     pub first_signaled: u32,
+    pub pad: u32,
+    /// Optional per-wait deadline hint forwarded to the fences when
+    /// WAIT_DEADLINE is set (Linux master, post-v7.1); accepted and unused.
+    pub deadline_nsec: u64,
 }
 
 /// Resets/signals binary syncobjs. Linux: `struct drm_syncobj_array` (16 bytes)
@@ -811,20 +818,25 @@ pub struct DrmSyncobjTimelineArray {
     pub flags: u32,
 }
 
-/// Waits on timeline syncobjs. Linux: `struct drm_syncobj_timeline_wait` (48 bytes)
+/// Waits on timeline syncobjs. Linux: `struct drm_syncobj_timeline_wait`
+/// (48 bytes).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmSyncobjTimelineWait {
     pub handles: u64,
     pub points: u64,
-    pub timeout_nsec: u64,
+    /// Absolute CLOCK_MONOTONIC deadline (`__s64` in Linux: negative values
+    /// read as already lapsed).
+    pub timeout_nsec: i64,
     pub count_handles: u32,
     pub flags: u32,
-    /// Output: index of the first signaled handle.
+    /// Output: index of the first signaled handle (valid on a successful
+    /// non-WAIT_ALL return only).
     pub first_signaled: u32,
     pub pad: u32,
-    /// Optional per-handle deadlines (v6.6+); unused here.
-    pub deadlines_nsec: u64,
+    /// Optional per-wait deadline hint forwarded to the fences when
+    /// WAIT_DEADLINE is set (Linux master, post-v7.1); accepted and unused.
+    pub deadline_nsec: u64,
 }
 
 /// Registers an eventfd to be signalled when a syncobj point completes.
@@ -916,6 +928,20 @@ mod tests {
         // command word, so a 16-byte struct silently misses the dispatch.
         assert_eq!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, 0xc018_64c1);
         assert_eq!(core::mem::size_of::<DrmSyncobjHandle>(), 24);
+    }
+
+    #[test]
+    fn syncobj_wait_structs_match_linux_command_words() {
+        // libdrm compiles `struct drm_syncobj_wait` from the Linux UAPI
+        // header as 40 bytes — timeout_nsec sits before count_handles and
+        // the trailing deadline_nsec hint rides along — and
+        // `drm_syncobj_timeline_wait` as 48 bytes. The packed size is part
+        // of the command word, so any layout drift silently misses the
+        // dispatch (`drmSyncobjWait` gets ENOTTY from the default arm).
+        assert_eq!(DRM_IOCTL_SYNCOBJ_WAIT, 0xc028_64c3);
+        assert_eq!(core::mem::size_of::<DrmSyncobjWait>(), 40);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, 0xc030_64ca);
+        assert_eq!(core::mem::size_of::<DrmSyncobjTimelineWait>(), 48);
     }
 
     #[test]

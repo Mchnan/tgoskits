@@ -1405,9 +1405,11 @@ impl Card0 {
         // point must already be signalled (Linux blocks in the ioctl on the
         // dependency fence; same-device fences could skip, but every venus
         // fence here is a ring batch the host may not have consumed yet, so
-        // enqueue order does not order execution).
+        // enqueue order does not order execution). A deliverable signal
+        // aborts the wait with EINTR (Linux -ERESTARTSYS) and an unbacked
+        // point fails with EINVAL before parking.
         for &(handle, point) in &in_syncobjs {
-            self.wait_syncobj_dependency(file.file_id, handle, point);
+            self.wait_syncobj_dependency(file.file_id, current, handle, point)?;
         }
 
         // Linux fences every venus EXECBUFFER (the ring idx rides on the
@@ -1433,6 +1435,10 @@ impl Card0 {
                     owner: file.file_id,
                     syncobjs: out_syncobjs,
                 });
+            // Arm the completion-side pump: a client that parks in
+            // `poll(eventfd)` after this submit issues no further ioctls,
+            // so the pump task is what observes the retire for it.
+            super::syncobj::kick_retire_pump();
         }
         // EXECBUFFER is a fire-and-forget transaction: one boundary notify
         // delivers the submission — Linux `virtio_gpu_notify()` at the ioctl

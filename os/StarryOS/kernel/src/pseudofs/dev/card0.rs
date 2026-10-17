@@ -801,7 +801,7 @@ impl FileLike for HostResourceDmaBuf {
         "anon_inode:dmabuf".into()
     }
 
-    fn device_mmap(&self, _offset: u64, length: u64) -> StarryResult<DeviceMmap> {
+    fn device_mmap(&self, offset: u64, length: u64) -> StarryResult<DeviceMmap> {
         // A host-visible venus blob exports its hostmem BAR window: the
         // exported fd mmap resolves to the same physical range the creator
         // mapped (gbm's CPU path and deniald's background writes go through
@@ -809,14 +809,17 @@ impl FileLike for HostResourceDmaBuf {
         // unmappable — its rendered content lives in the host texture, not
         // in any guest-visible memory.
         let map = (*self.resource.mapped_blob.lock()).ok_or(StarryError::Unsupported)?;
-        let end = map
-            .size
-            .checked_add(0)
+        // Sub-range mappings honor the caller's offset (Linux
+        // `drm_gem_mmap` resolves the offset within the object); anything
+        // past the window is EINVAL rather than a silent truncation.
+        let end = offset
+            .checked_add(length)
             .ok_or(StarryError::InvalidInput)?;
-        if length > end {
+        if end > map.size {
             return Err(StarryError::InvalidInput);
         }
-        let range = PhysAddrRange::from_start_size(PhysAddr::from(map.phys as usize), map.size as usize);
+        let start = (map.phys + offset) as usize;
+        let range = PhysAddrRange::from_start_size(PhysAddr::from(start), length as usize);
         let cached = map.map_info & VIRTGPU_MAP_CACHE_MASK == VIRTGPU_MAP_CACHE_CACHED;
         // Pin the host resource for the VMA's lifetime; the exported fd
         // already holds one Arc, so borrow it as the retainer.
@@ -1272,12 +1275,18 @@ impl Card0 {
     }
 
     pub fn new() -> Arc<Self> {
-        // The GPU IRQ worker calls this after pumping completions, so a
-        // poll-blocked out-fence waiter is woken in µs instead of waiting out
-        // the fence refresher's 250 µs active tick. Runs once per boot (this
+        // The GPU IRQ worker calls this after pumping completions: it kicks
+        // both the out-fence refresher (µs-scale wake for poll-blocked
+        // waiters) and the syncobj retire pump (eventfd waiters observing
+        // retires without issuing further ioctls). Runs once per boot (this
         // constructor is the single Card0 instantiation).
-        ax_gpu::set_completion_notifier(super::sync_file::on_gpu_completion);
-        Arc::new_cyclic(|weak| Self {
+        ax_gpu::set_completion_notifier(syncobj::on_gpu_completion);
+        Arc::new_cyclic(|weak| {
+            // The retire pump advances syncobj watermarks on completions;
+            // it holds only this weak reference, so it never keeps the
+            // device alive.
+            syncobj::register_retire_pump_target(weak.clone());
+            Self {
             self_weak: weak.clone(),
             vblank: VblankClock::new(monotonic_time_nanos()),
             vblank_event: Arc::new(Event::new()),
@@ -1311,6 +1320,7 @@ impl Card0 {
             syncobjs: Mutex::new(BTreeMap::new()),
             pending_retires: Mutex::new(VecDeque::new()),
             next_blob_mmap_key: AtomicU64::new(BLOB_MMAP_KEY_BASE),
+        }
         })
     }
 

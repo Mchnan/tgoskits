@@ -153,9 +153,15 @@ pub(crate) struct ControlQueue<H: virtio_drivers::Hal> {
     /// into the watermark once the hole ahead of them fills.
     completed_fence_id: u64,
     /// Fence ids above [`ControlQueue::completed_fence_id`] whose used
-    /// entries already popped (out-of-order ring completions). Bounded in
-    /// practice by the deferred batches' lag; pruned from the low end with
-    /// the same bound as the wait timeout.
+    /// entries already popped (out-of-order ring completions). Entries only
+    /// leave the set when the contiguous watermark folds them in
+    /// ([`ControlQueue::pump_completions`]); there is no independent
+    /// low-end pruning. A fence id the host enqueued but never retires is
+    /// therefore a permanent hole: the watermark stays below it and every
+    /// later pop retains one entry each, so in that wedged state the set
+    /// grows with the submit count (documented as a known limitation of the
+    /// design doc). Normal operation keeps it bounded by the deferred
+    /// batches' lag.
     completed_fences: BTreeSet<u64>,
     /// Monotonic nanosecond clock injected at construction; bounds the
     /// blocking waits. See [`WAIT_TIMEOUT_NS`].
@@ -779,8 +785,12 @@ impl<H: virtio_drivers::Hal> ControlQueue<H> {
         }
     }
 
-    /// Non-blocking fence query: has `fence_id` (and everything enqueued
-    /// before it) already been popped, i.e. has its virgl fence fired?
+    /// Non-blocking fence query: has `fence_id` already been popped, i.e.
+    /// has its virgl fence fired? True when the id is at or below the
+    /// contiguous completion watermark, or it popped out of order and
+    /// parks in the completion set — ring batches retire out of order, so
+    /// a lower id is NOT implicitly complete until its own pop folds the
+    /// watermark forward.
     ///
     /// Only reflects batches that have actually been delivered to the host; a
     /// consumer that only polls must ensure delivery itself (e.g.
@@ -1283,9 +1293,13 @@ mod tests {
     }
 
     #[test]
-    fn pump_advances_fence_high_water_with_implicit_ordering() {
+    fn pump_advances_fence_high_water_by_contiguous_prefix() {
         let (mut ctrl, state, mut transport) = make_ctrl();
 
+        // Ring batches retire out of order: fence 5 pops while 4 is still
+        // running, so 5 parks in the out-of-order set and the contiguous
+        // watermark stays put — a lower id must not read as implicitly
+        // complete before its own pop.
         ctrl.enqueue(&mut transport, &TestCmd { kind: 0, seq: 1 }, None, 5)
             .unwrap();
         assert!(!ctrl.fence_completed(5));
@@ -1293,9 +1307,16 @@ mod tests {
         assert!(complete_one(&state, ok_responder));
         ctrl.pump_completions(&mut transport).unwrap();
         assert!(ctrl.fence_completed(5));
-        // Implicit ordering: everything ≤ 5 is complete too.
+        assert!(!ctrl.fence_completed(4));
+
+        // Once the hole fills, the watermark folds the parked entries in
+        // and everything below reads complete again.
+        ctrl.enqueue(&mut transport, &TestCmd { kind: 0, seq: 2 }, None, 4)
+            .unwrap();
+        assert!(complete_one(&state, ok_responder));
+        ctrl.pump_completions(&mut transport).unwrap();
         assert!(ctrl.fence_completed(4));
-        assert_eq!(state.lock().unwrap().processed, vec![1]);
+        assert_eq!(state.lock().unwrap().processed, vec![1, 2]);
     }
 
     #[test]
