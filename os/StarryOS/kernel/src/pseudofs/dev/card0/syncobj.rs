@@ -552,13 +552,16 @@ impl Card0 {
         // `drm_syncobj_fence_get`); the binary view is point 1 here.
         let target = args.point.max(1);
         let mut state = state.lock();
-        if state.signaled_point < target
+        if args.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE == 0
+            && state.signaled_point < target
             && self.pending_fence_for(owner, args.handle, target).is_none()
         {
             // Linux resolves the fence at registration: without
             // WAIT_AVAILABLE, a point nothing backs has no fence to wait
             // on and the ioctl fails with EINVAL
-            // (`drm_syncobj_eventfd_ioctl`).
+            // (`drm_syncobj_eventfd_ioctl`). WAIT_AVAILABLE asks for the
+            // attachment instead, which an unsubmitted point may still
+            // gain.
             return Err(VfsError::InvalidInput);
         }
         // WAIT_AVAILABLE asks to be woken when a fence *attaches* to the

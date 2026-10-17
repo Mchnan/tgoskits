@@ -281,6 +281,9 @@ int main(void) {
             .points = (uint64_t)(uintptr_t)points,
             .timeout_nsec = 1, /* absolute: long since passed */
             .count_handles = 2,
+            /* WAIT_FOR_SUBMIT lets the unsatisfied handle stay in the list
+             * (Linux resolves every handle up front otherwise). */
+            .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
         };
         CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &w), 0,
                   "any-handle timeline wait succeeds when the second is reached");
@@ -291,6 +294,7 @@ int main(void) {
             .handles = (uint64_t)(uintptr_t)handles,
             .timeout_nsec = 1,
             .count_handles = 2,
+            .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
         };
         CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &bw), 0,
                   "any-handle binary wait succeeds when the second is signaled");
