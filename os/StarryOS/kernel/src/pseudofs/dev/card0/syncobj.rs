@@ -312,8 +312,10 @@ impl Card0 {
     }
 
     /// Advances one syncobj's watermark on behalf of an explicit
-    /// `TIMELINE_SIGNAL` (or binary SIGNAL) and wakes its waiters.
-    fn signal_syncobj_point(
+    /// `TIMELINE_SIGNAL` (or binary SIGNAL) and wakes its waiters. Also the
+    /// immediate-advance path for out-syncobjs of a synchronously-completed
+    /// EXECBUFFER (no retire to wait for).
+    pub(super) fn signal_syncobj_point(
         &self,
         owner: u64,
         handle: u32,
@@ -390,6 +392,9 @@ impl Card0 {
         arg: usize,
     ) -> VfsResult<usize> {
         let args: DrmSyncobjDestroy = load_arg(current, arg)?;
+        if args.pad != 0 {
+            return Err(VfsError::InvalidInput);
+        }
         self.syncobjs
             .lock()
             .remove(&(owner, args.handle))
@@ -404,6 +409,12 @@ impl Card0 {
         arg: usize,
     ) -> VfsResult<usize> {
         let args: DrmSyncobjTimelineArray = load_arg(current, arg)?;
+        // The tail word (Linux names it pad; QUERY's LAST_SUBMITTED flag is
+        // not implemented and is rejected here) and an empty handle list
+        // are EINVAL, like `drm_syncobj_query_ioctl`.
+        if args.flags != 0 {
+            return Err(VfsError::InvalidInput);
+        }
         let handles: Vec<u32> = vm_load(
             current,
             args.handles as *const u32,
@@ -429,6 +440,11 @@ impl Card0 {
         arg: usize,
     ) -> VfsResult<usize> {
         let args: DrmSyncobjArray = load_arg(current, arg)?;
+        // Linux `drm_syncobj_reset_ioctl`: a nonzero tail word or an empty
+        // handle list is EINVAL.
+        if args.flags != 0 || args.count_handles == 0 {
+            return Err(VfsError::InvalidInput);
+        }
         let handles: Vec<u32> = vm_load(
             current,
             args.handles as *const u32,
@@ -448,6 +464,11 @@ impl Card0 {
         arg: usize,
     ) -> VfsResult<usize> {
         let args: DrmSyncobjArray = load_arg(current, arg)?;
+        // Linux `drm_syncobj_signal_ioctl`: a nonzero tail word or an empty
+        // handle list is EINVAL.
+        if args.flags != 0 || args.count_handles == 0 {
+            return Err(VfsError::InvalidInput);
+        }
         let handles: Vec<u32> = vm_load(
             current,
             args.handles as *const u32,
@@ -475,6 +496,11 @@ impl Card0 {
         arg: usize,
     ) -> VfsResult<usize> {
         let args: DrmSyncobjTimelineArray = load_arg(current, arg)?;
+        // Linux `drm_syncobj_timeline_signal_ioctl`: a nonzero tail word or
+        // an empty handle list is EINVAL.
+        if args.flags != 0 || args.count_handles == 0 {
+            return Err(VfsError::InvalidInput);
+        }
         let handles: Vec<u32> = vm_load(
             current,
             args.handles as *const u32,
@@ -689,6 +715,9 @@ impl Card0 {
         let Ok(states) = self.lookup_syncobjs(owner, &[handle]) else {
             return Err(VfsError::NotFound);
         };
+        // Point 0 addresses the binary view (point 1) — the EXECBUFFER
+        // dependency tail carries 0 for binary syncobjs.
+        let point = point.max(1);
         let state = &states[0];
         if state.lock().signaled_point < point
             && self.pending_fence_for(owner, handle, point).is_none()
@@ -749,6 +778,10 @@ impl Card0 {
         let points: Vec<u64> =
             vm_load(current, args.points as *const u64, args.count_handles as usize)
                 .map_err(|_| VfsError::BadAddress)?;
+        // Point 0 addresses the binary view of the syncobj (Linux resolves
+        // the current fence); the binary view is point 1 here, so a 0 must
+        // not compare as always-reached against an unsignaled watermark.
+        let points: Vec<u64> = points.into_iter().map(|p| p.max(1)).collect();
         let states = self.lookup_syncobjs(owner, &handles)?;
 
         // Index of the first satisfied handle, for the non-WAIT_ALL

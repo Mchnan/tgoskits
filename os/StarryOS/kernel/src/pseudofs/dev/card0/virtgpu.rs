@@ -155,14 +155,19 @@ impl Card0 {
         };
 
         // Linux `virtio_gpu_getparam_ioctl`: `copy_to_user((void __user *)
-        // param->value, &value, sizeof(value))` — 结果写入用户指针指向的 u64,
-        // 而不是写回 struct 字段。之前 `g.value = value; vm_write(g)` 把值写进
-        // struct 的 value 字段(覆盖了指针),mesa 读的是指针指向的本地变量,
-        // 导致所有 GETPARAM 都读到 0 → 3D_FEATURES=0 → virgl winsys 创建失败。
+        // param->value, &value, sizeof(value))` — the result goes to the
+        // memory the `value` field points at, not back into the struct
+        // field (overwriting it would clobber the pointer, and Mesa reads
+        // the pointed-at local, so every GETPARAM used to return 0).
+        // `value` is an `int` in the UAPI, so exactly four bytes are
+        // written: a contract-faithful client passing `&int32` must not
+        // have the adjacent four bytes stomped.
         if g.value == 0 {
             return Err(VfsError::BadAddress);
         }
-        vm_write_slice(current, g.value as *mut u64, &[value]).map_err(|_| VfsError::BadAddress)?;
+        let narrow = value as u32;
+        vm_write_slice(current, g.value as *mut u32, &[narrow])
+            .map_err(|_| VfsError::BadAddress)?;
         Ok(0)
     }
 
@@ -1132,8 +1137,9 @@ impl Card0 {
         arg: usize,
         mut b: DrmVirtgpuResourceCreateBlob,
     ) -> VfsResult<usize> {
-        // Linux `verify_blob()`: `pad` must be zero unless the blob carries
-        // guest memory, and only the defined hint bit is accepted.
+        // Stricter than Linux `verify_blob()` (which forwards `pad` and
+        // `blob_hints` to the device untouched): a nonzero pad or an
+        // undefined hint bit is rejected here instead of reaching the host.
         if b.pad != 0 || b.blob_hints & !DRM_VIRTGPU_BLOB_FLAG_HINT_DEFER_MAPPING != 0 {
             return Err(VfsError::InvalidInput);
         }
@@ -1426,7 +1432,11 @@ impl Card0 {
         // fence lands (`pump_retired_fences`), not at submit time: the guest
         // reads a retired fence as "the host consumed my submission", so an
         // early signal lets it lap the venus ring and corrupt the host
-        // command stream.
+        // command stream. A synchronously-completed submit (fence id 0 —
+        // the driver answered without a pending retire) has no retire to
+        // wait for, so its out-syncobjs advance immediately (Linux
+        // `virtio_gpu_process_post_deps` attaches the fence unconditionally,
+        // whatever the submit mode was).
         if !out_syncobjs.is_empty() && fence_id != 0 {
             self.pending_retires
                 .lock()
@@ -1439,6 +1449,14 @@ impl Card0 {
             // `poll(eventfd)` after this submit issues no further ioctls,
             // so the pump task is what observes the retire for it.
             super::syncobj::kick_retire_pump();
+        } else if !out_syncobjs.is_empty() {
+            let mut woken = Vec::new();
+            for (handle, point) in out_syncobjs {
+                self.signal_syncobj_point(file.file_id, handle, point, &mut woken);
+            }
+            for eventfd in woken {
+                let _ = eventfd.signal_kernel(1);
+            }
         }
         // EXECBUFFER is a fire-and-forget transaction: one boundary notify
         // delivers the submission — Linux `virtio_gpu_notify()` at the ioctl

@@ -176,6 +176,15 @@ int main(void) {
               "TIMELINE_SIGNAL point 5");
     CHECK(query_point(fd, signaled) == 5, "QUERY reads the signaled waterline");
 
+    struct drm_syncobj_timeline_array sigbad = {
+        .handles = (uint64_t)(uintptr_t)&signaled,
+        .points = (uint64_t)(uintptr_t)&sig_point,
+        .count_handles = 1,
+        .pad = 1,
+    };
+    CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &sigbad), EINVAL,
+              "TIMELINE_SIGNAL with a nonzero tail word is EINVAL");
+
     /* --- TIMELINE_WAIT：绝对截止 + ETIME --- */
     {
         uint32_t handles[1] = { signaled };
@@ -289,6 +298,23 @@ int main(void) {
               "binary wait writes back the first satisfied index");
     }
 
+    /* --- timeline wait 的 point 0 是二进制视图 --- */
+    {
+        uint32_t handles[1] = { pending };
+        uint64_t points[1] = { 0 };
+        struct drm_syncobj_timeline_wait w = {
+            .handles = (uint64_t)(uintptr_t)handles,
+            .points = (uint64_t)(uintptr_t)points,
+            .timeout_nsec = 1,
+            .count_handles = 1,
+        };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &w), EINVAL,
+                  "point 0 on an unsignaled syncobj is the binary view, not always-reached");
+        handles[0] = signaled;
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &w), 0,
+                  "point 0 on a signaled syncobj reads as the binary view");
+    }
+
     /* --- HANDLE_TO_FD / FD_TO_HANDLE 校验与往返 --- */
     {
         struct drm_syncobj_handle h = { .handle = signaled, .flags = 1u << 2 };
@@ -370,6 +396,20 @@ int main(void) {
 
     /* --- RESET / SIGNAL --- */
     {
+        struct drm_syncobj_array bad = {
+            .handles = (uint64_t)(uintptr_t)&signaled,
+            .count_handles = 1,
+            .pad = 1,
+        };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_SIGNAL, &bad), EINVAL,
+                  "SIGNAL with a nonzero tail word is EINVAL");
+        bad.pad = 0;
+        bad.count_handles = 0;
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_SIGNAL, &bad), EINVAL,
+                  "SIGNAL with an empty handle list is EINVAL");
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_RESET, &bad), EINVAL,
+                  "RESET with an empty handle list is EINVAL");
+
         struct drm_syncobj_array arr = {
             .handles = (uint64_t)(uintptr_t)&signaled,
             .count_handles = 1,
@@ -445,6 +485,10 @@ int main(void) {
 
     /* --- DESTROY --- */
     {
+        struct drm_syncobj_destroy bad = { .handle = pending, .pad = 1 };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &bad), EINVAL,
+                  "DESTROY with a nonzero pad is EINVAL");
+
         struct drm_syncobj_destroy d = { .handle = pending };
         CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &d), 0, "DESTROY pending");
         CHECK(query_point(fd, pending) == UINT64_MAX,
