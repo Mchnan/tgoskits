@@ -23,8 +23,11 @@ use bytemuck::{AnyBitPattern, NoUninit};
 use super::super::drm::{
     DrmSyncobjArray, DrmSyncobjCreate, DrmSyncobjDestroy, DrmSyncobjEventfd, DrmSyncobjHandle,
     DrmSyncobjTimelineArray, DrmSyncobjTimelineWait, DrmSyncobjWait,
-    DRM_SYNCOBJ_CREATE_SIGNALED, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
-    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+    DRM_SYNCOBJ_CREATE_SIGNALED, DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
+    DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE, DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE,
+    DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE,
+    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
 };
 use super::super::sync_file::SyncFile;
 use super::Card0;
@@ -217,7 +220,7 @@ impl Card0 {
 
     /// Resolves handles to their per-fd syncobj states, failing with
     /// `NotFound` when any handle is unknown.
-    fn lookup_syncobjs(
+    pub(super) fn lookup_syncobjs(
         &self,
         owner: u64,
         handles: &[u32],
@@ -364,7 +367,12 @@ impl Card0 {
         for (handle, point) in handles.iter().zip(points) {
             self.signal_syncobj_point(owner, *handle, point, &mut woken);
         }
-        drop(woken);
+        // Signal the collected waiters after every lock is released, exactly
+        // like the retire pump; dropping them silently would park an
+        // EVENTFD waiter forever.
+        for eventfd in woken {
+            let _ = eventfd.signal_kernel(1);
+        }
         Ok(0)
     }
 
@@ -410,18 +418,31 @@ impl Card0 {
     /// sync_file fd — the EGL native-fence path (zink/venus export per-frame
     /// completion this way to drive the output-pool buffer lifecycle). An
     /// already-reached point exports a signaled file; a future point fires
-    /// when the watermark passes it.
+    /// when the watermark passes it. With `TIMELINE` (v6.16+) the export
+    /// lands at `point`; a missing handle is ENOENT (Linux uses EINVAL only
+    /// on the plain syncobj-fd export path, which this driver does not
+    /// model separately).
     pub(super) fn handle_syncobj_handle_to_fd(
         &self,
         owner: u64,
         current: &UserTaskRef,
         arg: usize,
-    ) -> Option<VfsResult<usize>> {
-        const EXPORT_SYNC_FILE: u32 = 1;
-        let args: DrmSyncobjHandle = load_arg(current, arg).ok()?;
-        if args.flags & !EXPORT_SYNC_FILE != 0 {
-            return Some(Err(VfsError::InvalidInput));
+    ) -> VfsResult<usize> {
+        let args: DrmSyncobjHandle = load_arg(current, arg)?;
+        if args.pad != 0
+            || args.flags
+                & !(DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE
+                    | DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE)
+                    != 0
+        {
+            return Err(VfsError::InvalidInput);
         }
+        let timeline = args.flags & DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE != 0;
+        if !timeline && args.point != 0 {
+            return Err(VfsError::InvalidInput);
+        }
+        // The binary view of the syncobj is point 1.
+        let point = if timeline { args.point.max(1) } else { 1 };
         // Drain retire responses first: exporting a point the host already
         // retired must produce a signaled file, not a pending registration.
         self.pump_retired_fences();
@@ -429,17 +450,19 @@ impl Card0 {
             .syncobjs
             .lock()
             .get(&(owner, args.handle))
-            .cloned()?;
+            .cloned()
+            .ok_or(VfsError::NotFound)?;
         let file = Arc::new(SyncFile::new(0));
         {
             let mut state = state.lock();
-            if state.signaled_point >= args.point {
-                // Fence id 0 completes on the first refresh, so a registered
-                // file over a reached point signals right away.
+            if state.signaled_point >= point {
+                // The point is already reached: publish the signaled state
+                // directly (Linux hands out a signaled stub fence for
+                // completed points) instead of waiting for the refresher
+                // to observe device fence 0.
+                file.mark_signaled();
                 file.register();
-            } else if let Some(fence_id) =
-                self.pending_fence_for(owner, args.handle, args.point)
-            {
+            } else if let Some(fence_id) = self.pending_fence_for(owner, args.handle, point) {
                 // The point belongs to an outstanding submission: bind the
                 // export to that submission's device fence and hand it to
                 // the completion refresher. The file then signals exactly
@@ -451,45 +474,91 @@ impl Card0 {
                 file.bind_fence_id(fence_id);
                 file.register();
             } else {
-                state.sync_files.push((args.point, file.clone()));
+                state.sync_files.push((point, file.clone()));
             }
         }
-        let fd = match add_file_like(file, true) {
-            Ok(fd) => fd,
-            Err(_) => return Some(Err(VfsError::Io)),
-        };
+        let fd = add_file_like(file, true).map_err(|_| VfsError::Io)?;
         let out = DrmSyncobjHandle { fd, ..args };
-        Some(store_arg(current, arg, &out).map(|_| 0))
+        store_arg(current, arg, &out).map(|_| 0)
     }
 
     /// `DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE`: imports a sync_file fd — the other
     /// half of the native-fence round trip. Only files this kernel exported
     /// are honored: an already-signaled file turns into the binary-signaled
-    /// syncobj view; a still-pending file has no async completion path here
-    /// and is rejected rather than left silently stuck.
+    /// syncobj view (or, with `TIMELINE`, the fence at `point`); a
+    /// still-pending file has no async completion path here and is rejected
+    /// rather than left silently stuck.
     pub(super) fn handle_syncobj_fd_to_handle(
         &self,
         owner: u64,
         current: &UserTaskRef,
         arg: usize,
-    ) -> Option<VfsResult<usize>> {
-        let args: DrmSyncobjHandle = load_arg(current, arg).ok()?;
-        let file = get_file_like(args.fd).ok()?;
-        let file = file.downcast_arc::<SyncFile>().ok()?;
-        if !file.refresh() {
-            return Some(Err(VfsError::InvalidInput));
+    ) -> VfsResult<usize> {
+        let args: DrmSyncobjHandle = load_arg(current, arg)?;
+        if args.pad != 0
+            || args.flags
+                & !(DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE
+                    | DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE)
+                    != 0
+        {
+            return Err(VfsError::InvalidInput);
         }
+        // Linux takes a new handle regardless of flags; a bad fd or a
+        // non-sync-file fd is EINVAL on both import paths.
+        let file = get_file_like(args.fd).map_err(|_| VfsError::InvalidInput)?;
+        let file = file
+            .downcast_arc::<SyncFile>()
+            .map_err(|_| VfsError::InvalidInput)?;
+        if !file.refresh() {
+            return Err(VfsError::InvalidInput);
+        }
+        let point = if args.flags & DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE != 0 {
+            args.point.max(1)
+        } else {
+            if args.point != 0 {
+                return Err(VfsError::InvalidInput);
+            }
+            1
+        };
         let handle = self.next_syncobj_handle();
         self.syncobjs.lock().insert(
             (owner, handle),
             Arc::new(Mutex::new(SyncobjState {
-                signaled_point: 1,
+                signaled_point: point,
                 eventfds: Vec::new(),
                 sync_files: Vec::new(),
             })),
         );
         let out = DrmSyncobjHandle { handle, ..args };
-        Some(store_arg(current, arg, &out).map(|_| 0))
+        store_arg(current, arg, &out).map(|_| 0)
+    }
+
+    /// Waits until `point` on `handle` is signalled, pumping host retires —
+    /// the inline EXECBUFFER dependency wait (Linux
+    /// `virtio_gpu_do_fence_wait`). Ring batches retire out of order, so
+    /// enqueue order alone does not order execution and the wait is real.
+    /// A dependency only a later submit of the same thread could satisfy is
+    /// a client bug (Linux deadlocks the same way); a slow host costs a
+    /// stall warn, never a failed submit.
+    pub(super) fn wait_syncobj_dependency(&self, owner: u64, handle: u32, point: u64) {
+        let Ok(states) = self.lookup_syncobjs(owner, &[handle]) else {
+            return;
+        };
+        let state = &states[0];
+        let start = ax_runtime::hal::time::monotonic_time_nanos();
+        let mut warned = false;
+        loop {
+            self.pump_retired_fences();
+            if state.lock().signaled_point >= point {
+                return;
+            }
+            let now = ax_runtime::hal::time::monotonic_time_nanos();
+            if !warned && now.saturating_sub(start) > 1_000_000_000 {
+                warned = true;
+                warn!("card0: execbuffer in-syncobj wait >1s (handle {handle}, point {point})");
+            }
+            yield_now();
+        }
     }
 
     pub(super) fn handle_syncobj_timeline_wait(
@@ -499,6 +568,19 @@ impl Card0 {
         arg: usize,
     ) -> VfsResult<usize> {
         let args: DrmSyncobjTimelineWait = load_arg(current, arg)?;
+        // Linux `drm_syncobj_timeline_wait_ioctl`: the four WAIT_* bits are
+        // the whole legal flag set.
+        const KNOWN_FLAGS: u32 = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
+            | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+            | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE
+            | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE;
+        if args.flags & !KNOWN_FLAGS != 0 {
+            return Err(VfsError::InvalidInput);
+        }
+        // An empty handle list is an immediate success in Linux.
+        if args.count_handles == 0 {
+            return Ok(0);
+        }
         let handles: Vec<u32> = vm_load(
             current,
             args.handles as *const u32,
@@ -525,10 +607,29 @@ impl Card0 {
             })
         };
 
-        // Any unsatisfied wait references a future point. Honour
-        // WAIT_FOR_SUBMIT by sleeping until the timeout lapses; without the
-        // flag Linux rejects unknown-future waits with EINVAL.
-        let allow_block = args.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0;
+        // WAIT_DEADLINE only forwards a scheduling hint (ignored here).
+        // WAIT_FOR_SUBMIT and WAIT_AVAILABLE both permit blocking on a
+        // point nothing has submitted yet; without either, Linux rejects an
+        // unsubmitted dependency with EINVAL up front — "submitted" in this
+        // model means the point is either reached or backed by an
+        // outstanding retire (`pending_fence_for`).
+        let allow_block = args.flags
+            & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)
+            != 0;
+        if !allow_block {
+            for (i, state) in states.iter().enumerate() {
+                if state.lock().signaled_point < points[i]
+                    && self.pending_fence_for(owner, handles[i], points[i]).is_none()
+                {
+                    return Err(VfsError::InvalidInput);
+                }
+            }
+        }
+
+        // `timeout_nsec` is an absolute CLOCK_MONOTONIC deadline (Linux
+        // `drm_timeout_abs_to_jiffies`); a deadline that already lapsed
+        // degenerates to a single poll, and expiry reports ETIME.
+        let deadline = args.timeout_nsec;
         let start = ax_runtime::hal::time::monotonic_time_nanos();
         let mut stall_warned = false;
         loop {
@@ -538,12 +639,9 @@ impl Card0 {
             if check()? {
                 return Ok(0);
             }
-            if !allow_block {
-                return Err(VfsError::InvalidInput);
-            }
             let now = ax_runtime::hal::time::monotonic_time_nanos();
-            if now.saturating_sub(start) >= args.timeout_nsec {
-                return Err(VfsError::TimedOut);
+            if now >= deadline {
+                return Err(VfsError::TimerExpired);
             }
             // A wait spinning past one second means the retire responses for
             // its fence are not arriving — the signature of a venus-side
@@ -568,6 +666,17 @@ impl Card0 {
         arg: usize,
     ) -> VfsResult<usize> {
         let args: DrmSyncobjWait = load_arg(current, arg)?;
+        // Linux `drm_syncobj_wait_ioctl`: WAIT_AVAILABLE is illegal here
+        // (timeline-only); WAIT_DEADLINE is a hint and is accepted.
+        const KNOWN_FLAGS: u32 = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
+            | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+            | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE;
+        if args.flags & !KNOWN_FLAGS != 0 {
+            return Err(VfsError::InvalidInput);
+        }
+        if args.count_handles == 0 {
+            return Ok(0);
+        }
         let handles: Vec<u32> = vm_load(
             current,
             args.handles as *const u32,
@@ -592,18 +701,29 @@ impl Card0 {
         };
 
         let allow_block = args.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0;
-        let start = ax_runtime::hal::time::monotonic_time_nanos();
+        if !allow_block {
+            for (i, state) in states.iter().enumerate() {
+                if state.lock().signaled_point < 1
+                    && self.pending_fence_for(owner, handles[i], 1).is_none()
+                {
+                    // An unsignaled binary syncobj nothing backs is the
+                    // "fence not submitted" EINVAL of the Linux loop above.
+                    return Err(VfsError::InvalidInput);
+                }
+            }
+        }
+
+        // Absolute CLOCK_MONOTONIC deadline; a negative or zero value has
+        // already lapsed, so the first unsatisfied poll returns ETIME.
+        let deadline = u64::try_from(args.timeout_nsec).unwrap_or(0);
         loop {
             self.pump_retired_fences();
             if check()? {
                 return Ok(0);
             }
-            if !allow_block {
-                return Err(VfsError::InvalidInput);
-            }
             let now = ax_runtime::hal::time::monotonic_time_nanos();
-            if now.saturating_sub(start) >= args.timeout_nsec.unsigned_abs() {
-                return Err(VfsError::TimedOut);
+            if now >= deadline {
+                return Err(VfsError::TimerExpired);
             }
             yield_now();
         }

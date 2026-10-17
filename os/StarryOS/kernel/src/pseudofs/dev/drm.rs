@@ -778,14 +778,16 @@ pub struct DrmSyncobjHandle {
 pub struct DrmSyncobjWait {
     /// Pointer to a __u32 handle array.
     pub handles: u64,
-    /// Absolute-ish timeout in nanoseconds (relative wait).
-    pub timeout_nsec: i64,
     pub count_handles: u32,
+    pub pad: u32,
+    /// Absolute CLOCK_MONOTONIC deadline in nanoseconds; a value that
+    /// already lapsed degenerates to a single poll (Linux
+    /// `drm_timeout_abs_to_jiffies`).
+    pub timeout_nsec: i64,
     /// `DRM_SYNCOBJ_WAIT_FLAGS_*`.
     pub flags: u32,
     /// Output: index of the first signaled handle.
     pub first_signaled: u32,
-    pub pad: u32,
 }
 
 /// Resets/signals binary syncobjs. Linux: `struct drm_syncobj_array` (16 bytes)
@@ -863,6 +865,22 @@ pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 1 << 1;
 /// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE`: wait for a fence to become
 /// available at the point rather than for the point to signal.
 pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 1 << 2;
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE`: pass `deadline_nsec` as a
+/// scheduling hint to the fences (v6.11+). Accepted and ignored here — it
+/// never changes the wait predicate.
+pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE: u32 = 1 << 3;
+
+/// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE`: export a sync file
+/// fd instead of a syncobj fd.
+pub const DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE: u32 = 1 << 0;
+/// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE`: export the sync file at
+/// `point` (v6.16+); without it `point` must be zero.
+pub const DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE: u32 = 1 << 1;
+/// `DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`: import a sync file fd.
+pub const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE: u32 = 1 << 0;
+/// `DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE`: import the fence at `point`
+/// (v6.16+); without it `point` must be zero.
+pub const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE: u32 = 1 << 1;
 
 #[cfg(all(test, not(axtest), feature = "rknpu"))]
 mod tests {
