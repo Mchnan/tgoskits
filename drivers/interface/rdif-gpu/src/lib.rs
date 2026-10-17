@@ -443,6 +443,12 @@ pub trait VirglOps {
     fn host_memory_region(&self) -> Option<HostMemoryRegion> {
         None
     }
+    /// The device-advertised blob alignment requirement, when the device
+    /// offered and the driver negotiated `VIRTIO_GPU_F_BLOB_ALIGNMENT`.
+    /// Blob sizes and `RESOURCE_MAP_BLOB` offsets must be multiples of it.
+    fn blob_alignment(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// A device shared-memory region backing mappable blob resources

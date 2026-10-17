@@ -1152,6 +1152,10 @@ impl<H: Hal, T: Transport> VirglOps for VirtIoGpuDevice<H, T> {
             length: region.length,
         })
     }
+
+    fn blob_alignment(&self) -> Option<u32> {
+        self.raw.blob_alignment()
+    }
 }
 
 impl<H: Hal, T: Transport> VirtIoGpuDevice<H, T> {
