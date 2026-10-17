@@ -217,7 +217,9 @@ honored (`HostResourceDmaBuf::device_mmap` validates
 ## 5. UAPI surface
 
 `card0/virtgpu_uapi.rs` and `drm.rs` pin the layouts, `card0/virtgpu.rs`
-and `card0/syncobj.rs` the semantics.
+and `card0/syncobj.rs` the semantics. The `drm-test-syncobj` suite
+transcribes its guest-side structs from the Linux headers independently of
+the kernel (73 checks, §6.1).
 
 ### 5.1 Version baseline
 
@@ -239,10 +241,10 @@ face; everything else is `EINVAL`/`ENOENT` per the Linux reference.
 | ioctl | Acceptance on the venus face |
 | --- | --- |
 | `CONTEXT_INIT` | Once per fd (repeat → `EEXIST`). `CAPSET_ID` validated against the host capset mask (`device_capset_mask`): capset 4 admitted exactly when the host lists it; id > 6 → `EINVAL`. `NUM_RINGS` 1..=64. `POLL_RINGS_MASK` accepted, ignored. Unknown param → `EINVAL`. |
-| `GETPARAM` | `3D_FEATURES`, `CAPSET_QUERY_FIX` (=1), `RESOURCE_BLOB`, `CONTEXT_INIT` per negotiation; `HOST_VISIBLE` per hostmem presence; `CROSS_DEVICE` = 0; `SUPPORTED_CAPSET_IDS` = host mask; `BLOB_ALIGNMENT` = negotiated value or `ENOENT`. Unknown → `EINVAL`. |
+| `GETPARAM` | `3D_FEATURES`, `CAPSET_QUERY_FIX` (=1), `RESOURCE_BLOB`, `CONTEXT_INIT` per negotiation; `HOST_VISIBLE` per hostmem presence; `CROSS_DEVICE` = 0; `SUPPORTED_CAPSET_IDS` = host mask; `BLOB_ALIGNMENT` = negotiated value or `ENOENT`. Unknown → `EINVAL`. The value is written through the `value` pointer as the UAPI `int` (four bytes), like `virtio_gpu_getparam_ioctl`. |
 | `GET_CAPS` | v7.1 semantics: `size==0` → `EINVAL`; missing or too-old capset → `EINVAL`; copy clamped to `min(size, host_size)`; cached per (id, ver). |
 | `RESOURCE_CREATE_BLOB` | Requires a venus context and `HOST3D`; `pad != 0` or hint bits beyond `DEFER_MAPPING` → `EINVAL`; size a multiple of the negotiated alignment, ≤ window; no guest shadow (virgl keeps one). Every mappable blob is **mapped eagerly** — `DEFER_MAPPING` is accepted but not honored (§4.2 tradeoff). Slot exhaustion → `ENOSPC`. |
-| `EXECBUFFER` | Flags ⊆ `RING_IDX` (size 0 = ring kick, legal; `FENCE_FD_IN/OUT` rejected — venus uses syncobjs); `ring_idx < num_rings`; ≤ 256 bo handles; ≤ 1024 syncobj entries each direction, `syncobj_stride` ≥ 16; out-entry flags must be 0, in-entry flags may carry `RESET` (applied after the submit, Linux cleanup stage); unknown in-handle → `ENOENT`, unknown out-handle → `EINVAL`. In-syncobjs waited inline (§3.3); out-syncobjs enter `pending_retires` and arm the retire pump. |
+| `EXECBUFFER` | Flags ⊆ `RING_IDX` (size 0 = ring kick, legal; `FENCE_FD_IN/OUT` rejected — venus uses syncobjs); `ring_idx < num_rings`; ≤ 256 bo handles; ≤ 1024 syncobj entries each direction, `syncobj_stride` ≥ 16; out-entry flags must be 0, in-entry flags may carry `RESET` (applied after the submit, Linux cleanup stage); unknown in-handle → `ENOENT`, unknown out-handle → `EINVAL`. In-syncobjs waited inline (§3.3); out-syncobjs enter `pending_retires` and arm the retire pump — or advance immediately when the driver completed synchronously (no retire to wait for, Linux `virtio_gpu_process_post_deps` attaching the fence unconditionally). |
 | `MAP` | Blob handle → its `mmap_key`; dumb handles keep the dumb-offset space. |
 | `WAIT` | Waits/probes the resource's `last_fence`; expiry and NOWAIT-busy both `EBUSY`. |
 | `TRANSFER_TO/FROM_HOST` | From-host waits its own fence outside the device lock, then syncs the backing for the CPU; to-host is fire-and-forget at the boundary. |
@@ -258,7 +260,9 @@ TIMELINE_SIGNAL/WAIT/TIMELINE_WAIT/EVENTFD/HANDLE_TO_FD/FD_TO_HANDLE`
 
 | Entry | Semantics |
 | --- | --- |
-| `WAIT` / `TIMELINE_WAIT` | Absolute `CLOCK_MONOTONIC` deadline (`timeout_nsec` is signed: negatives already lapsed), expiry `ETIME`; `WAIT_AVAILABLE` legal only on the timeline form; `WAIT_DEADLINE` accepted as a hint; empty handle list succeeds; a point neither reached nor backed by a pending retire, without `WAIT_FOR_SUBMIT` (or `WAIT_AVAILABLE` on the timeline form) → `EINVAL`; a successful non-`WAIT_ALL` return writes the first satisfied index to `first_signaled`; a deliverable signal aborts the wait with `EINTR`. |
+| `WAIT` / `TIMELINE_WAIT` | Absolute `CLOCK_MONOTONIC` deadline (`timeout_nsec` is signed: negatives already lapsed), expiry `ETIME`; `WAIT_AVAILABLE` legal only on the timeline form; `WAIT_DEADLINE` accepted as a hint; empty handle list succeeds; point 0 addresses the binary view (point 1); a point neither reached nor backed by a pending retire, without `WAIT_FOR_SUBMIT` (or `WAIT_AVAILABLE` on the timeline form) → `EINVAL`; a successful non-`WAIT_ALL` return writes the first satisfied index to `first_signaled`; a deliverable signal aborts the wait with `EINTR`. |
+| `CREATE` / `DESTROY` / `RESET` / `SIGNAL` / `TIMELINE_SIGNAL` | Unknown `CREATE` flag → `EINVAL`; a nonzero tail word (`pad`) is `EINVAL` everywhere, and an empty handle list is `EINVAL` for `RESET` / `SIGNAL` / `TIMELINE_SIGNAL` (Linux `drm_syncobj_*_ioctl` guards). |
+| `QUERY` | Reports the timeline watermark; the tail word must be zero — `LAST_SUBMITTED` is rejected as a documented divergence (the watermark model has no un-submitted points to report). |
 | `EVENTFD` | `point` 0 addresses the binary view; an unbacked point without `WAIT_AVAILABLE` → `EINVAL` (no fence to wait on); waiters fire on `TIMELINE_SIGNAL`, on binary `SIGNAL`, and via the retire pump (§3.2). |
 | `HANDLE_TO_FD` / `FD_TO_HANDLE` | Unknown handle `ENOENT`, bad fd / non-sync-file `EINVAL`; an already-reached point exports a signaled file; a future point binds to its retiring device fence; the `TIMELINE` flag carries the point in both directions. |
 
@@ -275,7 +279,7 @@ notify, queue-full parking, bounded waits and fence watermark advance;
 `drm.rs` unit tests pin the syncobj command words against the libdrm
 values. QEMU system regressions (`cargo xtask starry test qemu -c
 test-suit/starryos/qemu/system/...`) run `drm-test-drm-atomic` (KMS +
-deferred-release path) and the `drm-test-syncobj` conformance suite (66
+deferred-release path) and the `drm-test-syncobj` conformance suite (73
 checks, host-3D-free). The syncobj suite transcribes its structs
 independently from the Linux UAPI headers and `_Static_assert`s the
 packed command words, so a kernel-side layout regression surfaces as
