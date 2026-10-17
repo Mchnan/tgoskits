@@ -53,8 +53,7 @@ pub const VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS: u64 = 7;
 /// User-space debug naming (v6.12+).
 #[allow(dead_code)]
 pub const VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME: u64 = 8;
-/// Blob alignment requirement (v6.15+).
-#[allow(dead_code)]
+/// Blob alignment requirement (linux master, post-v7.1).
 pub const VIRTGPU_PARAM_BLOB_ALIGNMENT: u64 = 9;
 
 // ---- EXECBUFFER flags (VIRTGPU_EXECBUF_*) ----
@@ -66,9 +65,11 @@ pub const VIRTGPU_EXECBUF_FENCE_FD_OUT: u32 = 0x02;
 /// Use ring_idx field.
 #[allow(dead_code)]
 pub const VIRTGPU_EXECBUF_RING_IDX: u32 = 0x04;
-/// syncobj reset (v6.6+).
-#[allow(dead_code)]
-pub const VIRTGPU_EXECBUF_SYNCOBJ_RESET: u32 = 0x01;
+
+/// ---- `drm_virtgpu_execbuffer_syncobj` entry flags ----
+/// Linux `VIRTGPU_EXECBUF_SYNCOBJ_FLAGS`: the only legal per-entry flag is
+/// RESET — the kernel resets those in-syncobjs after the submit completes.
+pub const VIRTGPU_EXECBUF_SYNCOBJ_FLAGS_RESET: u32 = 0x01;
 
 // ---- WAIT flags ----
 
@@ -341,14 +342,16 @@ pub struct DrmVirtgpuGetCaps {
 }
 
 /// Creates a blob resource for coherent memory sharing.
-/// Linux: `struct drm_virtgpu_resource_create_blob` (56 bytes, v6.15 UAPI).
+/// Linux: `struct drm_virtgpu_resource_create_blob` (56 bytes; the
+/// `blob_hints` tail is linux master, post-v7.1).
 ///
 /// Mesa virgl calls this when `supports_coherent=true` (i.e. both
 /// RESOURCE_BLOB and HOST_VISIBLE are reported as supported); Mesa venus
 /// calls it for every host-visible memory allocation. The `blob_hints` tail
-/// was added in v6.15: the ioctl number encodes the struct size, so the
-/// 48-byte pre-hints layout would make current Mesa's command word land in
-/// the dispatch's reject arm and the whole BLOB ioctl would be unreachable.
+/// was added on linux master (absent from every tagged release through
+/// v7.1): the ioctl number encodes the struct size, so the 48-byte
+/// pre-hints layout would make current Mesa's command word land in the
+/// dispatch's reject arm and the whole BLOB ioctl would be unreachable.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmVirtgpuResourceCreateBlob {
@@ -370,7 +373,7 @@ pub struct DrmVirtgpuResourceCreateBlob {
     pub cmd: u64,
     /// Blob unique identifier.
     pub blob_id: u64,
-    /// `DRM_VIRTGPU_BLOB_FLAG_*` hints (Linux v6.15+).
+    /// `DRM_VIRTGPU_BLOB_FLAG_*` hints (linux master, post-v7.1).
     pub blob_hints: u32,
     pub pad2: u32,
 }

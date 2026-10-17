@@ -135,6 +135,15 @@ impl Card0 {
                 }
                 mask
             }
+            VIRTGPU_PARAM_BLOB_ALIGNMENT => {
+                // Linux reports the negotiated alignment, or -ENOENT when
+                // the feature was not negotiated (Mesa then assumes no
+                // alignment requirement).
+                match with_virgl(|virgl| Ok(virgl.blob_alignment()))? {
+                    Some(alignment) => u64::from(alignment),
+                    None => return Err(VfsError::NotFound),
+                }
+            }
             _ => {
                 // Unknown parameter — match Linux kernel: return -EINVAL.
                 // Mesa handles this gracefully (value stays 0).
@@ -1148,10 +1157,20 @@ impl Card0 {
             Vec::new()
         };
 
-        // The wire size is rounded up to the BAR slot granularity so the
-        // host-side subsection (and every EPT subsection the hvf listener
-        // derives from it) stays 16 KiB-aligned; see [`BAR_SLOT_ALIGN`].
-        let wire_size = b.size.div_ceil(BAR_SLOT_ALIGN) * BAR_SLOT_ALIGN;
+        // When the device negotiated a blob alignment requirement, Linux
+        // `verify_blob()` rejects unaligned sizes with EINVAL.
+        let negotiated_align = with_virgl(|virgl| Ok(virgl.blob_alignment()))?;
+        if negotiated_align.is_some_and(|align| !b.size.is_multiple_of(u64::from(align))) {
+            return Err(VfsError::InvalidInput);
+        }
+        // Slot granularity: the negotiated alignment floored at 16 KiB so
+        // the host-side subsection (and every EPT subsection the hvf
+        // listener derives from it) stays 16 KiB-aligned; see
+        // [`BAR_SLOT_ALIGN`]. The wire size is rounded up to it.
+        let slot_granularity = negotiated_align
+            .map(u64::from)
+            .map_or(BAR_SLOT_ALIGN, |align| align.max(BAR_SLOT_ALIGN));
+        let wire_size = b.size.div_ceil(slot_granularity) * slot_granularity;
         let device_handle = with_virgl(|virgl| {
             virgl.create_blob(
                 Some(context),
@@ -1173,16 +1192,21 @@ impl Card0 {
             }
         };
 
-        // Map mappable blobs into the hostmem window right away unless the
-        // caller deferred mapping (Linux vram_create behaviour).
+        // Map every mappable blob into the hostmem window right away. The
+        // DEFER_MAPPING hint is a guest-side hostmem saving (Linux skips
+        // the eager vram map and maps on first mmap); this driver always
+        // maps eagerly — with slot recycling the window cost of blobs that
+        // are never mmapped is reclaimed at destroy, and there is no
+        // lazy-map path that would make a deferred blob mappable later.
         let mut mapped = None;
-        if b.blob_flags & VIRTGPU_BLOB_FLAG_USE_MAPPABLE != 0
-            && b.blob_hints & DRM_VIRTGPU_BLOB_FLAG_HINT_DEFER_MAPPING == 0
-        {
-            let bar_offset = self.reserve_bar_slot(hostmem.length, wire_size)?;
+        if b.blob_flags & VIRTGPU_BLOB_FLAG_USE_MAPPABLE != 0 {
+            let (bar_offset, slot_len) =
+                reserve_bar_slot(hostmem.length, wire_size, slot_granularity)?;
             let map_info = match with_virgl(|virgl| virgl.map_blob(device_handle, bar_offset)) {
                 Ok(info) => info,
                 Err(error) => {
+                    // Return the freshly reserved slot before failing.
+                    release_bar_slot(bar_offset, slot_len);
                     let _ = release_gpu_buffer_and_drain(device_handle);
                     return Err(error);
                 }
@@ -1190,6 +1214,8 @@ impl Card0 {
             mapped = Some(MappedBlobBar {
                 phys: hostmem.base + bar_offset,
                 size: b.size,
+                bar_offset,
+                slot_len,
                 mmap_key: self.alloc_blob_mmap_key(),
                 map_info,
             });
@@ -1230,9 +1256,10 @@ impl Card0 {
     ///
     /// Ring-based submission with timeline syncobjs: out-syncobjs advance
     /// only when the host retired the submission's fence (`pending_retires`),
-    /// and in-syncobjs are validated but not waited on — the control queue is
-    /// strictly FIFO, so the dependency is already ordered behind everything
-    /// submitted before it, exactly as for the virgl in-fence path.
+    /// and in-syncobjs are resolved and waited on inline before the submit —
+    /// Linux `virtio_gpu_parse_deps` + `virtio_gpu_do_fence_wait`. The wait
+    /// is real, not an FIFO assumption: ring batches retire out of order, so
+    /// enqueue order alone does not order execution.
     fn handle_venus_execbuffer(
         &self,
         file: &Card0File,
@@ -1293,31 +1320,70 @@ impl Card0 {
         }
 
         // Read the out-syncobj list before submitting; their points get
-        // signalled once the fence retires.
+        // signalled once the fence retires. Linux `parse_post_deps` allows
+        // no per-entry flags on the out side.
+        const MAX_EXEC_SYNCOBJS: u32 = 1024;
+        let syncobj_stride = if eb.syncobj_stride == 0 {
+            core::mem::size_of::<DrmVirtgpuExecbufferSyncobj>()
+        } else {
+            eb.syncobj_stride as usize
+        };
+        if syncobj_stride < core::mem::size_of::<DrmVirtgpuExecbufferSyncobj>() {
+            return Err(StarryError::InvalidInput);
+        }
         let mut out_syncobjs: Vec<(u32, u64)> = Vec::new();
         if eb.num_out_syncobjs > 0 {
-            let stride = if eb.syncobj_stride == 0 {
-                core::mem::size_of::<DrmVirtgpuExecbufferSyncobj>()
-            } else {
-                eb.syncobj_stride as usize
-            };
-            if stride < core::mem::size_of::<DrmVirtgpuExecbufferSyncobj>() {
+            if eb.num_out_syncobjs > MAX_EXEC_SYNCOBJS || eb.out_syncobjs == 0 {
                 return Err(StarryError::InvalidInput);
             }
             for i in 0..eb.num_out_syncobjs as usize {
-                let addr = eb.out_syncobjs + (i * stride) as u64;
+                let addr = eb.out_syncobjs + (i * syncobj_stride) as u64;
                 let entry: DrmVirtgpuExecbufferSyncobj =
                     vm_load(current, addr as *const DrmVirtgpuExecbufferSyncobj, 1)
                         .map_err(|_| VfsError::BadAddress)?[0];
+                if entry.flags != 0 {
+                    return Err(StarryError::InvalidInput);
+                }
                 out_syncobjs.push((entry.handle, entry.point));
             }
             // Validate the handles up front: a queued submit with a dangling
             // handle would never signal anything once its retire response
-            // lands.
+            // lands (Linux `parse_post_deps` failure is EINVAL).
             let table = self.syncobjs.lock();
             for (handle, _) in &out_syncobjs {
                 if !table.contains_key(&(file.file_id, *handle)) {
                     return Err(StarryError::InvalidInput);
+                }
+            }
+        }
+
+        // In-syncobjs (dependencies): the only legal per-entry flag is RESET
+        // (Linux `VIRTGPU_EXECBUF_SYNCOBJ_FLAGS`); RESET entries are reset
+        // after the submit completes, like the Linux cleanup stage.
+        let mut in_syncobjs: Vec<(u32, u64)> = Vec::new();
+        let mut reset_syncobjs: Vec<u32> = Vec::new();
+        if eb.num_in_syncobjs > 0 {
+            if eb.num_in_syncobjs > MAX_EXEC_SYNCOBJS || eb.in_syncobjs == 0 {
+                return Err(StarryError::InvalidInput);
+            }
+            for i in 0..eb.num_in_syncobjs as usize {
+                let addr = eb.in_syncobjs + (i * syncobj_stride) as u64;
+                let entry: DrmVirtgpuExecbufferSyncobj =
+                    vm_load(current, addr as *const DrmVirtgpuExecbufferSyncobj, 1)
+                        .map_err(|_| VfsError::BadAddress)?[0];
+                if entry.flags & !VIRTGPU_EXECBUF_SYNCOBJ_FLAGS_RESET != 0 {
+                    return Err(StarryError::InvalidInput);
+                }
+                if entry.flags & VIRTGPU_EXECBUF_SYNCOBJ_FLAGS_RESET != 0 {
+                    reset_syncobjs.push(entry.handle);
+                }
+                in_syncobjs.push((entry.handle, entry.point));
+            }
+            // An unknown dependency handle is ENOENT (Linux `find_fence`).
+            let table = self.syncobjs.lock();
+            for (handle, _) in &in_syncobjs {
+                if !table.contains_key(&(file.file_id, *handle)) {
+                    return Err(VfsError::NotFound.into());
                 }
             }
         }
@@ -1331,6 +1397,15 @@ impl Card0 {
             vm_load(current, eb.command as *const u8, eb.size as usize)
                 .map_err(|_| VfsError::BadAddress)?
         };
+
+        // Wait out the dependencies before the submit: each in-syncobj
+        // point must already be signalled (Linux blocks in the ioctl on the
+        // dependency fence; same-device fences could skip, but every venus
+        // fence here is a ring batch the host may not have consumed yet, so
+        // enqueue order does not order execution).
+        for &(handle, point) in &in_syncobjs {
+            self.wait_syncobj_dependency(file.file_id, handle, point);
+        }
 
         // Linux fences every venus EXECBUFFER (the ring idx rides on the
         // fence): the host defers the SUBMIT_3D response to fence retire
@@ -1368,6 +1443,13 @@ impl Card0 {
             Ok(())
         })?;
         self.pump_retired_fences();
+        // RESET-flagged in-syncobjs are cleared after the submit (Linux
+        // `virtio_gpu_reset_syncobjs` in the cleanup stage).
+        for &handle in &reset_syncobjs {
+            if let Ok(states) = self.lookup_syncobjs(file.file_id, &[handle]) {
+                states[0].lock().signaled_point = 0;
+            }
+        }
         Ok(0)
     }
 }

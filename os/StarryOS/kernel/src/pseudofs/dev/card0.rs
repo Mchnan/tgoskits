@@ -653,6 +653,10 @@ pub(super) struct MappedBlobBar {
     pub(super) phys: u64,
     /// Userspace-visible size (the requested size, not the padded slot).
     pub(super) size: u64,
+    /// Window offset of the slot (hostmem-relative), for recycling.
+    pub(super) bar_offset: u64,
+    /// Slot length in the window (the padded, granularity-rounded size).
+    pub(super) slot_len: u64,
     /// Synthetic mmap offset handed back by `VIRTGPU_MAP`.
     pub(super) mmap_key: u64,
     /// Host cache hint (`virtio_gpu_resp_map_info.map_info`).
@@ -663,7 +667,7 @@ impl Drop for GpuResource {
     fn drop(&mut self) {
         // Tear the hostmem BAR mapping down before the UNREF: after the
         // resource is gone the host no longer accepts an UNMAP_BLOB for it.
-        if self.mapped_blob.lock().take().is_some() {
+        if let Some(map) = self.mapped_blob.lock().take() {
             let result = ax_gpu::with_gpu_for_cleanup(|device| {
                 let virgl = device.virgl().ok_or(GpuError::Unsupported)?;
                 let result = virgl.unmap_blob(self.device_handle);
@@ -679,6 +683,13 @@ impl Drop for GpuResource {
                     self.device_handle
                 );
             }
+            // Recycle the window slot either way. Reuse is safe because the
+            // control queue is a strict FIFO: once the UNMAP above is
+            // enqueued, any later MAP_BLOB for the same offset executes
+            // after it; if the enqueue failed the device is broken and the
+            // window state no longer matters. The fenced UNREF observation
+            // stays with the reaper and does not gate slot reuse.
+            release_bar_slot(map.bar_offset, map.slot_len);
         }
         if let Err(error) = release_gpu_buffer_and_drain(self.device_handle) {
             warn!("failed to release GPU buffer {:?}: {error}", self.device_handle);
@@ -961,9 +972,6 @@ pub struct Card0 {
     /// signalling at submit time would let the guest lap the venus ring and
     /// corrupt the host command stream.
     pending_retires: Mutex<VecDeque<syncobj::PendingRetire>>,
-    /// Monotonic bump allocator for hostmem BAR slots (never reused; the
-    /// hostmem window is sized generously for exactly this reason).
-    next_bar_offset: AtomicU64,
     /// Monotonic mmap-key allocator for host-visible blob mappings. Keys
     /// start far above the dumb-buffer offset range so the two never
     /// collide (an 8 MiB-stride dumb counter would need ~131k live
@@ -1302,7 +1310,6 @@ impl Card0 {
             capset_cache: Mutex::new(BTreeMap::new()),
             syncobjs: Mutex::new(BTreeMap::new()),
             pending_retires: Mutex::new(VecDeque::new()),
-            next_bar_offset: AtomicU64::new(0),
             next_blob_mmap_key: AtomicU64::new(BLOB_MMAP_KEY_BASE),
         })
     }
@@ -1835,12 +1842,12 @@ impl Card0File {
             // ---- generic-DRM syncobj family (venus timeline fences) ----
             DRM_IOCTL_SYNCOBJ_CREATE => card.handle_syncobj_create(self.file_id, current, arg),
             DRM_IOCTL_SYNCOBJ_DESTROY => card.handle_syncobj_destroy(self.file_id, current, arg),
-            DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD => card
-                .handle_syncobj_handle_to_fd(self.file_id, current, arg)
-                .unwrap_or(Err(VfsError::InvalidInput)),
-            DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => card
-                .handle_syncobj_fd_to_handle(self.file_id, current, arg)
-                .unwrap_or(Err(VfsError::InvalidInput)),
+            DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD => {
+                card.handle_syncobj_handle_to_fd(self.file_id, current, arg)
+            }
+            DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => {
+                card.handle_syncobj_fd_to_handle(self.file_id, current, arg)
+            }
             DRM_IOCTL_SYNCOBJ_WAIT => card.handle_syncobj_wait(self.file_id, current, arg),
             DRM_IOCTL_SYNCOBJ_RESET => card.handle_syncobj_reset(self.file_id, current, arg),
             DRM_IOCTL_SYNCOBJ_SIGNAL => card.handle_syncobj_signal(self.file_id, current, arg),
@@ -2672,29 +2679,55 @@ fn handle_set_version(current: &crate::task::UserTaskRef, arg: usize) -> VfsResu
     Ok(0)
 }
 
-impl Card0 {
-    /// Reserves a 16 KiB-aligned slot of `size` bytes in the hostmem window
-    /// (venus face). Slots are never reused — the bump allocator keeps the
-    /// lifecycle trivially correct, and hostmem regions are sized generously
-    /// for exactly this reason.
-    pub(super) fn reserve_bar_slot(&self, region_len: u64, size: u64) -> VfsResult<u64> {
-        let size = size.max(1).div_ceil(BAR_SLOT_ALIGN) * BAR_SLOT_ALIGN;
-        loop {
-            let cur = self.next_bar_offset.load(Ordering::Acquire);
-            let next = cur.checked_add(size).ok_or(VfsError::InvalidInput)?;
-            if next > region_len {
-                return Err(VfsError::StorageFull);
-            }
-            if self
-                .next_bar_offset
-                .compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Ok(cur);
-            }
-        }
-    }
+/// Hostmem BAR slots in use (offset → padded length). The window belongs to
+/// the one GPU device, and the table must outlive any `GpuResource` so
+/// teardown can recycle the slot from [`Drop::drop`].
+static BAR_SLOTS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
+/// Reserves a slot of `size` bytes in the `region_len`-byte hostmem window,
+/// first-fit at `granularity` alignment (floored at [`BAR_SLOT_ALIGN`]).
+/// Slots are recycled on unmap, so create/destroy cycles cannot exhaust the
+/// window; exhaustion surfaces as `ENOSPC` (`VfsError::StorageFull`).
+pub(super) fn reserve_bar_slot(
+    region_len: u64,
+    size: u64,
+    granularity: u64,
+) -> VfsResult<(u64, u64)> {
+    let granularity = granularity.max(BAR_SLOT_ALIGN);
+    let want = size.max(1).div_ceil(granularity) * granularity;
+    let mut slots = BAR_SLOTS.lock();
+    let mut cursor = 0u64;
+    for (&offset, &len) in slots.iter() {
+        let aligned = cursor.div_ceil(granularity) * granularity;
+        if offset > aligned && offset - aligned >= want {
+            break;
+        }
+        cursor = cursor.max(offset + len);
+    }
+    let start = cursor.div_ceil(granularity) * granularity;
+    if start
+        .checked_add(want)
+        .filter(|end| *end <= region_len)
+        .is_none()
+    {
+        return Err(VfsError::StorageFull);
+    }
+    slots.insert(start, want);
+    Ok((start, want))
+}
+
+/// Returns a [`reserve_bar_slot`] slot to the window.
+fn release_bar_slot(offset: u64, len: u64) {
+    let mut slots = BAR_SLOTS.lock();
+    match slots.get(&offset) {
+        Some(&recorded) if recorded == len => {
+            slots.remove(&offset);
+        }
+        _ => warn!("card0: bar slot release mismatch (offset {offset:#x}, len {len:#x})"),
+    }
+}
+
+impl Card0 {
     /// Hands out the next page-strided blob mmap key.
     pub(super) fn alloc_blob_mmap_key(&self) -> u64 {
         self.next_blob_mmap_key
