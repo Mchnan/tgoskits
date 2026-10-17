@@ -104,6 +104,9 @@ pub struct VirtIoGpu<H: Hal, T: Transport> {
     has_resource_blob: bool,
     /// Whether `VIRTIO_GPU_F_CONTEXT_INIT` was negotiated.
     has_context_init: bool,
+    /// The device-advertised blob alignment requirement, read from the
+    /// config only when `VIRTIO_GPU_F_BLOB_ALIGNMENT` was negotiated.
+    blob_alignment: Option<u32>,
     /// Device-advertised scanouts, capped to the protocol's sixteen entries.
     num_scanouts: u32,
     reset_done: bool,
@@ -145,9 +148,16 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         let has_virgl = negotiated.contains(Features::VIRGL);
         let has_resource_blob = negotiated.contains(Features::RESOURCE_BLOB);
         let has_context_init = negotiated.contains(Features::CONTEXT_INIT);
+        // The alignment register only exists once the feature was
+        // negotiated; reading it from a legacy device is undefined.
+        let blob_alignment = negotiated
+            .contains(Features::BLOB_ALIGNMENT)
+            .then(|| read_config!(transport, Config, blob_alignment))
+            .transpose()?;
         log::info!(
             "virtio-gpu features: negotiated={negotiated:?}, has_virgl={has_virgl}, \
-             has_resource_blob={has_resource_blob}, has_context_init={has_context_init}"
+             has_resource_blob={has_resource_blob}, has_context_init={has_context_init}, \
+             blob_alignment={blob_alignment:?}"
         );
 
         Ok(Self {
@@ -161,6 +171,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
             has_virgl,
             has_resource_blob,
             has_context_init,
+            blob_alignment,
             num_scanouts: num_scanouts.min(16),
             reset_done: false,
             hostmem: None,
@@ -180,6 +191,12 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
     /// exposed one.
     pub fn hostmem(&self) -> Option<HostMemRegion> {
         self.hostmem
+    }
+
+    /// The device-advertised blob alignment requirement, when
+    /// `VIRTIO_GPU_F_BLOB_ALIGNMENT` was negotiated.
+    pub fn blob_alignment(&self) -> Option<u32> {
+        self.blob_alignment
     }
 
     /// Number of output slots exposed by this device.

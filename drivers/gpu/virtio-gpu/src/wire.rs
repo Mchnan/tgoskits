@@ -13,9 +13,12 @@ use crate::{Error, GpuBox, Rect};
 /// Device configuration space (`struct virtio_gpu_config`).
 ///
 /// The fields are kept in wire order so the offsets of the registers this
-/// driver reads match the device layout. `num_capsets` is deliberately absent:
-/// this driver never iterates capsets by count, and reading a register that
-/// legacy devices do not implement would only add a failure mode.
+/// driver reads match the device layout. `num_capsets` is present only to
+/// pin the offset of `blob_alignment` (linux master `struct
+/// virtio_gpu_config` field order): this driver never iterates capsets by
+/// count, and `blob_alignment` is read only when
+/// [`Features::BLOB_ALIGNMENT`] was negotiated, so legacy devices never
+/// observe a stray register read.
 #[repr(C)]
 #[derive(FromBytes, Immutable, IntoBytes)]
 pub(crate) struct Config {
@@ -25,6 +28,12 @@ pub(crate) struct Config {
     pub(crate) events_clear: WriteOnly<u32>,
     /// Number of scanouts the device supports.
     pub(crate) num_scanouts: ReadOnly<u32>,
+    /// Number of capability sets (kept for offset fidelity, never read).
+    pub(crate) num_capsets: ReadOnly<u32>,
+    /// Blob alignment requirement, valid only after
+    /// [`Features::BLOB_ALIGNMENT`] was negotiated: blob sizes and
+    /// `RESOURCE_MAP_BLOB` offsets must be multiples of it (power of two).
+    pub(crate) blob_alignment: ReadOnly<u32>,
 }
 
 /// `VIRTIO_GPU_EVENT_DISPLAY`: the display configuration changed.
@@ -44,8 +53,10 @@ bitflags! {
         const RESOURCE_BLOB = 1 << 3;
         /// Context-init protocol (virgl2 capset, per-fd context).
         const CONTEXT_INIT = 1 << 4;
-        /// The device config advertises a blob alignment requirement
-        /// (`Config::blob_alignment`).
+        /// The device config carries a valid `blob_alignment` field
+        /// (linux master `VIRTIO_GPU_F_BLOB_ALIGNMENT`; requires
+        /// RESOURCE_BLOB): blob sizes and MAP_BLOB offsets must be
+        /// multiples of the advertised value.
         const BLOB_ALIGNMENT = 1 << 5;
 
         const RING_INDIRECT_DESC = 1 << 28;
