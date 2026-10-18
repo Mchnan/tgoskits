@@ -1,6 +1,8 @@
 //! VirtIO GPU private DRM ioctl ABI.
 //!
-//! Layout and ioctl numbers follow Linux v7.1 `include/uapi/drm/virtgpu_drm.h`.
+//! Layout and ioctl numbers follow Linux v7.1 `include/uapi/drm/virtgpu_drm.h`,
+//! except `DrmVirtgpuResourceCreateBlob`, whose `blob_hints` tail follows
+//! linux master (see the struct docs for the version basis).
 
 use bytemuck::{AnyBitPattern, NoUninit};
 
@@ -377,6 +379,12 @@ pub struct DrmVirtgpuResourceCreateBlob {
     pub blob_hints: u32,
     pub pad2: u32,
 }
+
+// The blob_hints tail is linux-master-only (absent from every tag through
+// v7.1); Mesa 26.2+ encodes this 56-byte layout into the ioctl number.
+const _: () = assert!(core::mem::size_of::<DrmVirtgpuResourceCreateBlob>() == 56);
+const _: () = assert!(core::mem::offset_of!(DrmVirtgpuResourceCreateBlob, blob_hints) == 48);
+const _: () = assert!(DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB == 0xc038_644a);
 
 /// Initializes a rendering context on this file descriptor.
 /// Linux: `struct drm_virtgpu_context_init` (16 bytes)
