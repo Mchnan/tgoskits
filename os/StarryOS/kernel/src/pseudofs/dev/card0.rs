@@ -2776,8 +2776,9 @@ impl Card0 {
 
 /// Whether the venus (capset 4) face is usable: a 3D virtio-gpu whose bus
 /// exposed the hostmem shared-memory window (PCI `SHARED_MEMORY_CFG`). The
-/// virgl-only devices never have one, so this also gates the syncobj-cap
-/// advertisement.
+/// virgl-only devices never have one. This does not gate the syncobj caps:
+/// `DRM_CAP_SYNCOBJ*` are pure kernel-side state and `handle_get_cap`
+/// advertises them unconditionally.
 fn venus_available() -> bool {
     ax_gpu::with_gpu(|device| {
         device

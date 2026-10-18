@@ -53,18 +53,12 @@ type VfsResult<T = ()> = Result<T, axfs_ng_vfs::VfsError>;
 use axfs_ng_vfs::VfsError;
 
 /// A syncobj's completion state: a timeline watermark plus the registered
-/// waiters (eventfds and sync-file exports) waiting on future points.
+/// eventfd waiters waiting on future points.
 pub(super) struct SyncobjState {
     /// Timeline watermark: every point `<= signaled_point` is complete.
     pub(super) signaled_point: u64,
     /// Eventfds registered via `DRM_IOCTL_SYNCOBJ_EVENTFD`.
     pub(super) eventfds: Vec<EventfdWaiter>,
-    /// Sync-file exports registered via `DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD`,
-    /// each with the point it represents. The file is bound to the retiring
-    /// device fence when the watermark reaches its point; an already-reached
-    /// point exports an immediately-signaled file (fence id 0 completes on
-    /// the first refresh).
-    pub(super) sync_files: Vec<(u64, Arc<SyncFile>)>,
 }
 
 /// One `DRM_IOCTL_SYNCOBJ_EVENTFD` registration (Linux
@@ -280,11 +274,8 @@ impl Card0 {
         }
     }
 
-    /// Collects the eventfds and sync-files whose registered points the
-    /// watermark now covers. Both eventfd kinds fire here: completion
-    /// implies availability. Sync-files bind to fence id 0 (complete on the
-    /// first refresh) — the caller advances the watermark only after the
-    /// device fence already retired, so no per-file device fence is needed.
+    /// Collects the eventfds whose registered points the watermark now
+    /// covers. Both kinds fire here: completion implies availability.
     fn collect_reached_waiters(
         state: &mut SyncobjState,
         woken: &mut Vec<Arc<crate::file::event::EventFd>>,
@@ -296,17 +287,6 @@ impl Card0 {
                 woken.push(waiter.eventfd);
             } else {
                 i += 1;
-            }
-        }
-        let mut j = 0;
-        while j < state.sync_files.len() {
-            if state.signaled_point >= state.sync_files[j].0 {
-                let (file_point, file) = state.sync_files.swap_remove(j);
-                let _ = file_point;
-                file.bind_fence_id(0);
-                file.register();
-            } else {
-                j += 1;
             }
         }
     }
@@ -436,7 +416,6 @@ impl Card0 {
             Arc::new(Mutex::new(SyncobjState {
                 signaled_point: u64::from(args.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0),
                 eventfds: Vec::new(),
-                sync_files: Vec::new(),
             })),
         );
         store_arg(current, arg, &DrmSyncobjCreate {
@@ -663,11 +642,15 @@ impl Card0 {
     /// `DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD`: exports the syncobj's fence as a
     /// sync_file fd — the EGL native-fence path (zink/venus export per-frame
     /// completion this way to drive the output-pool buffer lifecycle). An
-    /// already-reached point exports a signaled file; a future point fires
-    /// when the watermark passes it. With `TIMELINE` (v6.16+) the export
-    /// lands at `point`; a missing handle is ENOENT (Linux uses EINVAL only
-    /// on the plain syncobj-fd export path, which this driver does not
-    /// model separately).
+    /// already-reached point exports a signaled file; a point backed by an
+    /// outstanding submission binds to that submission's device fence and
+    /// signals when the host retires it; a point nothing backs is `EINVAL`
+    /// (Linux `drm_syncobj_find_fence` without WAIT_FOR_SUBMIT semantics —
+    /// a parked file would read as fence id 0 and fake completion on the
+    /// first poll). With `TIMELINE` (v6.16+) the export lands at `point`; a
+    /// missing handle is ENOENT (Linux uses EINVAL only on the plain
+    /// syncobj-fd export path, which this driver does not model
+    /// separately).
     pub(super) fn handle_syncobj_handle_to_fd(
         &self,
         owner: u64,
@@ -700,7 +683,7 @@ impl Card0 {
             .ok_or(VfsError::NotFound)?;
         let file = Arc::new(SyncFile::new(0));
         {
-            let mut state = state.lock();
+            let state = state.lock();
             if state.signaled_point >= point {
                 // The point is already reached: publish the signaled state
                 // directly (Linux hands out a signaled stub fence for
@@ -720,7 +703,14 @@ impl Card0 {
                 file.bind_fence_id(fence_id);
                 file.register();
             } else {
-                state.sync_files.push((point, file.clone()));
+                // An unbacked point has no fence to export: Linux resolves
+                // the fence at `drm_syncobj_export_sync_file` time and
+                // fails with EINVAL (`drm_syncobj_find_fence` without
+                // WAIT_FOR_SUBMIT semantics). Parking the file instead
+                // would read as fence id 0 — signaled on the first poll
+                // (`fence_completed(0)` is trivially true) — a fake
+                // completion for GPU work that does not exist.
+                return Err(VfsError::InvalidInput);
             }
         }
         let fd = add_file_like(file, true).map_err(|_| VfsError::Io)?;

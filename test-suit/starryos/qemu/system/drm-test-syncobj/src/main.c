@@ -14,6 +14,7 @@
  *     同步文件导出/导入往返（import 的 handle 是输入：装入既有 syncobj、
  *     不写回新句柄，含 TIMELINE 点位）、坏 fd EINVAL、
  *     无 IMPORT flag 的 sync-file fd 是 EINVAL（Linux 只认 syncobj fd）、
+ *     未提交点位导出 EINVAL（不得假信号）、
  *     同点位双导出后关闭其一，另一 fd 仍可读
  *   - RESET / SIGNAL 水位清零与置一
  *   - EVENTFD：未背书点注册成功并在 TIMELINE_SIGNAL 后唤醒（Linux 语义：
@@ -480,6 +481,21 @@ int main(void) {
         struct pollfd tpfd = { .fd = twin_b.fd, .events = POLLIN };
         CHECK(poll(&tpfd, 1, 0) == 1, "twin export B is still readable after A closes");
         CHECK_RET(close(twin_b.fd), 0, "close twin export B");
+
+        /* 未提交点位导出：Linux drm_syncobj_find_fence 无 WAIT_FOR_SUBMIT
+         * 语义 → EINVAL。旧实现把文件停靠在等待列表里，fence id 0 在首次
+         * poll 即报已信号——没有 GPU 工作却宣告完成，此用例拦该回归。 */
+        struct drm_syncobj_handle unbacked = {
+            .handle = pending, /* 水位 0，无任何在途提交背书 */
+            .flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE,
+        };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &unbacked), EINVAL,
+                  "export of an unsubmitted point is EINVAL, never a fake-signaled fd");
+        unbacked.flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE |
+                         DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE;
+        unbacked.point = 9;
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &unbacked), EINVAL,
+                  "timeline export of an unsubmitted point is EINVAL");
     }
 
     /* --- RESET / SIGNAL --- */

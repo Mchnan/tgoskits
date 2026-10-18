@@ -137,9 +137,13 @@ pub(crate) struct ControlQueue<H: virtio_drivers::Hal> {
     /// Highest fence id whose completion has been observed (implicit ordering:
     /// fence N done ⇒ all ≤ N done).
     ///
-    /// INVARIANT: only [`ControlQueue::pump_completions`] advances this
-    /// counter. It is the *contiguous* completion watermark: every fence id
-    /// `<= completed_fence_id` has popped. Submits are fire-and-forget
+    /// INVARIANT: only [`ControlQueue::pump_completions`] and
+    /// [`ControlQueue::cancel_fence`] advance this counter, both under the
+    /// same contiguous-prefix semantics (a never-enqueued id retired by
+    /// `cancel_fence` counts as completed: no host completion for it will
+    /// ever arrive). It is the *contiguous* completion watermark: every
+    /// fence id `<= completed_fence_id` has either popped on the used ring
+    /// or been canceled without reaching it. Submits are fire-and-forget
     /// (`enqueue` with a fence id); there is no blocking fenced submission
     /// path, so a fence id the host never completes keeps
     /// [`ControlQueue::wait_fence`] waiting until its timeout.

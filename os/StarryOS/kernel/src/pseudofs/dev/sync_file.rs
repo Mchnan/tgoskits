@@ -379,39 +379,62 @@ impl Drop for SyncFile {
 /// Refreshes every registered out-fence, signaling + waking the pollers of
 /// fences the host completed. Called on the refresher's active cadence.
 ///
-/// The walk takes the registry lock once per node instead of building a
-/// snapshot vector: a snapshot would allocate (allocation under the IRQ-save
-/// lock is the cross-CPU wedge the intrusive design exists to prevent, see
-/// [`RegistryHead`]). Under the lock each node's storage is valid and an
-/// upgraded `Arc` keeps the current node alive across the unlocked refresh,
-/// which takes the GPU lock (`fence_level`) and may block. A node whose last
-/// reference died mid-walk is skipped: its `Drop` is queuing on the lock to
-/// unlink, so reading its `next` first is safe. New registrations link at
-/// the front and are covered by the next tick's pass.
+/// The walk is anchored on an `Arc`, never on a raw pointer: between two
+/// lock holds the current node is refreshed outside the lock (taking the
+/// GPU lock via `fence_level`), during which *any* other node may be
+/// dropped — its `Drop` takes the lock, unlinks it and its memory is freed.
+/// A raw cursor to such a node would therefore dangle at the next
+/// relock. Holding a strong reference to the current node keeps it linked
+/// and alive (an `Arc` prevents `Drop` outright), and `Arc::upgrade` is a
+/// plain atomic increment, so the no-allocation-under-the-lock guarantee
+/// ([`RegistryHead`]) is preserved. Raw pointers are only dereferenced
+/// *inside* a lock hold, where a dying node's `Drop` is blocked before its
+/// memory can be freed.
+///
+/// New registrations link at the front and are covered by the next tick's
+/// pass; a node that dies mid-walk is skipped (its upgrade fails under the
+/// lock while its `Drop` queues behind the walker).
 fn refresh_all_fences() -> usize {
     let mut signaled = 0;
-    let mut cursor = FENCE_WAITERS.lock_irqsave().first;
-    while let Some(node) = cursor {
-        let (file, next) = {
-            let _registry = FENCE_WAITERS.lock_irqsave();
-            // SAFETY: linked nodes' storage is valid under the registry lock
-            // (a dying file unlinks in `Drop` before its memory is freed).
-            let this = unsafe { node.as_ref() };
-            (
-                this.self_weak.get().and_then(Weak::upgrade),
-                this.next.get(),
-            )
-        };
-        cursor = next;
-        if let Some(file) = file {
-            let before = file.signaled.load(Ordering::Acquire);
-            file.refresh();
-            if !before && file.signaled.load(Ordering::Acquire) {
-                signaled += 1;
-            }
+    let mut current: Option<Arc<SyncFile>> = {
+        let registry = FENCE_WAITERS.lock_irqsave();
+        first_upgradable(registry.first)
+    };
+    while let Some(file) = current {
+        let before = file.signaled.load(Ordering::Acquire);
+        file.refresh();
+        if !before && file.signaled.load(Ordering::Acquire) {
+            signaled += 1;
         }
+        current = {
+            // The guard is held across the read and the `first_upgradable`
+            // walk: every raw-pointer deref below happens under it.
+            let _registry = FENCE_WAITERS.lock_irqsave();
+            let next = file.next.get();
+            first_upgradable(next)
+        };
     }
     signaled
+}
+
+/// Upgrades the first alive node at or after `start`, skipping dying nodes
+/// (their `Drop` is queued on the registry lock, so their links and storage
+/// stay valid to read until it acquires the lock). Called with
+/// [`FENCE_WAITERS`] held.
+fn first_upgradable(start: Option<NonNull<SyncFile>>) -> Option<Arc<SyncFile>> {
+    let mut cursor = start;
+    while let Some(node) = cursor {
+        // SAFETY: under the registry lock, a linked node's storage is valid
+        // even while it is dying — its `Drop` must take this lock to unlink
+        // before its memory is freed, so it queues here instead.
+        let this = unsafe { node.as_ref() };
+        let next = this.next.get();
+        if let Some(file) = this.self_weak.get().and_then(|weak| weak.upgrade()) {
+            return Some(file);
+        }
+        cursor = next;
+    }
+    None
 }
 
 /// Whether any registered out-fence still waits for its host completion. The

@@ -219,7 +219,7 @@ honored (`HostResourceDmaBuf::device_mmap` validates
 `card0/virtgpu_uapi.rs` and `drm.rs` pin the layouts, `card0/virtgpu.rs`
 and `card0/syncobj.rs` the semantics. The `drm-test-syncobj` suite
 transcribes its guest-side structs from the Linux headers independently of
-the kernel (73 checks, §6.1).
+the kernel (§6.1).
 
 ### 5.1 Version baseline
 
@@ -264,7 +264,7 @@ TIMELINE_SIGNAL/WAIT/TIMELINE_WAIT/EVENTFD/HANDLE_TO_FD/FD_TO_HANDLE`
 | `CREATE` / `DESTROY` / `RESET` / `SIGNAL` / `TIMELINE_SIGNAL` | Unknown `CREATE` flag → `EINVAL`; a nonzero tail word (`pad`) is `EINVAL` everywhere, and an empty handle list is `EINVAL` for `RESET` / `SIGNAL` / `TIMELINE_SIGNAL` (Linux `drm_syncobj_*_ioctl` guards). |
 | `QUERY` | Reports the timeline watermark; `LAST_SUBMITTED` reports the newest attached point (the watermark or the highest still-pending out point, whichever is further); any other flag and an empty handle list are `EINVAL` (Linux `drm_syncobj_query_ioctl` guards). |
 | `EVENTFD` | `point` 0 addresses the binary view; validation covers flags/pad/handle/eventfd only — a point no fence backs yet still registers and fires when the point completes (Linux keeps the entry until `add_point`/`replace_fence` lands the fence). An already-completed point fires at registration. `WAIT_AVAILABLE` entries fire when a fence *attaches*: an EXECBUFFER out-syncobj registration or a sync-file import fires them on the spot (`fire_available_waiters`), and completion fires the rest via the retire pump (§3.2). |
-| `HANDLE_TO_FD` / `FD_TO_HANDLE` | Export: unknown handle `ENOENT`, bad fd / non-sync-file `EINVAL`; an already-reached point exports a signaled file; a future point binds to its retiring device fence; `TIMELINE` carries the point. Import (`IMPORT_SYNC_FILE`): `fd` is validated before the handle (bad fd / non-sync-file `EINVAL`, unknown handle `ENOENT` — the Linux order); the fence lands in the *existing* syncobj named by `handle`, `point` 0 replacing its whole view, and no handle is written back; an already-signaled file completes the point at import, a pending one when the host retires its fence (pending-retire path). Without `IMPORT_SYNC_FILE` the ioctl is `EINVAL`: that direction takes a *syncobj* fd (Linux's fops check), which this driver never hands out. |
+| `HANDLE_TO_FD` / `FD_TO_HANDLE` | Export: unknown handle `ENOENT`, bad fd / non-sync-file `EINVAL`; an already-reached point exports a signaled file; a point backed by an outstanding submission binds to its retiring device fence; a point nothing backs is `EINVAL` (Linux `drm_syncobj_find_fence` — parking the file would fake completion, since fence id 0 reports signaled on the first poll); `TIMELINE` carries the point. Import (`IMPORT_SYNC_FILE`): `fd` is validated before the handle (bad fd / non-sync-file `EINVAL`, unknown handle `ENOENT` — the Linux order); the fence lands in the *existing* syncobj named by `handle`, `point` 0 replacing its whole view, and no handle is written back; an already-signaled file completes the point at import, a pending one when the host retires its fence (pending-retire path). Without `IMPORT_SYNC_FILE` the ioctl is `EINVAL`: that direction takes a *syncobj* fd (Linux's fops check), which this driver never hands out. |
 
 ## 6. Verification matrix
 
@@ -279,8 +279,10 @@ notify, queue-full parking, bounded waits and fence watermark advance;
 `drm.rs` unit tests pin the syncobj command words against the libdrm
 values. QEMU system regressions (`cargo xtask starry test qemu -c
 test-suit/starryos/qemu/system/...`) run `drm-test-drm-atomic` (KMS +
-deferred-release path) and the `drm-test-syncobj` conformance suite (73
-checks, host-3D-free). The syncobj suite transcribes its structs
+deferred-release path) and the `drm-test-syncobj` conformance suite
+(host-3D-free; the check count grows with each Linux-semantics case
+added — see the suite source for the current set). The syncobj suite
+transcribes its structs
 independently from the Linux UAPI headers and `_Static_assert`s the
 packed command words, so a kernel-side layout regression surfaces as
 `ENOTTY` instead of both sides agreeing on a wrong layout; the suite is
