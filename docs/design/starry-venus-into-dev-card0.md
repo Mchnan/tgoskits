@@ -199,13 +199,17 @@ userspace-visible size stays the requested one (`MappedBlobBar`: `phys`,
 
 ### 4.2 Recycling
 
-`release_bar_slot` runs in `GpuResource::drop` right after the
-`UNMAP_BLOB` is enqueued, not after it completes — safe because the
-strict-FIFO control queue makes any later `MAP_BLOB` at the same offset
-execute after the unmap, so create/destroy cycles cannot exhaust the
-window. That is what lets `CREATE_BLOB` map eagerly (§5): slot recycling
-bounds the hostmem cost `DEFER_MAPPING` exists to save, so no lazy-map
-path is needed.
+`release_bar_slot` runs in `GpuResource::drop` only when the `UNMAP_BLOB`
+enqueue succeeded — not after it completes, because the strict-FIFO
+control queue makes any later `MAP_BLOB` at the same offset execute after
+the ringed-or-parked unmap, so create/destroy cycles cannot exhaust the
+window. An enqueue failure recycles nothing: `QueueBusy` (ring and
+parking FIFO both full while the host stalls) is recoverable and leaves
+the host still mapping the offset, so reuse could alias the window; the
+slot is leaked instead — logged, with the finite window degrading to
+`ENOSPC` on new blobs long before that aliasing could bite. That is what
+lets `CREATE_BLOB` map eagerly (§5): slot recycling bounds the hostmem
+cost `DEFER_MAPPING` exists to save, so no lazy-map path is needed.
 
 ### 4.3 Userspace mapping
 

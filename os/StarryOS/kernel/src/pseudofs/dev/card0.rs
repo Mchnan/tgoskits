@@ -677,19 +677,28 @@ impl Drop for GpuResource {
                 result
             })
             .and_then(core::convert::identity);
-            if let Err(error) = result {
-                warn!(
-                    "failed to unmap blob resource {:?}: {error}",
-                    self.device_handle
-                );
+            // Recycle the window slot only when the UNMAP really reached the
+            // queue. Reuse is safe because the control queue is a strict
+            // FIFO: once the UNMAP is on the ring or parked in its FIFO, any
+            // later MAP_BLOB for the same offset executes after it. The
+            // fenced UNREF observation stays with the reaper and does not
+            // gate slot reuse.
+            //
+            // An `Err` here does NOT mean the device is broken: `enqueue`
+            // reports `QueueBusy` when the ring and the parking FIFO are
+            // both full while the host stalls — a recoverable failure with
+            // the host still mapping this offset. Recycling then could hand
+            // the offset to a new blob while the old mapping lives, aliasing
+            // the hostmem window. Leak the slot instead: the failure is
+            // logged, and the bounded window degrades to `ENOSPC` on new
+            // blobs long before that aliasing could bite.
+            match result {
+                Ok(()) => release_bar_slot(map.bar_offset, map.slot_len),
+                Err(error) => warn!(
+                    "failed to unmap blob resource {:?}: {error}; leaking window slot {:#x}+{:#x}",
+                    self.device_handle, map.bar_offset, map.slot_len
+                ),
             }
-            // Recycle the window slot either way. Reuse is safe because the
-            // control queue is a strict FIFO: once the UNMAP above is
-            // enqueued, any later MAP_BLOB for the same offset executes
-            // after it; if the enqueue failed the device is broken and the
-            // window state no longer matters. The fenced UNREF observation
-            // stays with the reaper and does not gate slot reuse.
-            release_bar_slot(map.bar_offset, map.slot_len);
         }
         if let Err(error) = release_gpu_buffer_and_drain(self.device_handle) {
             warn!("failed to release GPU buffer {:?}: {error}", self.device_handle);
