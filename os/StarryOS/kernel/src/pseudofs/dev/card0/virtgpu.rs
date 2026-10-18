@@ -33,10 +33,11 @@ fn device_capset_mask() -> Option<u64> {
     (mask != 0).then_some(mask)
 }
 
-/// Upper bound for one venus EXECBUFFER command buffer. This matches the
-/// per-request ceiling of the user-memory loader: a stream beyond it could
-/// never be copied in, and rejecting it here reports EINVAL instead of the
-/// loader's EFAULT.
+/// Upper bound for one venus EXECBUFFER command buffer (and the venus blob
+/// init stream). Real venus payloads are orders of magnitude smaller; the
+/// bound exists so an oversized user size is rejected with EINVAL *before*
+/// `vm_load` allocates the whole buffer — the loader itself has no
+/// per-request ceiling for fixed-size loads.
 const MAX_VENUS_COMMAND_BYTES: usize = 128 * 1024;
 
 fn virgl_capabilities() -> VfsResult<rdif_gpu::GpuCapabilities> {
@@ -1159,6 +1160,13 @@ impl Card0 {
 
         // Optional initialization command stream, submitted before the blob
         // is created (the control queue is FIFO, so ordering holds).
+        // Bound the size before `vm_load` allocates the whole buffer: the
+        // u32 `cmd_size` would otherwise let one ioctl demand a multi-GiB
+        // kernel allocation, and a null `cmd` with a nonzero size is the
+        // same malformed request the virgl flavour rejects above.
+        if b.cmd_size as usize > MAX_VENUS_COMMAND_BYTES || (b.cmd_size > 0 && b.cmd == 0) {
+            return Err(VfsError::InvalidInput);
+        }
         let init_cmd: Vec<u8> = if b.cmd_size > 0 {
             vm_load(current, b.cmd as *const u8, b.cmd_size as usize)
                 .map_err(|_| VfsError::BadAddress)?

@@ -17,6 +17,8 @@
  *     未提交点位导出 EINVAL（不得假信号）、
  *     同点位双导出后关闭其一，另一 fd 仍可读
  *   - RESET / SIGNAL 水位清零与置一
+ *   - 各数组承载 ioctl 的 count_handles 超上限（1024 + 1）→ EINVAL
+ *     （在任何内核分配与用户内存访问之前拒绝）
  *   - EVENTFD：未背书点注册成功并在 TIMELINE_SIGNAL 后唤醒（Linux 语义：
  *     条目等 fence 挂上）、已到达点注册即触发、WAIT_AVAILABLE 注册、
  *     未知句柄 ENOENT、未知 flag / pad EINVAL
@@ -523,6 +525,57 @@ int main(void) {
 
         CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_SIGNAL, &arr), 0, "SIGNAL");
         CHECK(query_point(fd, signaled) == 1, "binary signal reaches point 1");
+    }
+
+    /* --- count_handles 限幅：超上限必须在分配前 EINVAL ---
+     * 上限 1024，与 venus EXECBUFFER 的 syncobj 数组上限一致；填 1025 个
+     * 未知句柄让未限幅实现可判定地停在句柄查找（ENOENT），而限幅实现
+     * 在触碰用户内存、分配内核缓冲之前就返回 EINVAL。 */
+    {
+        enum { CAP = 1024 };
+        static uint32_t many[CAP + 1];
+        static uint64_t many_points[CAP + 1];
+        for (int i = 0; i < CAP + 1; i++) {
+            many[i] = 0xDEAD;
+            many_points[i] = 1;
+        }
+        struct drm_syncobj_array arr = {
+            .handles = (uint64_t)(uintptr_t)many,
+            .count_handles = CAP + 1,
+        };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_SIGNAL, &arr), EINVAL,
+                  "SIGNAL with an oversized handle list is EINVAL");
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_RESET, &arr), EINVAL,
+                  "RESET with an oversized handle list is EINVAL");
+
+        struct drm_syncobj_timeline_array tarr = {
+            .handles = (uint64_t)(uintptr_t)many,
+            .points = (uint64_t)(uintptr_t)many_points,
+            .count_handles = CAP + 1,
+        };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &tarr), EINVAL,
+                  "TIMELINE_SIGNAL with an oversized handle list is EINVAL");
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_QUERY, &tarr), EINVAL,
+                  "QUERY with an oversized handle list is EINVAL");
+
+        struct drm_syncobj_timeline_wait tw = {
+            .handles = (uint64_t)(uintptr_t)many,
+            .points = (uint64_t)(uintptr_t)many_points,
+            .timeout_nsec = 1, /* absolute: lapsed, nothing may park */
+            .count_handles = CAP + 1,
+            .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+        };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &tw), EINVAL,
+                  "TIMELINE_WAIT with an oversized handle list is EINVAL");
+
+        struct drm_syncobj_wait bw = {
+            .handles = (uint64_t)(uintptr_t)many,
+            .timeout_nsec = 1,
+            .count_handles = CAP + 1,
+            .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+        };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &bw), EINVAL,
+                  "WAIT with an oversized handle list is EINVAL");
     }
 
     /* --- EVENTFD 唤醒传播 --- */

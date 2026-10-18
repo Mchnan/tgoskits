@@ -200,6 +200,28 @@ fn load_arg<T: AnyBitPattern>(current: &UserTaskRef, arg: usize) -> VfsResult<T>
     Ok(loaded[0])
 }
 
+/// Upper bound for every user-supplied syncobj handle/point array. Linux
+/// copies these arrays with `memdup_user`, where an oversized allocation
+/// fails with ENOMEM; `vm_load` instead allocates the whole buffer before
+/// touching user memory and a kernel allocation failure is fatal, so an
+/// unbounded `count_handles` (u32) would let one ioctl demand a huge kernel
+/// allocation. Matches the `MAX_EXEC_SYNCOBJS` cap on the venus EXECBUFFER
+/// side (virtgpu.rs).
+const MAX_SYNCOBJ_HANDLES: usize = 1024;
+
+/// Loads a `count`-long `T` array for a syncobj ioctl: the count is bounded
+/// (EINVAL) before any allocation, and a bad pointer maps to EFAULT.
+fn load_syncobj_array<T: AnyBitPattern>(
+    current: &UserTaskRef,
+    ptr: u64,
+    count: u32,
+) -> VfsResult<Vec<T>> {
+    if count as usize > MAX_SYNCOBJ_HANDLES {
+        return Err(VfsError::InvalidInput);
+    }
+    vm_load(current, ptr as *const T, count as usize).map_err(|_| VfsError::BadAddress)
+}
+
 fn store_arg<T: NoUninit>(current: &UserTaskRef, arg: usize, value: &T) -> VfsResult {
     vm_write_slice(current, arg as *mut T, core::slice::from_ref(value))
         .map_err(|_| VfsError::BadAddress)
@@ -458,12 +480,7 @@ impl Card0 {
             return Err(VfsError::InvalidInput);
         }
         let last_submitted = args.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
-        let handles: Vec<u32> = vm_load(
-            current,
-            args.handles as *const u32,
-            args.count_handles as usize,
-        )
-        .map_err(|_| VfsError::BadAddress)?;
+        let handles: Vec<u32> = load_syncobj_array(current, args.handles, args.count_handles)?;
         // Retire responses may have landed since the last submit; drain them
         // so a query observes the current watermark.
         self.pump_retired_fences();
@@ -492,12 +509,7 @@ impl Card0 {
         if args.flags != 0 || args.count_handles == 0 {
             return Err(VfsError::InvalidInput);
         }
-        let handles: Vec<u32> = vm_load(
-            current,
-            args.handles as *const u32,
-            args.count_handles as usize,
-        )
-        .map_err(|_| VfsError::BadAddress)?;
+        let handles: Vec<u32> = load_syncobj_array(current, args.handles, args.count_handles)?;
         for state in self.lookup_syncobjs(owner, &handles)? {
             state.lock().signaled_point = 0;
         }
@@ -516,12 +528,7 @@ impl Card0 {
         if args.flags != 0 || args.count_handles == 0 {
             return Err(VfsError::InvalidInput);
         }
-        let handles: Vec<u32> = vm_load(
-            current,
-            args.handles as *const u32,
-            args.count_handles as usize,
-        )
-        .map_err(|_| VfsError::BadAddress)?;
+        let handles: Vec<u32> = load_syncobj_array(current, args.handles, args.count_handles)?;
         let mut woken = Vec::new();
         for handle in handles {
             self.signal_syncobj_point(owner, handle, 1, &mut woken);
@@ -548,15 +555,8 @@ impl Card0 {
         if args.flags != 0 || args.count_handles == 0 {
             return Err(VfsError::InvalidInput);
         }
-        let handles: Vec<u32> = vm_load(
-            current,
-            args.handles as *const u32,
-            args.count_handles as usize,
-        )
-        .map_err(|_| VfsError::BadAddress)?;
-        let points: Vec<u64> =
-            vm_load(current, args.points as *const u64, args.count_handles as usize)
-                .map_err(|_| VfsError::BadAddress)?;
+        let handles: Vec<u32> = load_syncobj_array(current, args.handles, args.count_handles)?;
+        let points: Vec<u64> = load_syncobj_array(current, args.points, args.count_handles)?;
         let mut woken = Vec::new();
         for (handle, point) in handles.iter().zip(points) {
             self.signal_syncobj_point(owner, *handle, point, &mut woken);
@@ -882,15 +882,8 @@ impl Card0 {
         if args.count_handles == 0 {
             return Ok(0);
         }
-        let handles: Vec<u32> = vm_load(
-            current,
-            args.handles as *const u32,
-            args.count_handles as usize,
-        )
-        .map_err(|_| VfsError::BadAddress)?;
-        let points: Vec<u64> =
-            vm_load(current, args.points as *const u64, args.count_handles as usize)
-                .map_err(|_| VfsError::BadAddress)?;
+        let handles: Vec<u32> = load_syncobj_array(current, args.handles, args.count_handles)?;
+        let points: Vec<u64> = load_syncobj_array(current, args.points, args.count_handles)?;
         // Point 0 addresses the binary view of the syncobj (Linux resolves
         // the current fence); the binary view is point 1 here, so a 0 must
         // not compare as always-reached against an unsignaled watermark.
@@ -1004,12 +997,7 @@ impl Card0 {
         if args.count_handles == 0 {
             return Ok(0);
         }
-        let handles: Vec<u32> = vm_load(
-            current,
-            args.handles as *const u32,
-            args.count_handles as usize,
-        )
-        .map_err(|_| VfsError::BadAddress)?;
+        let handles: Vec<u32> = load_syncobj_array(current, args.handles, args.count_handles)?;
         let states = self.lookup_syncobjs(owner, &handles)?;
 
         // Index of the first satisfied handle, for the non-WAIT_ALL
