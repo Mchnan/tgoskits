@@ -641,7 +641,10 @@ impl Card0 {
 
     /// `DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD`: exports the syncobj's fence as a
     /// sync_file fd — the EGL native-fence path (zink/venus export per-frame
-    /// completion this way to drive the output-pool buffer lifecycle). An
+    /// completion this way to drive the output-pool buffer lifecycle); the
+    /// export requires `EXPORT_SYNC_FILE`, because the no-flag direction
+    /// hands out the syncobj's own fd in Linux and this driver models no
+    /// syncobj fds (see `handle_syncobj_fd_to_handle`). An
     /// already-reached point exports a signaled file; a point backed by an
     /// outstanding submission binds to that submission's device fence and
     /// signals when the host retires it; a point nothing backs is `EINVAL`
@@ -664,6 +667,15 @@ impl Card0 {
                     | DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE)
                     != 0
         {
+            return Err(VfsError::InvalidInput);
+        }
+        // Without EXPORT_SYNC_FILE Linux exports the syncobj's own fd
+        // (`drm_syncobj_handle_to_fd`), an object this driver never hands
+        // out (the mirror of `handle_syncobj_fd_to_handle`'s no-flag
+        // rejection). Failing fast beats handing back a sync_file whose
+        // type contradicts the request and breaks the standard
+        // HANDLE_TO_FD → FD_TO_HANDLE round trip.
+        if args.flags & DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE == 0 {
             return Err(VfsError::InvalidInput);
         }
         let timeline = args.flags & DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE != 0;

@@ -357,6 +357,11 @@ int main(void) {
         CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &h), EINVAL,
                   "unknown export flag rejected");
 
+        /* flags=0 在 Linux 是导出 syncobj fd 本身；本驱动不发放 syncobj fd，
+         * 与 FD_TO_HANDLE 无 flag 方向同样 EINVAL。 */
+        h.flags = 0;
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &h), EINVAL,
+                  "export without EXPORT_SYNC_FILE rejected");
         h.flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE;
         h.pad = 1;
         CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &h), EINVAL,
