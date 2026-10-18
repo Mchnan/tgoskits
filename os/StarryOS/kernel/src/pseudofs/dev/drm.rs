@@ -913,42 +913,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_addfb_matches_linux_command_word() {
-        // GBM userspaces issue the legacy ADDFB with the 28-byte
-        // `drm_mode_fb_cmd`; the packed command must be the exact word
-        // observed on real clients, or the dispatch never sees it.
-        assert_eq!(DRM_IOCTL_MODE_ADDFB, 0xc01c_64ae);
-        assert_eq!(
-            io_size(DRM_IOCTL_MODE_ADDFB),
-            core::mem::size_of::<DrmModeFbCmd>() as u32
-        );
-        assert_eq!(core::mem::size_of::<DrmModeFbCmd>(), 28);
-    }
-
-    #[test]
-    fn syncobj_handle_to_fd_matches_userspace_command_word() {
-        // Mesa's EGL native-fence path exports syncobjs with the 24-byte
-        // (point-carrying) `drm_syncobj_handle`; the size is part of the
-        // command word, so a 16-byte struct silently misses the dispatch.
-        assert_eq!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, 0xc018_64c1);
-        assert_eq!(core::mem::size_of::<DrmSyncobjHandle>(), 24);
-    }
-
-    #[test]
-    fn syncobj_wait_structs_match_linux_command_words() {
-        // libdrm compiles `struct drm_syncobj_wait` from the Linux UAPI
-        // header as 40 bytes — timeout_nsec sits before count_handles and
-        // the trailing deadline_nsec hint rides along — and
-        // `drm_syncobj_timeline_wait` as 48 bytes. The packed size is part
-        // of the command word, so any layout drift silently misses the
-        // dispatch (`drmSyncobjWait` gets ENOTTY from the default arm).
-        assert_eq!(DRM_IOCTL_SYNCOBJ_WAIT, 0xc028_64c3);
-        assert_eq!(core::mem::size_of::<DrmSyncobjWait>(), 40);
-        assert_eq!(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, 0xc030_64ca);
-        assert_eq!(core::mem::size_of::<DrmSyncobjTimelineWait>(), 48);
-    }
-
-    #[test]
     fn ioctl_nr_masks_to_low_byte() {
         // Direction and size occupy the high bits; nr is only bits 7..0.
         assert_eq!(ioctl_nr(0xc010_6402), 0x02);
@@ -984,5 +948,71 @@ mod tests {
         assert!(!is_driver_ioctl(ioctl_nr(DRM_IOCTL_MODE_GETRESOURCES)));
         assert!(is_driver_ioctl(0x40));
         assert!(is_driver_ioctl(0x45));
+    }
+}
+
+/// Layout pins for the UAPI command words this file defines. Deliberately
+/// outside the `rknpu`-gated `mod tests` (whose helpers are rknpu-only):
+/// these assertions only touch always-compiled constants, and keeping them
+/// in the default-feature test build makes `cargo test -p starry-kernel`
+/// run them — the guest-side `_Static_assert`s in `drm-test-syncobj` are
+/// the second, independent layer.
+#[cfg(all(test, not(axtest)))]
+mod uapi_layout_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_addfb_matches_linux_command_word() {
+        // GBM userspaces issue the legacy ADDFB with the 28-byte
+        // `drm_mode_fb_cmd`; the packed command must be the exact word
+        // observed on real clients, or the dispatch never sees it. The
+        // size field (bits 29..16) is decoded locally — `io_size` lives
+        // behind the `rknpu` feature.
+        assert_eq!(DRM_IOCTL_MODE_ADDFB, 0xc01c_64ae);
+        assert_eq!(
+            (DRM_IOCTL_MODE_ADDFB >> 16) & 0x3fff,
+            core::mem::size_of::<DrmModeFbCmd>() as u32
+        );
+        assert_eq!(core::mem::size_of::<DrmModeFbCmd>(), 28);
+    }
+
+    #[test]
+    fn syncobj_handle_to_fd_matches_userspace_command_word() {
+        // Mesa's EGL native-fence path exports syncobjs with the 24-byte
+        // (point-carrying) `drm_syncobj_handle`; the size is part of the
+        // command word, so a 16-byte struct silently misses the dispatch.
+        assert_eq!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, 0xc018_64c1);
+        assert_eq!(core::mem::size_of::<DrmSyncobjHandle>(), 24);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjHandle, fd), 8);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjHandle, point), 16);
+    }
+
+    #[test]
+    fn syncobj_wait_structs_match_linux_command_words() {
+        // libdrm compiles `struct drm_syncobj_wait` from the Linux UAPI
+        // header as 40 bytes — timeout_nsec sits before count_handles and
+        // the trailing deadline_nsec hint rides along — and
+        // `drm_syncobj_timeline_wait` as 48 bytes. The packed size is part
+        // of the command word, so any layout drift silently misses the
+        // dispatch (`drmSyncobjWait` gets ENOTTY from the default arm).
+        // The offset pins catch same-size reorders a size check cannot.
+        assert_eq!(DRM_IOCTL_SYNCOBJ_WAIT, 0xc028_64c3);
+        assert_eq!(core::mem::size_of::<DrmSyncobjWait>(), 40);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjWait, timeout_nsec), 8);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjWait, count_handles), 16);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjWait, first_signaled), 24);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjWait, deadline_nsec), 32);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, 0xc030_64ca);
+        assert_eq!(core::mem::size_of::<DrmSyncobjTimelineWait>(), 48);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjTimelineWait, points), 8);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjTimelineWait, timeout_nsec), 16);
+        assert_eq!(
+            core::mem::offset_of!(DrmSyncobjTimelineWait, count_handles),
+            24
+        );
+        assert_eq!(
+            core::mem::offset_of!(DrmSyncobjTimelineWait, deadline_nsec),
+            40
+        );
     }
 }
