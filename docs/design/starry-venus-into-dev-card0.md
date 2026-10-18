@@ -244,7 +244,7 @@ face; everything else is `EINVAL`/`ENOENT` per the Linux reference.
 | `GETPARAM` | `3D_FEATURES`, `CAPSET_QUERY_FIX` (=1), `RESOURCE_BLOB`, `CONTEXT_INIT` per negotiation; `HOST_VISIBLE` per hostmem presence; `CROSS_DEVICE` = 0; `SUPPORTED_CAPSET_IDS` = host mask; `BLOB_ALIGNMENT` = negotiated value or `ENOENT`. Unknown → `EINVAL`. The value is written through the `value` pointer as the UAPI `int` (four bytes), like `virtio_gpu_getparam_ioctl`. |
 | `GET_CAPS` | v7.1 semantics: `size==0` → `EINVAL`; missing or too-old capset → `EINVAL`; copy clamped to `min(size, host_size)`; cached per (id, ver). |
 | `RESOURCE_CREATE_BLOB` | Requires a venus context and `HOST3D`; `pad != 0` or hint bits beyond `DEFER_MAPPING` → `EINVAL`; size a multiple of the negotiated alignment, ≤ window; no guest shadow (virgl keeps one). Every mappable blob is **mapped eagerly** — `DEFER_MAPPING` is accepted but not honored (§4.2 tradeoff). Slot exhaustion → `ENOSPC`. |
-| `EXECBUFFER` | Flags ⊆ `RING_IDX` (size 0 = ring kick, legal; `FENCE_FD_IN/OUT` rejected — venus uses syncobjs); `ring_idx < num_rings`; ≤ 256 bo handles; ≤ 1024 syncobj entries each direction, `syncobj_stride` ≥ 16; out-entry flags must be 0, in-entry flags may carry `RESET` (applied after the submit, Linux cleanup stage); unknown in-handle → `ENOENT`, unknown out-handle → `EINVAL`. In-syncobjs waited inline (§3.3); out-syncobjs enter `pending_retires` and arm the retire pump — or advance immediately when the driver completed synchronously (no retire to wait for, Linux `virtio_gpu_process_post_deps` attaching the fence unconditionally). |
+| `EXECBUFFER` | Flags ⊆ `RING_IDX` (size 0 = ring kick, legal; `FENCE_FD_IN/OUT` rejected — venus uses syncobjs); `ring_idx < num_rings`; ≤ 256 bo handles; ≤ 1024 syncobj entries each direction, `syncobj_stride` ≥ 16; out-entry flags must be 0, in-entry flags may carry `RESET` (applied after the submit, Linux cleanup stage); unknown in-handle → `ENOENT`, unknown out-handle → `EINVAL`. In-syncobjs waited inline (§3.3); out-syncobjs enter `pending_retires` and arm the retire pump — or advance immediately when the driver completed synchronously (no retire to wait for, Linux `virtio_gpu_process_post_deps` attaching the fence unconditionally). An out-entry `point` of 0 addresses the binary view (Linux replaces the fence of a point-0 syncobj at retire) and is normalized to watermark 1 at collection, exactly like the in-side dependency wait and the EVENTFD path — the raw 0 would compare as always-reached in every completion path and the binary out-fence would never advance. |
 | `MAP` | Blob handle → its `mmap_key`; dumb handles keep the dumb-offset space. |
 | `WAIT` | Waits/probes the resource's `last_fence`; expiry and NOWAIT-busy both `EBUSY`. |
 | `TRANSFER_TO/FROM_HOST` | From-host waits its own fence outside the device lock, then syncs the backing for the CPU; to-host is fire-and-forget at the boundary. |
@@ -264,7 +264,7 @@ TIMELINE_SIGNAL/WAIT/TIMELINE_WAIT/EVENTFD/HANDLE_TO_FD/FD_TO_HANDLE`
 | `CREATE` / `DESTROY` / `RESET` / `SIGNAL` / `TIMELINE_SIGNAL` | Unknown `CREATE` flag → `EINVAL`; a nonzero tail word (`pad`) is `EINVAL` everywhere, and an empty handle list is `EINVAL` for `RESET` / `SIGNAL` / `TIMELINE_SIGNAL` (Linux `drm_syncobj_*_ioctl` guards). |
 | `QUERY` | Reports the timeline watermark; `LAST_SUBMITTED` reports the newest attached point (the watermark or the highest still-pending out point, whichever is further); any other flag and an empty handle list are `EINVAL` (Linux `drm_syncobj_query_ioctl` guards). |
 | `EVENTFD` | `point` 0 addresses the binary view; validation covers flags/pad/handle/eventfd only — a point no fence backs yet still registers and fires when the point completes (Linux keeps the entry until `add_point`/`replace_fence` lands the fence). An already-completed point fires at registration. `WAIT_AVAILABLE` entries fire when a fence *attaches*: an EXECBUFFER out-syncobj registration or a sync-file import fires them on the spot (`fire_available_waiters`), and completion fires the rest via the retire pump (§3.2). |
-| `HANDLE_TO_FD` / `FD_TO_HANDLE` | Export: unknown handle `ENOENT`, bad fd / non-sync-file `EINVAL`; an already-reached point exports a signaled file; a point backed by an outstanding submission binds to its retiring device fence; a point nothing backs is `EINVAL` (Linux `drm_syncobj_find_fence` — parking the file would fake completion, since fence id 0 reports signaled on the first poll); `TIMELINE` carries the point. Import (`IMPORT_SYNC_FILE`): `fd` is validated before the handle (bad fd / non-sync-file `EINVAL`, unknown handle `ENOENT` — the Linux order); the fence lands in the *existing* syncobj named by `handle`, `point` 0 replacing its whole view, and no handle is written back; an already-signaled file completes the point at import, a pending one when the host retires its fence (pending-retire path). Without `IMPORT_SYNC_FILE` the ioctl is `EINVAL`: that direction takes a *syncobj* fd (Linux's fops check), which this driver never hands out. |
+| `HANDLE_TO_FD` / `FD_TO_HANDLE` | Export: unknown handle `ENOENT`, bad fd / non-sync-file `EINVAL`; without `EXPORT_SYNC_FILE` the ioctl is `EINVAL` — that direction hands out the syncobj's own fd in Linux (`drm_syncobj_handle_to_fd`), an object this driver never models (mirroring the import side's no-flag rejection), and handing back a sync_file instead would break the standard HANDLE_TO_FD → FD_TO_HANDLE round trip; an already-reached point exports a signaled file; a point backed by an outstanding submission binds to its retiring device fence; a point nothing backs is `EINVAL` (Linux `drm_syncobj_find_fence` — parking the file would fake completion, since fence id 0 reports signaled on the first poll); `TIMELINE` carries the point. Import (`IMPORT_SYNC_FILE`): `fd` is validated before the handle (bad fd / non-sync-file `EINVAL`, unknown handle `ENOENT` — the Linux order); the fence lands in the *existing* syncobj named by `handle`, `point` 0 replacing its whole view, and no handle is written back; an already-signaled file completes the point at import, a pending one when the host retires its fence (pending-retire path). Without `IMPORT_SYNC_FILE` the ioctl is `EINVAL`: that direction takes a *syncobj* fd (Linux's fops check), which this driver never hands out. |
 
 ## 6. Verification matrix
 
@@ -287,7 +287,12 @@ independently from the Linux UAPI headers and `_Static_assert`s the
 packed command words, so a kernel-side layout regression surfaces as
 `ENOTTY` instead of both sides agreeing on a wrong layout; the suite is
 validated bidirectionally — the predecessor implementation failed 14
-checks before the UAPI alignment fixes.
+checks before the UAPI alignment fixes. **Coverage gap**: the suite is
+host-3D-free, so it exercises the syncobj ioctls but never the venus
+`EXECBUFFER` out-syncobj path (submitting needs a venus context and a
+retiring host fence) — that path, including the point-0 binary-view
+normalization, is covered only by the venus e2e (§6.2), which CI cannot
+run.
 
 ### 6.2 venus e2e
 
@@ -296,7 +301,14 @@ blob hostmem and a MoltenVK renderer); CI cannot cover it. There the
 21-step `vkprobe` (Vulkan init, BAR round-trip, timeline fence, fenced
 compute readback 4/4) passes, and the desktop e2e four criteria hold —
 flip counter growing, screendump distinct-pixel count ≈ 61k at 1280×800,
-cross-time pixel diffs, `unavailable_output_ticks = 0`.
+cross-time pixel diffs, `unavailable_output_ticks = 0`. The same rig
+carries a `syncobj0` behavior probe for the point-0 out-syncobj path the
+guest suite cannot reach: a venus EXECBUFFER ring kick with a binary
+out-syncobj, then `poll(eventfd)` and a plain `SYNCOBJ_WAIT` — on the
+fix it fires and returns after the host retires (waterline 1); on the
+pre-fix kernels it either times out (pending point normalized, fence
+never delivered) or fails with `EINVAL` (pending point left at 0, no
+backing found — the signature that motivated the fix).
 
 ## 7. Known limitations
 

@@ -1361,7 +1361,12 @@ impl Card0 {
                 if entry.flags != 0 {
                     return Err(StarryError::InvalidInput);
                 }
-                out_syncobjs.push((entry.handle, entry.point));
+                // Point 0 addresses the binary view (point 1): Linux
+                // `virtio_gpu_process_post_deps` replaces the fence of a
+                // point-0 out-syncobj at retire, so the raw 0 must never
+                // reach the completion paths, where it would compare as
+                // always-reached and never advance the watermark.
+                out_syncobjs.push((entry.handle, entry.point.max(1)));
             }
             // Validate the handles up front: a queued submit with a dangling
             // handle would never signal anything once its retire response
