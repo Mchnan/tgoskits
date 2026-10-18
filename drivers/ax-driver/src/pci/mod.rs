@@ -1439,6 +1439,10 @@ const PCI_CAP_ID_VNDR: u8 = 0x09;
 /// Config-space offset of the first PCI BAR.
 #[cfg(virtio_dev)]
 const PCI_BAR_OFFSET: u8 = 0x10;
+/// `sizeof(struct virtio_pci_cap64)`: the only capability length Linux
+/// accepts for a `SHARED_MEMORY_CFG` region (`virtio_pci_find_shm_cap`).
+#[cfg(virtio_dev)]
+const VIRTIO_PCI_CAP64_LEN: u8 = 24;
 
 /// Like [`take_virtio_transport_masked`], but also walks the virtio
 /// vendor capabilities and resolves the shared memory region with the
@@ -1490,26 +1494,38 @@ fn parse_virtio_shm_cap(
         let cfg_type = (header >> 24) as u8;
 
         if cap_id == PCI_CAP_ID_VNDR && cfg_type == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG {
-            // virtio_pci_cap: bar@4, id@5, offset@8, length@12; the
-            // cap64 extension appends offset_hi@16, length_hi@20.
-            let bar_and_id = access.read_word(bdf, off + 4);
-            let bar_index = bar_and_id as u8;
-            let shm_id = (bar_and_id >> 8) as u8;
-            let mut offset = access.read_word(bdf, off + 8) as u64;
-            let mut length = access.read_word(bdf, off + 12) as u64;
-            if cap_len >= 20 {
-                offset |= (access.read_word(bdf, off + 16) as u64) << 32;
-                length |= (access.read_word(bdf, off + 20) as u64) << 32;
-            }
-            if shm_id == want_shm_id
-                && bar_index < 6
-                && length > 0
-                && let Some(phys) = bar_physical_address(access, bdf, bar_index)
-            {
-                return Some(VirtioShmRegion {
-                    phys: phys + offset,
-                    length,
-                });
+            // Linux `virtio_pci_find_shm_cap` accepts the cap64 form only:
+            // a capability whose length is not exactly
+            // `sizeof(struct virtio_pci_cap64)` is malformed and skipped, so
+            // words beyond the capability never leak into the window (a
+            // 16-byte cap has no hi words; 17..23 would read config space
+            // past the capability).
+            if cap_len == VIRTIO_PCI_CAP64_LEN {
+                // virtio_pci_cap: bar@4, id@5, offset@8, length@12; the
+                // cap64 extension appends offset_hi@16, length_hi@20.
+                let bar_and_id = access.read_word(bdf, off + 4);
+                let bar_index = bar_and_id as u8;
+                let shm_id = (bar_and_id >> 8) as u8;
+                let offset = access.read_word(bdf, off + 8) as u64
+                    | ((access.read_word(bdf, off + 16) as u64) << 32);
+                let length = access.read_word(bdf, off + 12) as u64
+                    | ((access.read_word(bdf, off + 20) as u64) << 32);
+                if shm_id == want_shm_id
+                    && bar_index < 6
+                    && length > 0
+                    && let Some(base) = bar_physical_address(access, bdf, bar_index)
+                    // A window ending past the physical address space would
+                    // defeat every downstream bound check; a wrapping base
+                    // means the BAR or offset is garbage, so no hostmem.
+                    && let Some(phys) = base.checked_add(offset)
+                {
+                    return Some(VirtioShmRegion { phys, length });
+                }
+            } else {
+                log::warn!(
+                    "pci: skipping malformed SHARED_MEMORY_CFG capability at offset {off:#x} \
+                     (cap_len {cap_len})"
+                );
             }
         }
 
