@@ -285,8 +285,12 @@ impl<H: virtio_drivers::Hal> ControlQueue<H> {
             return Err(Error::InvalidParam);
         }
         // The payload box is moved into the `PendingSubmit`, not cloned — for
-        // SUBMIT_3D it can be hundreds of kilobytes.
-        let mut data: Option<Vec<u8>> = data.map(<[u8]>::to_vec);
+        // SUBMIT_3D it can be hundreds of kilobytes. An empty payload folds
+        // to `None`: virtio forbids zero-length buffers, so a size-0
+        // SUBMIT_3D (the venus ring kick) must go out header-only, exactly
+        // like Linux `virtio_gpu_queue_fenced_ctrl_buffer` with
+        // `data_size == 0`.
+        let mut data: Option<Vec<u8>> = data.filter(|data| !data.is_empty()).map(<[u8]>::to_vec);
 
         // Acquire a stable-address slot. Every path below that consumes an
         // entry (`pop_used` or this error return) gives its slot back, so
@@ -1264,6 +1268,50 @@ mod tests {
         assert!(!poll_queue_notified(&state));
         ctrl.notify(&mut transport);
         assert!(poll_queue_notified(&state));
+    }
+
+    #[test]
+    fn empty_payload_enqueues_header_only() {
+        // Virtio forbids zero-length buffers: a size-0 SUBMIT_3D (the venus
+        // ring kick) must not add a data descriptor, matching Linux
+        // `virtio_gpu_queue_fenced_ctrl_buffer` with `data_size == 0`. A real
+        // device rejects the whole chain otherwise and the submit is silently
+        // lost with its fence never retiring.
+        let (mut ctrl, state, mut transport) = make_ctrl();
+
+        ctrl.enqueue(&mut transport, &TestCmd { kind: 0, seq: 0 }, Some(&[]), 1)
+            .unwrap();
+        ctrl.notify(&mut transport);
+
+        let st = state.lock().unwrap();
+        let (desc_addr, driver_addr, device_addr) = {
+            let q = &st.queues[Q as usize];
+            (q.descriptors, q.driver_area, q.device_area)
+        };
+        // SAFETY: the queue areas were allocated and zeroed by `TestHal` and
+        // registered via `queue_set`; only this fn (under the lock) and the
+        // driver's atomically-ordered ring accesses touch them.
+        unsafe {
+            let avail = driver_addr as *const AvailRing;
+            let used = device_addr as *const UsedRing;
+            let descs = desc_addr as *const Desc;
+            let slot = (*used).idx.load(Ordering::Acquire) & (QSIZE as u16 - 1);
+            let head = *descs.add((*avail).ring[slot as usize] as usize);
+            // cmd + resp exceeds one buffer, so the chain rides an indirect
+            // table: the walk must inspect the table entries, where a
+            // zero-length payload descriptor would have landed.
+            assert_eq!(head.flags & DESC_INDIRECT, DESC_INDIRECT);
+            let table = core::slice::from_raw_parts(
+                head.addr as *const Desc,
+                head.len as usize / size_of::<Desc>(),
+            );
+            for d in table {
+                assert_ne!(d.len, 0, "zero-length descriptor in the chain");
+            }
+            // Exactly the command header and the response buffer — no data
+            // descriptor for the empty payload.
+            assert_eq!(table.len(), 2);
+        }
     }
 
     #[test]
