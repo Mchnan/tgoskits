@@ -38,12 +38,15 @@ use alloc::{
     borrow::Cow,
     string::String,
     sync::{Arc, Weak},
-    vec::Vec,
 };
 use core::{
+    cell::Cell,
+    ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
+
+use ax_lazyinit::OnceLock;
 
 use ax_runtime::hal::time::monotonic_time_nanos;
 use ax_std::os::arceos::task::sync::WaitQueue;
@@ -125,15 +128,63 @@ pub struct SyncFile {
     fence_id: AtomicU64,
     signaled: AtomicBool,
     poll_rx: PollSet,
+    /// Identity for the intrusive waiters list: lets a scanner take a strong
+    /// reference to a node without allocating. Written once by
+    /// [`Self::register`] right after the node is linked (a scanner reaching
+    /// the node in that window simply skips it for one tick).
+    self_weak: OnceLock<Weak<SyncFile>>,
+    /// Whether this file is currently linked into [`FENCE_WAITERS`], and the
+    /// list links themselves. Guarded by the registry lock; see
+    /// [`RegistryHead`] for why the registry must never allocate.
+    registered: Cell<bool>,
+    prev: Cell<Option<NonNull<SyncFile>>>,
+    next: Cell<Option<NonNull<SyncFile>>>,
 }
 
-/// Live out-fence registry. The host completion of a fence is only observable
-/// as a level (the device's completion high-water mark); a guest *blocked in
-/// poll()* cannot re-check that level by itself, so a background refresher
-/// task pumps the used ring and wakes matching pollers. Entries are `Weak`;
-/// dead ones are pruned by the same scan. The lock is an IRQ-save mutex so the
-/// IRQ path can never spin on it.
-static FENCE_WAITERS: RawSpinLock<Vec<(u64, Weak<SyncFile>)>> = RawSpinLock::new(Vec::new());
+// SAFETY: `self_weak` is written exactly once before the node becomes
+// reachable from other threads and only read afterwards; `registered`,
+// `prev` and `next` are only touched while holding `FENCE_WAITERS`, and the
+// pointers they hold are only dereferenced under that lock. The remaining
+// fields are atomics or `Sync` primitives, so moving a `SyncFile` across
+// threads and sharing it is sound.
+unsafe impl Send for SyncFile {}
+unsafe impl Sync for SyncFile {}
+
+/// The out-fence registry: an intrusive doubly-linked list threaded through
+/// the registered [`SyncFile`]s themselves.
+///
+/// Intrusive on purpose. The registry used to be a heap `Vec` pushed to
+/// **while holding the IRQ-save registry lock**; growing that Vec can extend
+/// the kernel heap and reach a TLB shootdown (`flush_tlb_range_all_cpus` →
+/// `ax_ipi::call_on_cpu`), which spin-waits for every CPU to acknowledge —
+/// while a target CPU spinning on this very lock with IRQs masked can never
+/// take the shootdown IPI. That closed a four-CPU wedge 8.4 h into a desktop
+/// soak (two CPUs parked in `call_on_cpu` on `flush_tlb_range_thunk`, two
+/// spinning here in `register`/`drop`). With the links inside the files no
+/// registry path allocates, so a shootdown can never originate under the
+/// lock again.
+///
+/// Soundness: while `FENCE_WAITERS` is held, every linked node's storage is
+/// valid — a dying file's `Drop` must take this lock to unlink before its
+/// memory is freed, so it queues on the lock instead.
+///
+/// The lock stays IRQ-save: the completion IRQ path must never spin on it
+/// behind a task-context holder.
+static FENCE_WAITERS: RawSpinLock<RegistryHead> = RawSpinLock::new(RegistryHead {
+    first: None,
+    last: None,
+});
+
+struct RegistryHead {
+    first: Option<NonNull<SyncFile>>,
+    last: Option<NonNull<SyncFile>>,
+}
+
+// SAFETY: raw pointers are not `Send` by construction; the head is only
+// reachable through `FENCE_WAITERS`, whose critical sections move and
+// dereference the links on one CPU at a time. Linked nodes are registered
+// `SyncFile`s, which are `Send`/`Sync` through their explicit impls above.
+unsafe impl Send for RegistryHead {}
 
 /// One-shot guard so the refresher task is spawned exactly once (on the first
 /// registered out-fence).
@@ -197,6 +248,10 @@ impl SyncFile {
             fence_id: AtomicU64::new(fence_id),
             signaled: AtomicBool::new(false),
             poll_rx: PollSet::new(),
+            self_weak: OnceLock::new(),
+            registered: Cell::new(false),
+            prev: Cell::new(None),
+            next: Cell::new(None),
         }
     }
 
@@ -222,13 +277,44 @@ impl SyncFile {
     /// Registers this out-fence in the completion registry and makes sure the
     /// refresher task exists (card0's EXECBUFFER `FENCE_FD_OUT` path).
     ///
-    /// `lock` is IRQ-save on both sides (here and in the scans), so the
-    /// completion IRQ can never spin on the registry while a task holds it.
+    /// Linking is allocation-free by construction (see [`RegistryHead`]).
+    /// `ensure_refresher` may spawn a task and allocate, so it runs strictly
+    /// after the registry lock is released — allocating under the IRQ-save
+    /// lock is exactly the cross-CPU wedge the intrusive design prevents.
+    ///
+    /// The lock discipline is IRQ-save on both sides (here and in the
+    /// scans), so the completion IRQ can never spin on the registry while a
+    /// task holds it.
     pub fn register(self: &Arc<Self>) {
-        FENCE_WAITERS
-            .lock_irqsave()
-            .push((self.fence_id.load(Ordering::Relaxed), Arc::downgrade(self)));
-        ensure_refresher();
+        let fresh = {
+            let mut registry = FENCE_WAITERS.lock_irqsave();
+            if self.registered.get() {
+                false
+            } else {
+                let node = NonNull::from(self.as_ref());
+                self.prev.set(None);
+                self.next.set(registry.first);
+                if let Some(first) = registry.first {
+                    // SAFETY: linked nodes are registered files whose storage
+                    // is valid under the registry lock (a dying file unlinks
+                    // in `Drop` before its memory is freed).
+                    unsafe { first.as_ref().prev.set(Some(node)) };
+                } else {
+                    registry.last = Some(node);
+                }
+                registry.first = Some(node);
+                self.registered.set(true);
+                true
+            }
+        };
+        if fresh {
+            // Both the identity write and the task spawn may take locks that
+            // must never run under the IRQ-save registry lock (`init_once`
+            // can wait on a concurrent initializer; spawning allocates and
+            // can reach a TLB shootdown).
+            self.self_weak.call_once(|| Arc::downgrade(self));
+            ensure_refresher();
+        }
     }
 
     /// Publishes the signaled state and wakes any poll/epoll sleepers.
@@ -261,85 +347,101 @@ impl SyncFile {
 
 impl Drop for SyncFile {
     fn drop(&mut self) {
-        // Remove only this file's entry, by identity: fence ids are shared
-        // whenever one point is exported twice (syncobj exports and the
-        // reached-point stub id 0), and dropping a twin export must not
+        // Unlink exactly this file's own node, by identity: fence ids are
+        // shared whenever one point is exported twice (syncobj exports and
+        // the reached-point stub id 0), and dropping a twin export must not
         // unregister its sibling — a poll blocked on the sibling would then
-        // never be woken by the refresher scan. The IRQ-save lock
-        // discipline matches `register`.
-        let self_addr = core::ptr::from_ref::<Self>(&*self);
-        FENCE_WAITERS.lock_irqsave().retain(|(_, w)| w.as_ptr() != self_addr);
+        // never be woken by the refresher scan. Unlinking is allocation-free
+        // (see [`RegistryHead`]).
+        let mut registry = FENCE_WAITERS.lock_irqsave();
+        if !self.registered.get() {
+            return;
+        }
+        match self.prev.get() {
+            Some(prev) => {
+                // SAFETY: neighbors are linked files, storage valid under
+                // the registry lock.
+                unsafe { prev.as_ref().next.set(self.next.get()) };
+            }
+            None => registry.first = self.next.get(),
+        }
+        match self.next.get() {
+            Some(next) => {
+                // SAFETY: as above.
+                unsafe { next.as_ref().prev.set(self.prev.get()) };
+            }
+            None => registry.last = self.prev.get(),
+        }
+        self.registered.set(false);
     }
 }
 
-/// Refreshes every live out-fence, signaling + waking the pollers of fences
-/// the host completed. Called on the refresher's active cadence.
+/// Refreshes every registered out-fence, signaling + waking the pollers of
+/// fences the host completed. Called on the refresher's active cadence.
 ///
-/// `live` is a scratch buffer reused across calls, so the steady-state scan
-/// allocates nothing. Dead registry entries (dropped `SyncFile`s) are pruned
-/// in the same pass — an upgrade failing inside the lock removes the entry —
-/// so the active path needs no separate prune scan.
-fn refresh_all_fences(live: &mut Vec<Arc<SyncFile>>) -> usize {
-    // Upgrade the live fences under the registry lock, then refresh *outside*
-    // it: the lock is IRQ-save, so holding it across the GPU device lock
-    // (taken by the fence query) could deadlock if a preempted task held the
-    // device lock with IRQs disabled. The upgrade itself is a plain atomic
-    // refcount bump and touches no other lock.
-    live.clear();
-    FENCE_WAITERS
-        .lock_irqsave()
-        .retain(|(_, w)| match w.upgrade() {
-            Some(sf) => {
-                live.push(sf);
-                true
-            }
-            None => false,
-        });
+/// The walk takes the registry lock once per node instead of building a
+/// snapshot vector: a snapshot would allocate (allocation under the IRQ-save
+/// lock is the cross-CPU wedge the intrusive design exists to prevent, see
+/// [`RegistryHead`]). Under the lock each node's storage is valid and an
+/// upgraded `Arc` keeps the current node alive across the unlocked refresh,
+/// which takes the GPU lock (`fence_level`) and may block. A node whose last
+/// reference died mid-walk is skipped: its `Drop` is queuing on the lock to
+/// unlink, so reading its `next` first is safe. New registrations link at
+/// the front and are covered by the next tick's pass.
+fn refresh_all_fences() -> usize {
     let mut signaled = 0;
-    for sf in live.iter() {
-        let before = sf.signaled.load(Ordering::Acquire);
-        sf.refresh();
-        if !before && sf.signaled.load(Ordering::Acquire) {
-            signaled += 1;
+    let mut cursor = FENCE_WAITERS.lock_irqsave().first;
+    while let Some(node) = cursor {
+        let (file, next) = {
+            let _registry = FENCE_WAITERS.lock_irqsave();
+            // SAFETY: linked nodes' storage is valid under the registry lock
+            // (a dying file unlinks in `Drop` before its memory is freed).
+            let this = unsafe { node.as_ref() };
+            (
+                this.self_weak.get().and_then(Weak::upgrade),
+                this.next.get(),
+            )
+        };
+        cursor = next;
+        if let Some(file) = file {
+            let before = file.signaled.load(Ordering::Acquire);
+            file.refresh();
+            if !before && file.signaled.load(Ordering::Acquire) {
+                signaled += 1;
+            }
         }
     }
     signaled
 }
 
-/// Removes dead entries (dropped `SyncFile`s) from the registry so the idle
-/// scan stays bounded. The active scan prunes in its upgrade pass
-/// ([`refresh_all_fences`]); this is only for the idle backstop.
-fn prune_dead_waiters() {
-    FENCE_WAITERS
-        .lock_irqsave()
-        .retain(|(_, w)| w.strong_count() > 0);
-}
-
-/// Whether any live out-fence still waits for its host completion. The
+/// Whether any registered out-fence still waits for its host completion. The
 /// refresher's active cadence is only needed while this holds: a signaled
-/// fence has already woken its pollers, and its registry entry only waits
-/// for the fd to close (pruned by the idle backstop). Every other wait path
-/// re-checks the fence level itself.
+/// fence has already woken its pollers, and an unregistered one is gone
+/// (dying files unlink themselves in `Drop`; no separate prune pass exists).
+/// Every other wait path re-checks the fence level itself.
 fn has_live_waiters() -> bool {
-    FENCE_WAITERS.lock_irqsave().iter().any(|(_, w)| {
-        w.strong_count() > 0
-            && w.upgrade()
-                .is_some_and(|sf| !sf.signaled.load(Ordering::Acquire))
-    })
+    let registry = FENCE_WAITERS.lock_irqsave();
+    let mut cursor = registry.first;
+    while let Some(node) = cursor {
+        // SAFETY: as in `refresh_all_fences`.
+        let this = unsafe { node.as_ref() };
+        if !this.signaled.load(Ordering::Acquire) {
+            return true;
+        }
+        cursor = this.next.get();
+    }
+    false
 }
 
 /// Background fence waiter: while at least one live out-fence exists, pump +
 /// refresh on the active cadence so a poll-blocked waiter observes host
 /// completions even when the completion IRQ is not delivered in this
-/// environment. With none, fall back to the idle backstop that only prunes
-/// dead registry entries. Runs forever; spawned once by [`ensure_refresher`].
+/// environment. With none, fall back to the idle backstop. Runs forever;
+/// spawned once by [`ensure_refresher`].
 fn refresher_loop() -> ! {
-    // Scratch for [`refresh_all_fences`], reused every tick: the steady-state
-    // active scan allocates nothing.
-    let mut live: Vec<Arc<SyncFile>> = Vec::new();
     loop {
         if has_live_waiters() {
-            let signaled = refresh_all_fences(&mut live);
+            let signaled = refresh_all_fences();
             let now = monotonic_time_nanos();
             if now < REFRESHER_BURST_UNTIL_NS.load(Ordering::Acquire) && signaled == 0 {
                 // A kicked submit's completion is imminent; re-check quickly
@@ -352,7 +454,6 @@ fn refresher_loop() -> ! {
                 REFRESHER_WAKE.wait_timeout_until(REFRESHER_ACTIVE_TICK, || !has_live_waiters());
             }
         } else {
-            prune_dead_waiters();
             REFRESHER_WAKE.wait_timeout_until(REFRESHER_IDLE_TICK, has_live_waiters);
         }
     }
