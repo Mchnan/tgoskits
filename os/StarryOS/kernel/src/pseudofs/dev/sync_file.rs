@@ -212,6 +212,13 @@ impl SyncFile {
         self.fence_id.store(fence_id, Ordering::Relaxed);
     }
 
+    /// The device fence this file waits on. Syncobj imports need it to
+    /// advance the importing timeline when the host retires this fence
+    /// (`DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE` over a still-pending export).
+    pub fn bound_fence_id(&self) -> u64 {
+        self.fence_id.load(Ordering::Relaxed)
+    }
+
     /// Registers this out-fence in the completion registry and makes sure the
     /// refresher task exists (card0's EXECBUFFER `FENCE_FD_OUT` path).
     ///
@@ -254,12 +261,14 @@ impl SyncFile {
 
 impl Drop for SyncFile {
     fn drop(&mut self) {
-        // Fence ids are unique among live out-fences (one SyncFile per
-        // submit), so removing every entry with this id is exact. The IRQ-save
-        // lock discipline matches `register`.
-        FENCE_WAITERS
-            .lock_irqsave()
-            .retain(|(id, _)| *id != self.fence_id.load(Ordering::Relaxed));
+        // Remove only this file's entry, by identity: fence ids are shared
+        // whenever one point is exported twice (syncobj exports and the
+        // reached-point stub id 0), and dropping a twin export must not
+        // unregister its sibling — a poll blocked on the sibling would then
+        // never be woken by the refresher scan. The IRQ-save lock
+        // discipline matches `register`.
+        let self_addr = core::ptr::from_ref::<Self>(&*self);
+        FENCE_WAITERS.lock_irqsave().retain(|(_, w)| w.as_ptr() != self_addr);
     }
 }
 

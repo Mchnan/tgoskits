@@ -1438,17 +1438,28 @@ impl Card0 {
         // `virtio_gpu_process_post_deps` attaches the fence unconditionally,
         // whatever the submit mode was).
         if !out_syncobjs.is_empty() && fence_id != 0 {
+            let mut woken = Vec::new();
             self.pending_retires
                 .lock()
                 .push_back(super::syncobj::PendingRetire {
                     fence_id,
                     owner: file.file_id,
-                    syncobjs: out_syncobjs,
+                    syncobjs: out_syncobjs.clone(),
                 });
+            // Attaching the fences satisfies every WAIT_AVAILABLE entry on
+            // these points (Linux re-runs the eventfd entries from
+            // drm_syncobj_add_point); completion entries stay parked until
+            // the retire lands. Registering first closes the race: a
+            // concurrent EVENTFD ioctl either lands in the scan or sees the
+            // backing through `pending_fence_for` and fires itself.
+            self.fire_available_waiters(file.file_id, &out_syncobjs, &mut woken);
             // Arm the completion-side pump: a client that parks in
             // `poll(eventfd)` after this submit issues no further ioctls,
             // so the pump task is what observes the retire for it.
             super::syncobj::kick_retire_pump();
+            for eventfd in woken {
+                let _ = eventfd.signal_kernel(1);
+            }
         } else if !out_syncobjs.is_empty() {
             let mut woken = Vec::new();
             for (handle, point) in out_syncobjs {

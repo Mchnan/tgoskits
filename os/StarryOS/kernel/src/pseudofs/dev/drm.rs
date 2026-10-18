@@ -894,6 +894,10 @@ pub const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE: u32 = 1 << 0;
 /// (v6.16+); without it `point` must be zero.
 pub const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE: u32 = 1 << 1;
 
+/// `DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED`: QUERY reports the newest
+/// attached point instead of the last completed one.
+pub const DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED: u32 = 1 << 0;
+
 #[cfg(all(test, not(axtest), feature = "rknpu"))]
 mod tests {
     use super::*;

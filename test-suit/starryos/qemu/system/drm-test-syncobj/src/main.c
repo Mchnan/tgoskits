@@ -2,7 +2,8 @@
  * test-drm-syncobj — card0 syncobj 家族与 Linux UAPI 语义一致性测试
  *
  * 覆盖（对齐 Linux drm_syncobj.c 的可判定语义，全部无需 3D/venus 宿主）：
- *   - SYNCOBJ_CREATE / TIMELINE_SIGNAL / TIMELINE_QUERY 水位往返
+ *   - SYNCOBJ_CREATE / TIMELINE_SIGNAL / TIMELINE_QUERY 水位往返；
+ *     QUERY 空列表 EINVAL、LAST_SUBMITTED 被接受、未知 flag EINVAL
  *   - TIMELINE_WAIT：绝对 CLOCK_MONOTONIC 截止（过期立即 ETIME、未来截止
  *     按真实剩余时间等待）、已信号点先查状态再判超时、ETIME 而非 ETIMEDOUT、
  *     未知 flag EINVAL、空句柄列表成功、未知句柄 ENOENT、
@@ -10,10 +11,14 @@
  *   - 二进制 WAIT：WAIT_AVAILABLE 非法（EINVAL）、空列表成功、未提交 → EINVAL、
  *     非 WAIT_ALL 成功时写回 first_signaled
  *   - HANDLE_TO_FD / FD_TO_HANDLE：flag/pad/point 校验、未知句柄 ENOENT、
- *     同步文件导出导入往返（含 TIMELINE 点位导出导入）、坏 fd EINVAL
+ *     同步文件导出/导入往返（import 的 handle 是输入：装入既有 syncobj、
+ *     不写回新句柄，含 TIMELINE 点位）、坏 fd EINVAL、
+ *     无 IMPORT flag 的 sync-file fd 是 EINVAL（Linux 只认 syncobj fd）、
+ *     同点位双导出后关闭其一，另一 fd 仍可读
  *   - RESET / SIGNAL 水位清零与置一
- *   - EVENTFD：无 WAIT_AVAILABLE 且点未背书 → EINVAL；
- *     TIMELINE_SIGNAL 与二进制 SIGNAL 两条路径都唤醒等待者
+ *   - EVENTFD：未背书点注册成功并在 TIMELINE_SIGNAL 后唤醒（Linux 语义：
+ *     条目等 fence 挂上）、已到达点注册即触发、WAIT_AVAILABLE 注册、
+ *     未知句柄 ENOENT、未知 flag / pad EINVAL
  */
 
 #define _GNU_SOURCE
@@ -56,7 +61,7 @@ struct drm_syncobj_timeline_array {
     uint64_t handles;
     uint64_t points;
     uint32_t count_handles;
-    uint32_t pad;
+    uint32_t flags;
 };
 struct drm_syncobj_wait {
     uint64_t handles;
@@ -126,6 +131,7 @@ _Static_assert(DRM_IOCTL_SYNCOBJ_EVENTFD == 0xc01864cfu,
 #define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL (1u << 0)
 #define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT (1u << 1)
 #define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE (1u << 2)
+#define DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED (1u << 0)
 #define DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE (1u << 0)
 #define DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE (1u << 1)
 #define DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE (1u << 0)
@@ -176,11 +182,34 @@ int main(void) {
               "TIMELINE_SIGNAL point 5");
     CHECK(query_point(fd, signaled) == 5, "QUERY reads the signaled waterline");
 
+    /* --- QUERY 校验：空列表 EINVAL、LAST_SUBMITTED、未知 flag --- */
+    {
+        struct drm_syncobj_timeline_array q = {
+            .handles = (uint64_t)(uintptr_t)&signaled,
+            .points = 0,
+            .count_handles = 0,
+        };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_QUERY, &q), EINVAL,
+                  "QUERY with an empty handle list is EINVAL");
+
+        uint64_t point = 0;
+        q.points = (uint64_t)(uintptr_t)&point;
+        q.count_handles = 1;
+        q.flags = 1u << 1;
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_QUERY, &q), EINVAL,
+                  "QUERY with an unknown flag is EINVAL");
+
+        q.flags = DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED;
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_QUERY, &q), 0,
+                  "QUERY accepts LAST_SUBMITTED");
+        CHECK(point == 5, "LAST_SUBMITTED reports the newest attached point");
+    }
+
     struct drm_syncobj_timeline_array sigbad = {
         .handles = (uint64_t)(uintptr_t)&signaled,
         .points = (uint64_t)(uintptr_t)&sig_point,
         .count_handles = 1,
-        .pad = 1,
+        .flags = 1,
     };
     CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &sigbad), EINVAL,
               "TIMELINE_SIGNAL with a nonzero tail word is EINVAL");
@@ -347,19 +376,27 @@ int main(void) {
         struct pollfd pfd = { .fd = h.fd, .events = POLLIN };
         CHECK(poll(&pfd, 1, 0) == 1, "signaled export is immediately readable");
 
+        /* import 的 handle 是输入（Linux drm_syncobj_import_sync_file_fence）：
+         * fence 装入既有 syncobj、不写回新句柄。 */
+        struct drm_syncobj_create imp_c = {0};
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &imp_c), 0,
+                  "SYNCOBJ_CREATE (import target)");
+        uint32_t imp_tgt = imp_c.handle;
         struct drm_syncobj_handle import = {
+            .handle = imp_tgt,
             .fd = h.fd,
             .flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
         };
         CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &import), 0,
                   "import round trip");
-        CHECK(import.handle != 0 && import.handle != signaled,
-              "import assigns a fresh handle");
-        CHECK(query_point(fd, import.handle) == 1,
-              "binary import reads as signaled point 1");
+        CHECK(import.handle == imp_tgt,
+              "import writes back no new handle");
+        CHECK(query_point(fd, imp_tgt) == 1,
+              "binary import signals the target at point 1");
         CHECK_RET(close(h.fd), 0, "close export fd");
 
-        /* TIMELINE 点位导出/导入（v6.16 语义） */
+        /* TIMELINE 点位导出/导入（v6.16 语义）：目标点由导入方指定，
+         * 与导出点位无关。 */
         struct drm_syncobj_handle texp = {
             .handle = signaled,
             .flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE |
@@ -369,17 +406,36 @@ int main(void) {
         CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &texp), 0,
                   "timeline export at a reached point");
         CHECK(texp.fd >= 0, "timeline export produced an fd");
+        struct drm_syncobj_create timp_c = {0};
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &timp_c), 0,
+                  "SYNCOBJ_CREATE (timeline import target)");
+        uint32_t timp_tgt = timp_c.handle;
         struct drm_syncobj_handle timp = {
+            .handle = timp_tgt,
             .fd = texp.fd,
             .flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE |
                      DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE,
-            .point = 5,
+            .point = 7,
         };
         CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &timp), 0,
                   "timeline import round trip");
-        CHECK(query_point(fd, timp.handle) == 5,
-              "timeline import lands at the exported point");
+        CHECK(query_point(fd, timp_tgt) == 7,
+              "timeline import lands at the requested point");
+
+        struct drm_syncobj_handle unknown = {
+            .handle = 0xDEAD,
+            .fd = texp.fd,
+            .flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
+        };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &unknown), ENOENT,
+                  "import into an unknown handle is ENOENT");
         CHECK_RET(close(texp.fd), 0, "close timeline export fd");
+
+        /* 无 IMPORT flag：Linux 只接受 syncobj fd（fops 检查）；sync-file
+         * fd 在该方向上就是 EINVAL。 */
+        struct drm_syncobj_handle fresh = {0};
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &fresh), EINVAL,
+                  "FD_TO_HANDLE without IMPORT_SYNC_FILE is EINVAL (no syncobj fds exist)");
 
         struct drm_syncobj_handle badfd = {
             .fd = open("/dev/null", O_RDONLY),
@@ -396,6 +452,34 @@ int main(void) {
         };
         CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &badflag), EINVAL,
                   "unknown import flag rejected");
+
+        struct drm_syncobj_handle badpad = {
+            .handle = imp_tgt,
+            .fd = 0,
+            .flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
+            .pad = 1,
+        };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &badpad), EINVAL,
+                  "nonzero pad rejected on import");
+
+        /* 同点位双导出：关闭其一后另一 fd 仍可读（注册按文件身份回收，
+         * 不按 fence id 连坐）。 */
+        struct drm_syncobj_handle twin_a = {
+            .handle = signaled,
+            .flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE,
+        };
+        struct drm_syncobj_handle twin_b = {
+            .handle = signaled,
+            .flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE,
+        };
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &twin_a), 0,
+                  "twin export A");
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &twin_b), 0,
+                  "twin export B");
+        CHECK_RET(close(twin_a.fd), 0, "close twin export A");
+        struct pollfd tpfd = { .fd = twin_b.fd, .events = POLLIN };
+        CHECK(poll(&tpfd, 1, 0) == 1, "twin export B is still readable after A closes");
+        CHECK_RET(close(twin_b.fd), 0, "close twin export B");
     }
 
     /* --- RESET / SIGNAL --- */
@@ -435,11 +519,9 @@ int main(void) {
             .point = 100,
             .fd = efd,
         };
-        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev), EINVAL,
-                  "eventfd on an unbacked point without WAIT_AVAILABLE is EINVAL");
-        ev.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;
+        /* Linux 语义：未背书点也注册成功，条目等 fence 挂上后触发。 */
         CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev), 0,
-                  "register eventfd waiter");
+                  "unbacked point registers without WAIT_AVAILABLE");
         uint64_t point = 100;
         struct drm_syncobj_timeline_array sigp = {
             .handles = (uint64_t)(uintptr_t)&pending,
@@ -454,6 +536,44 @@ int main(void) {
         CHECK_RET(read(efd, &val, sizeof(val)), 8, "read eventfd payload");
         CHECK(val == 1, "eventfd payload is 1");
         CHECK_RET(close(efd), 0, "close eventfd");
+
+        /* 已到达点：注册即触发（Linux 找到的 fence 已信号，
+         * dma_fence_add_callback 返回 -ENOENT 路径）。 */
+        int efd_now = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        CHECK(efd_now >= 0, "create eventfd for the reached point");
+        struct drm_syncobj_eventfd ev_now = {
+            .handle = signaled,
+            .flags = 0,
+            .point = 0, /* binary view, watermark 已到 1 */
+            .fd = efd_now,
+        };
+        CHECK_RET(ioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev_now), 0,
+                  "register eventfd on an already-reached point");
+        struct pollfd npfd = { .fd = efd_now, .events = POLLIN };
+        CHECK(poll(&npfd, 1, 0) == 1, "reached-point eventfd fires immediately");
+        CHECK_RET(close(efd_now), 0, "close the reached-point eventfd");
+
+        /* 负例：未知句柄 ENOENT、未知 flag / pad EINVAL、坏 fd EINVAL。 */
+        struct drm_syncobj_eventfd ev_bad = {
+            .handle = 0xDEAD,
+            .fd = 1,
+        };
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev_bad), ENOENT,
+                  "eventfd on an unknown handle is ENOENT");
+        ev_bad.handle = pending;
+        ev_bad.flags = 1u << 3;
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev_bad), EINVAL,
+                  "eventfd with an unknown flag is EINVAL");
+        ev_bad.flags = 0;
+        ev_bad.pad = 1;
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev_bad), EINVAL,
+                  "eventfd with a nonzero pad is EINVAL");
+        ev_bad.pad = 0;
+        ev_bad.fd = open("/dev/null", O_RDONLY);
+        CHECK(ev_bad.fd >= 0, "open /dev/null for the eventfd bad-fd case");
+        CHECK_ERR(ioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev_bad), EINVAL,
+                  "eventfd on a non-eventfd fd is EINVAL");
+        CHECK_RET(close(ev_bad.fd), 0, "close the eventfd bad fd");
     }
 
     /* --- SYNCOBJ_SIGNAL 唤醒 EVENTFD（二进制信号路径）--- */

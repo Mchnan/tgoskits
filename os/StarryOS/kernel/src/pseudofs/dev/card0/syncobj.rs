@@ -32,9 +32,9 @@ use super::super::drm::{
     DrmSyncobjTimelineArray, DrmSyncobjTimelineWait, DrmSyncobjWait,
     DRM_SYNCOBJ_CREATE_SIGNALED, DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
     DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE, DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE,
-    DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
-    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE,
-    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+    DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE, DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED,
+    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
 };
 use super::super::sync_file::SyncFile;
 use super::Card0;
@@ -57,15 +57,26 @@ use axfs_ng_vfs::VfsError;
 pub(super) struct SyncobjState {
     /// Timeline watermark: every point `<= signaled_point` is complete.
     pub(super) signaled_point: u64,
-    /// Eventfds registered via `DRM_IOCTL_SYNCOBJ_EVENTFD`, with the point
-    /// each waits for.
-    pub(super) eventfds: Vec<(u64, Arc<crate::file::event::EventFd>)>,
+    /// Eventfds registered via `DRM_IOCTL_SYNCOBJ_EVENTFD`.
+    pub(super) eventfds: Vec<EventfdWaiter>,
     /// Sync-file exports registered via `DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD`,
     /// each with the point it represents. The file is bound to the retiring
     /// device fence when the watermark reaches its point; an already-reached
     /// point exports an immediately-signaled file (fence id 0 completes on
     /// the first refresh).
     pub(super) sync_files: Vec<(u64, Arc<SyncFile>)>,
+}
+
+/// One `DRM_IOCTL_SYNCOBJ_EVENTFD` registration (Linux
+/// `syncobj_eventfd_entry`). Completion entries fire when the watermark
+/// covers their point; `WAIT_AVAILABLE` entries fire as soon as a fence
+/// *attaches* to the point (an EXECBUFFER out-syncobj registration or an
+/// import), the way `drm_syncobj_add_eventfd` re-evaluates the list on
+/// `drm_syncobj_add_point`/`replace_fence`.
+pub(super) struct EventfdWaiter {
+    pub(super) point: u64,
+    pub(super) wait_available: bool,
+    pub(super) eventfd: Arc<crate::file::event::EventFd>,
 }
 
 /// Out-syncobjs registered against one fenced EXECBUFFER. The fence id comes
@@ -270,7 +281,8 @@ impl Card0 {
     }
 
     /// Collects the eventfds and sync-files whose registered points the
-    /// watermark now covers. Sync-files bind to fence id 0 (complete on the
+    /// watermark now covers. Both eventfd kinds fire here: completion
+    /// implies availability. Sync-files bind to fence id 0 (complete on the
     /// first refresh) — the caller advances the watermark only after the
     /// device fence already retired, so no per-file device fence is needed.
     fn collect_reached_waiters(
@@ -279,8 +291,9 @@ impl Card0 {
     ) {
         let mut i = 0;
         while i < state.eventfds.len() {
-            if state.signaled_point >= state.eventfds[i].0 {
-                woken.push(state.eventfds.swap_remove(i).1);
+            if state.signaled_point >= state.eventfds[i].point {
+                let waiter = state.eventfds.swap_remove(i);
+                woken.push(waiter.eventfd);
             } else {
                 i += 1;
             }
@@ -298,6 +311,35 @@ impl Card0 {
         }
     }
 
+    /// Fires the `WAIT_AVAILABLE` eventfds whose points a submission just
+    /// backed (Linux `drm_syncobj_add_eventfd` re-running the entry when
+    /// `drm_syncobj_add_point` attaches a fence). Completion entries stay
+    /// parked — they fire from `collect_reached_waiters` when the host
+    /// retires the fence.
+    pub(super) fn fire_available_waiters(
+        &self,
+        owner: u64,
+        backed: &[(u32, u64)],
+        woken: &mut Vec<Arc<crate::file::event::EventFd>>,
+    ) {
+        let table = self.syncobjs.lock();
+        for &(handle, point) in backed {
+            let Some(state) = table.get(&(owner, handle)).cloned() else {
+                continue;
+            };
+            let mut state = state.lock();
+            let mut i = 0;
+            while i < state.eventfds.len() {
+                if state.eventfds[i].wait_available && point >= state.eventfds[i].point {
+                    let waiter = state.eventfds.swap_remove(i);
+                    woken.push(waiter.eventfd);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
     /// The device fence id of the outstanding submission that will advance
     /// `handle` to `point` on `owner`'s fd, if one is still pending.
     fn pending_fence_for(&self, owner: u64, handle: u32, point: u64) -> Option<u64> {
@@ -309,6 +351,25 @@ impl Card0 {
                     && entry.syncobjs.iter().any(|&(h, p)| h == handle && p == point)
             })
             .map(|entry| entry.fence_id)
+    }
+
+    /// The newest point ever attached to `handle`: the completed watermark
+    /// or the highest still-pending out point, whichever is further. This is
+    /// QUERY's `LAST_SUBMITTED` view (Linux reports the newest chain node's
+    /// seqno, submitted or not).
+    fn last_submitted_point(&self, owner: u64, handle: u32, signaled: u64) -> u64 {
+        let pending = self.pending_retires.lock();
+        pending
+            .iter()
+            .filter(|entry| entry.owner == owner)
+            .filter_map(|entry| {
+                entry
+                    .syncobjs
+                    .iter()
+                    .find(|&&(h, _)| h == handle)
+                    .map(|&(_, point)| point)
+            })
+            .fold(signaled, u64::max)
     }
 
     /// Advances one syncobj's watermark on behalf of an explicit
@@ -409,12 +470,15 @@ impl Card0 {
         arg: usize,
     ) -> VfsResult<usize> {
         let args: DrmSyncobjTimelineArray = load_arg(current, arg)?;
-        // The tail word (Linux names it pad; QUERY's LAST_SUBMITTED flag is
-        // not implemented and is rejected here) and an empty handle list
-        // are EINVAL, like `drm_syncobj_query_ioctl`.
-        if args.flags != 0 {
+        // Linux `drm_syncobj_query_ioctl`: `LAST_SUBMITTED` is the only
+        // legal flag, and an empty handle list is EINVAL (unlike the WAIT
+        // ioctls, which return 0 there).
+        if args.flags & !DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0
+            || args.count_handles == 0
+        {
             return Err(VfsError::InvalidInput);
         }
+        let last_submitted = args.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
         let handles: Vec<u32> = vm_load(
             current,
             args.handles as *const u32,
@@ -426,7 +490,11 @@ impl Card0 {
         self.pump_retired_fences();
         let states = self.lookup_syncobjs(owner, &handles)?;
         for (i, state) in states.iter().enumerate() {
-            let point = state.lock().signaled_point;
+            let point = if last_submitted {
+                self.last_submitted_point(owner, handles[i], state.lock().signaled_point)
+            } else {
+                state.lock().signaled_point
+            };
             vm_write_slice(current, (args.points + i as u64 * 8) as *mut u64, &[point])
                 .map_err(|_| VfsError::BadAddress)?;
         }
@@ -527,6 +595,14 @@ impl Card0 {
     /// the kernel signals when a syncobj point completes. Mesa's DRM sync
     /// provider uses this as its completion wakeup, so a missing handler
     /// makes every Vulkan fence wait fall back to polling or fail outright.
+    ///
+    /// Linux `drm_syncobj_eventfd_ioctl` validates flags/pad/handle/eventfd
+    /// and nothing more: a point no fence backs yet still registers, and
+    /// the entry fires once a fence lands on the point and retires (the
+    /// `syncobj_eventfd_entry` re-evaluates on every
+    /// `drm_syncobj_add_point`/`replace_fence`). `WAIT_AVAILABLE` entries
+    /// fire when the fence *attaches* — here, when an EXECBUFFER
+    /// out-syncobj or an import backs the point ([`Self::fire_available_waiters`]).
     pub(super) fn handle_syncobj_eventfd(
         &self,
         owner: u64,
@@ -537,41 +613,49 @@ impl Card0 {
         if args.pad != 0 || args.flags & !DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0 {
             return Err(VfsError::InvalidInput);
         }
-        let file = get_file_like(args.fd).map_err(|_| VfsError::BadFileDescriptor)?;
-        let eventfd = file
-            .downcast_arc::<crate::file::event::EventFd>()
-            .map_err(|_| VfsError::InvalidInput)?;
-
+        // Linux resolves the handle before the eventfd (`drm_syncobj_find`
+        // then `eventfd_ctx_fdget`): an unknown handle is ENOENT even when
+        // the fd is also bad.
         let state = self
             .syncobjs
             .lock()
             .get(&(owner, args.handle))
             .cloned()
             .ok_or(VfsError::NotFound)?;
+        let file = get_file_like(args.fd).map_err(|_| VfsError::BadFileDescriptor)?;
+        let eventfd = file
+            .downcast_arc::<crate::file::event::EventFd>()
+            .map_err(|_| VfsError::InvalidInput)?;
         // `point` 0 addresses the binary view of the syncobj (Linux
         // `drm_syncobj_fence_get`); the binary view is point 1 here.
         let target = args.point.max(1);
-        let mut state = state.lock();
-        if args.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE == 0
-            && state.signaled_point < target
-            && self.pending_fence_for(owner, args.handle, target).is_none()
+        let wait_available = args.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0;
+        let mut fire_now = false;
         {
-            // Linux resolves the fence at registration: without
-            // WAIT_AVAILABLE, a point nothing backs has no fence to wait
-            // on and the ioctl fails with EINVAL
-            // (`drm_syncobj_eventfd_ioctl`). WAIT_AVAILABLE asks for the
-            // attachment instead, which an unsubmitted point may still
-            // gain.
-            return Err(VfsError::InvalidInput);
+            let mut state = state.lock();
+            if state.signaled_point >= target {
+                // The point already completed: Linux finds the fence
+                // signaled at registration (`dma_fence_add_callback`
+                // returning -ENOENT) and signals immediately.
+                fire_now = true;
+            } else if wait_available
+                && self.pending_fence_for(owner, args.handle, target).is_some()
+            {
+                // The point is backed by an outstanding submission: the
+                // fence is already attached, so a WAIT_AVAILABLE entry
+                // fires right away (Linux `syncobj_eventfd_entry_func` on
+                // the WAIT_AVAILABLE path).
+                fire_now = true;
+            } else {
+                state.eventfds.push(EventfdWaiter {
+                    point: target,
+                    wait_available,
+                    eventfd: eventfd.clone(),
+                });
+            }
         }
-        // WAIT_AVAILABLE asks to be woken when a fence *attaches* to the
-        // point; with the watermark model the point is always backed by a
-        // fence the moment it is signaled, so the two conditions coincide.
-        if state.signaled_point >= target {
-            drop(state);
+        if fire_now {
             let _ = eventfd.signal_kernel(1);
-        } else {
-            state.eventfds.push((target, eventfd));
         }
         Ok(0)
     }
@@ -645,11 +729,19 @@ impl Card0 {
     }
 
     /// `DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE`: imports a sync_file fd — the other
-    /// half of the native-fence round trip. Only files this kernel exported
-    /// are honored: an already-signaled file turns into the binary-signaled
-    /// syncobj view (or, with `TIMELINE`, the fence at `point`); a
-    /// still-pending file has no async completion path here and is rejected
-    /// rather than left silently stuck.
+    /// half of the native-fence round trip. With `IMPORT_SYNC_FILE` the
+    /// `handle` field names the *existing* syncobj the fence lands in
+    /// (Linux `drm_syncobj_import_sync_file_fence`: an unknown handle is
+    /// ENOENT, `point` 0 replaces the syncobj's whole view, and no handle
+    /// is written back). An already-signaled file completes the target
+    /// point at once; a still-pending file completes it when the host
+    /// retires the fence it was exported from (the same pending-retire
+    /// path EXECBUFFER out-syncobjs use).
+    ///
+    /// The flagless direction is EINVAL: Linux requires a *syncobj* fd
+    /// there (`drm_syncobj_fd_to_handle`'s fops check), and this driver
+    /// never hands those out, so every fd a guest could pass fails the
+    /// check exactly as it would on Linux.
     pub(super) fn handle_syncobj_fd_to_handle(
         &self,
         owner: u64,
@@ -665,34 +757,62 @@ impl Card0 {
         {
             return Err(VfsError::InvalidInput);
         }
-        // Linux takes a new handle regardless of flags; a bad fd or a
-        // non-sync-file fd is EINVAL on both import paths.
+        if args.flags & DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE == 0 {
+            return Err(VfsError::InvalidInput);
+        }
+        // A bad fd or a non-sync-file fd is EINVAL (Linux
+        // `sync_file_get_fence`); only then does the import target handle
+        // resolve, missing ones being ENOENT (`drm_syncobj_find`) — the
+        // same order the Linux helper checks in.
         let file = get_file_like(args.fd).map_err(|_| VfsError::InvalidInput)?;
         let file = file
             .downcast_arc::<SyncFile>()
             .map_err(|_| VfsError::InvalidInput)?;
-        if !file.refresh() {
-            return Err(VfsError::InvalidInput);
-        }
-        let point = if args.flags & DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE != 0 {
+        let state = self
+            .syncobjs
+            .lock()
+            .get(&(owner, args.handle))
+            .cloned()
+            .ok_or(VfsError::NotFound)?;
+        // With TIMELINE the fence lands at `point` (ignored otherwise, like
+        // Linux reading args->point only under the flag); point 0 addresses
+        // the binary view (point 1). The watermark only moves forward:
+        // importing below the current watermark changes nothing, which
+        // matches every observable Linux behavior for this model.
+        let target = if args.flags & DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE != 0 {
             args.point.max(1)
         } else {
-            if args.point != 0 {
-                return Err(VfsError::InvalidInput);
-            }
             1
         };
-        let handle = self.next_syncobj_handle();
-        self.syncobjs.lock().insert(
-            (owner, handle),
-            Arc::new(Mutex::new(SyncobjState {
-                signaled_point: point,
-                eventfds: Vec::new(),
-                sync_files: Vec::new(),
-            })),
-        );
-        let out = DrmSyncobjHandle { handle, ..args };
-        store_arg(current, arg, &out).map(|_| 0)
+        // Resolve the imported fence: refresh pumps the completion view, so
+        // a fence that retired since the export signals right here.
+        if file.refresh() {
+            let mut woken = Vec::new();
+            self.signal_syncobj_point(owner, args.handle, target, &mut woken);
+            for eventfd in woken {
+                let _ = eventfd.signal_kernel(1);
+            }
+        } else if state.lock().signaled_point < target {
+            // The fence is still retiring on the device: the point
+            // completes when the host retires it — the same registration
+            // EXECBUFFER out-syncobjs live under, driven by the retire
+            // pump. Registering first lets a concurrent EVENTFD ioctl see
+            // the backing through `pending_fence_for`; WAIT_AVAILABLE
+            // waiters fire right after.
+            let backed = [(args.handle, target)];
+            let mut woken = Vec::new();
+            self.pending_retires.lock().push_back(PendingRetire {
+                fence_id: file.bound_fence_id(),
+                owner,
+                syncobjs: Vec::from(backed),
+            });
+            self.fire_available_waiters(owner, &backed, &mut woken);
+            kick_retire_pump();
+            for eventfd in woken {
+                let _ = eventfd.signal_kernel(1);
+            }
+        }
+        Ok(0)
     }
 
     /// Waits until `point` on `handle` is signalled, pumping host retires —
