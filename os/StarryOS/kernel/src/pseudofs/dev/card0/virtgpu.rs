@@ -1452,13 +1452,11 @@ impl Card0 {
         // whatever the submit mode was).
         if !out_syncobjs.is_empty() && fence_id != 0 {
             let mut woken = Vec::new();
-            self.pending_retires
-                .lock()
-                .push_back(super::syncobj::PendingRetire {
-                    fence_id,
-                    owner: file.file_id,
-                    syncobjs: out_syncobjs.clone(),
-                });
+            self.pending_retires.lock().push_back(super::syncobj::PendingRetire::new(
+                fence_id,
+                file.file_id,
+                out_syncobjs.clone(),
+            ));
             // Attaching the fences satisfies every WAIT_AVAILABLE entry on
             // these points (Linux re-runs the eventfd entries from
             // drm_syncobj_add_point); completion entries stay parked until

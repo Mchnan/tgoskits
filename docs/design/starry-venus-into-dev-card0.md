@@ -133,7 +133,13 @@ card0 registers each submit's out-syncobjs as a `PendingRetire`
 `fence_completed` (which itself delivers the batch and pumps the queue),
 then advances each `signaled_point` watermark and wakes the registered
 waiters — eventfds signalled, sync-file exports bound to the retiring
-fence (`pending_fence_for`) flip. Two drivers run it: every
+fence (`pending_fence_for`) flip. Drained entries are removed by
+registration id, never by fence id: one fence backs several registrations
+(a point exported and imported twice), and the pump queries the device
+outside the registry lock, so a fence-id removal could also delete a
+registration pushed in that window — a point nothing has advanced yet,
+which every wait would then observe only as `ETIME`. Surviving same-fence
+registrations drain on the next pump round. Two drivers run it: every
 syncobj-observing entry point (wait, query, export) pumps first, and a
 dedicated `syncobj-retire-pump` kernel thread covers clients that issue
 no further ioctls — while any retire is outstanding it pumps on a 250 µs

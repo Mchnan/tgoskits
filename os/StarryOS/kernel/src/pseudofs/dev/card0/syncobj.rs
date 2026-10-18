@@ -23,7 +23,7 @@ use alloc::{
 use ax_std::os::arceos::task::sync::WaitQueue;
 use bytemuck::{AnyBitPattern, NoUninit};
 use core::{
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -73,13 +73,35 @@ pub(super) struct EventfdWaiter {
     pub(super) eventfd: Arc<crate::file::event::EventFd>,
 }
 
-/// Out-syncobjs registered against one fenced EXECBUFFER. The fence id comes
-/// from the device's monotonic counter; the entries advance when the device
-/// reports that fence complete.
+/// Out-syncobjs registered against one fenced submission (EXECBUFFER
+/// out-syncobjs, or an imported sync file). The fence id comes from the
+/// device's monotonic counter; the entries advance when the device reports
+/// that fence complete.
 pub(super) struct PendingRetire {
+    /// Registration identity, unique per push. One fence id can back several
+    /// registrations (a point exported and imported twice), and the pump
+    /// drains by this id: removing by fence id would also delete
+    /// registrations pushed while the pump queried the device outside the
+    /// lock, dropping points that were never advanced.
+    pub(super) id: u64,
     pub(super) fence_id: u64,
     pub(super) owner: u64,
     pub(super) syncobjs: Vec<(u32, u64)>,
+}
+
+/// Registration ids for [`PendingRetire`], allocated per push: fence ids do
+/// not identify a registration (see the field docs).
+static PENDING_RETIRE_NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+impl PendingRetire {
+    pub(super) fn new(fence_id: u64, owner: u64, syncobjs: Vec<(u32, u64)>) -> Self {
+        Self {
+            id: PENDING_RETIRE_NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            fence_id,
+            owner,
+            syncobjs,
+        }
+    }
 }
 
 /// Per-fd syncobj table: `(file_id, handle)` → shared state. Lives on
@@ -88,8 +110,9 @@ pub(super) struct PendingRetire {
 /// without any rendering context, and reaps them in `drm_release`).
 pub(super) type SyncobjTable = Mutex<alloc::collections::BTreeMap<(u64, u32), Arc<Mutex<SyncobjState>>>>;
 
-/// One drained retire entry: `(fence_id, owner, out-syncobjs)`.
-type RetiredFence = (u64, u64, Vec<(u32, u64)>);
+/// One drained retire entry: `(registration id, fence_id, owner,
+/// out-syncobjs)`.
+type RetiredFence = (u64, u64, u64, Vec<(u32, u64)>);
 
 // ---- completion-side pump ----
 //
@@ -233,21 +256,28 @@ impl Card0 {
     /// this first so a query or wait observes the current watermark; a
     /// response nobody drains would leave waiters spinning forever.
     pub(super) fn pump_retired_fences(&self) {
-        // Snapshot the fence ids under the registry lock, then ask the device
-        // outside every card0 lock: `fence_completed` takes the GPU lock and
-        // pumps the control queue.
-        let fence_ids: Vec<RetiredFence> = {
+        // Snapshot the registrations under the registry lock, then ask the
+        // device outside every card0 lock: `fence_completed` takes the GPU
+        // lock and pumps the control queue.
+        let registrations: Vec<RetiredFence> = {
             let pending = self.pending_retires.lock();
             pending
                 .iter()
-                .map(|entry| (entry.fence_id, entry.owner, entry.syncobjs.clone()))
+                .map(|entry| {
+                    (
+                        entry.id,
+                        entry.fence_id,
+                        entry.owner,
+                        entry.syncobjs.clone(),
+                    )
+                })
                 .collect()
         };
-        if fence_ids.is_empty() {
+        if registrations.is_empty() {
             return;
         }
         let mut retired: Vec<RetiredFence> = Vec::new();
-        for (fence_id, owner, syncobjs_list) in fence_ids {
+        for (id, fence_id, owner, syncobjs_list) in registrations {
             let done = ax_gpu::with_gpu(|device| {
                 device
                     .virgl()
@@ -258,23 +288,29 @@ impl Card0 {
             .and_then(|result| result.ok())
             .unwrap_or(false);
             if done {
-                retired.push((fence_id, owner, syncobjs_list));
+                retired.push((id, fence_id, owner, syncobjs_list));
             }
         }
         if retired.is_empty() {
             return;
         }
+        // Retire exactly the snapshot entries the device confirmed, matched
+        // by registration id — never by fence id. A fence id is shared by
+        // every registration of the same submission (a point exported and
+        // imported twice), so a fence-id match would also remove
+        // registrations pushed after the snapshot, while this pump held no
+        // lock and asked the device — deleting points nothing has advanced
+        // yet. A surviving same-fence registration drains on the next pump
+        // round (its fence is already complete).
         {
             let mut pending = self.pending_retires.lock();
-            for (fence_id, _, _) in &retired {
-                pending.retain(|entry| entry.fence_id != *fence_id);
-            }
+            pending.retain(|entry| !retired.iter().any(|&(id, ..)| id == entry.id));
         }
         // Advance the watermarks and collect the waiters to wake, all under
         // the syncobj table lock; signals happen after it is released.
         let table = self.syncobjs.lock();
         let mut woken: Vec<Arc<crate::file::event::EventFd>> = Vec::new();
-        for (_, owner, syncobjs_list) in retired {
+        for (_, _, owner, syncobjs_list) in retired {
             for (handle, point) in syncobjs_list {
                 let Some(state) = table.get(&(owner, handle)).cloned() else {
                     // The fd's syncobj was destroyed while the submit was in
@@ -803,11 +839,11 @@ impl Card0 {
             // waiters fire right after.
             let backed = [(args.handle, target)];
             let mut woken = Vec::new();
-            self.pending_retires.lock().push_back(PendingRetire {
-                fence_id: file.bound_fence_id(),
+            self.pending_retires.lock().push_back(PendingRetire::new(
+                file.bound_fence_id(),
                 owner,
-                syncobjs: Vec::from(backed),
-            });
+                Vec::from(backed),
+            ));
             self.fire_available_waiters(owner, &backed, &mut woken);
             kick_retire_pump();
             for eventfd in woken {
